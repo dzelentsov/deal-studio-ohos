@@ -1,4 +1,3 @@
-import router from '@ohos.router'
 import { chats, ChatSummary } from '../vera/ChatStore'
 import { formatUsd } from '../vera/VeraChatStats'
 
@@ -13,7 +12,9 @@ struct ChatListPage {
   @State list: ChatSummary[] = []
 
   aboutToAppear(): void {
-    chats.init(getContext(this).filesDir)
+    let context = this.getUIContext().getHostContext()
+    if (context === undefined) { throw new Error('Chat list host context is unavailable') }
+    chats.init(context.filesDir)
     this.reload()
   }
 
@@ -29,7 +30,8 @@ struct ChatListPage {
   private open(id: string): void {
     let nav = new ChatNavParams()
     nav.chatId = id
-    router.pushUrl({ url: 'pages/ChatPage', params: nav })
+    this.getUIContext().getRouter().pushUrl({ url: 'pages/ChatPage', params: nav })
+      .catch((e: Error): void => { console.error('Navigate to chat failed: ' + e.message) })
   }
 
   private describe(c: ChatSummary): string {
@@ -84,7 +86,8 @@ struct ChatListPage {
     .toolbarConfiguration([{
       value: 'New chat',
       status: ToolbarItemStatus.NORMAL,
-      action: () => { router.pushUrl({ url: 'pages/ChatPage' }) }
+      action: () => { this.getUIContext().getRouter().pushUrl({ url: 'pages/ChatPage' })
+        .catch((e: Error): void => { console.error('Navigate to chat failed: ' + e.message) }) }
     }])
   }
 

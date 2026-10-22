@@ -18,13 +18,20 @@ async function downloadModel(context: common.Context): Promise<void> {
   } catch (_e) {}
   console.info('VERA-EMBED downloading model (one-time, ~236MB)...')
   try {
-    let task = await request.downloadFile(context, {
-      url: EMBED_MODEL_URL, filePath: embedModelPath(context.filesDir)
-    })
-    await new Promise<void>((resolve, reject) => {
-      task.on('complete', (): void => { resolve() })
-      task.on('fail', (err: number): void => { reject(new Error('download failed, code ' + err.toString())) })
-    })
+    if (canIUse('SystemCapability.Request.FileTransferAgent')) {
+      if (canIUse('SystemCapability.MiscServices.Download')) {
+        let task = await request.downloadFile(context, {
+          url: EMBED_MODEL_URL, filePath: embedModelPath(context.filesDir)
+        })
+        await new Promise<void>((resolve, reject) => {
+          task.on('complete', (): void => { resolve() })
+          task.on('fail', (err: number): void => { reject(new Error('download failed, code ' + err.toString())) })
+        })
+        return
+      }
+      throw new Error('SystemCapability.MiscServices.Download is not supported')
+    }
+    throw new Error('SystemCapability.Request.FileTransferAgent is not supported')
   } catch (e) {
     console.warn('VERA-EMBED model unavailable: ' + (e as Error).message)
   }

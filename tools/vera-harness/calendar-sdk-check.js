@@ -162,13 +162,15 @@ function fixture(options = {}) {
       const result = ts.transpileModule(backendSource, { fileName: 'VeraSdkBackend.ts', compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020, esModuleInterop: true }, reportDiagnostics: true })
       assert.equal((result.diagnostics || []).filter(d => d.category === ts.DiagnosticCategory.Error).length, 0)
       const backend = { exports: {} }
-      new Function('require', 'module', 'exports', result.outputText)(name => {
+      const supports = new Set(['SystemCapability.FileManagement.StorageService.SpatialStatistics'])
+      const canIUse = capability => supports.has(capability)
+      new Function('require', 'module', 'exports', 'canIUse', result.outputText)(name => {
         if (name === './VeraCalendarSdk') return mod.exports
         if (name === './VeraPermissions') return { AbilityContext: ability }
         if (name === '@ohos.file.storageStatistics') return { getFreeSizeSync: () => 4096 }
         if (name.startsWith('@ohos.')) return {}
         throw Error('Unexpected backend import ' + name)
-      }, backend, backend.exports)
+      }, backend, backend.exports, canIUse)
       return backend.exports
     },
     fail(name, code = 201, message = 'permission denied') { failure = { name, code, message } },

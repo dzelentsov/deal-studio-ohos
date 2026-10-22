@@ -30,14 +30,32 @@ DIST="$HAPSIGNER/dist"
 HAP_OUT_DIR="${HAP_OUT_DIR:-/tmp/vera-probe-dyn-hap}"
 UNSIGNED="$HAP_OUT_DIR/vera-probe-dyn-unsigned.hap"
 SIGNED="$HAP_OUT_DIR/vera-probe-dyn-system-signed.hap"
-PROFILE_IN="$SCRIPT_DIR/signing/UnsgnedReleasedProfileTemplate.json"
+PROFILE_TEMPLATE="$SCRIPT_DIR/signing/UnsgnedReleasedProfileTemplate.json"
+PROFILE_IN="$HAP_OUT_DIR/vera-probe-dyn-device-profile.json"
 PROFILE_OUT="$HAP_OUT_DIR/vera-probe-dyn-system.p7b"
+command -v java >/dev/null
+command -v python3 >/dev/null
+vera_signing_device
 
 for f in "$DIST/hap-sign-tool.jar" "$DIST/OpenHarmony.p12" \
          "$DIST/OpenHarmonyProfileRelease.pem" "$DIST/OpenHarmonyApplication.pem" \
-         "$PROFILE_IN" "$UNSIGNED"; do
+          "$PROFILE_TEMPLATE" "$UNSIGNED"; do
   [[ -f "$f" ]] || { echo "ERROR: missing $f" >&2; exit 1; }
 done
+
+python3 - "$PROFILE_TEMPLATE" "$PROFILE_IN" "$UDID" <<'PY'
+import json, sys, time, uuid
+from pathlib import Path
+profile = json.loads(Path(sys.argv[1]).read_text())
+if profile['type'] != 'release' or profile['bundle-info']['app-feature'] != 'hos_system_app':
+    sys.exit('ERROR: expected a release system-app profile')
+now = int(time.time())
+profile['app-distribution-type'] = 'internaltesting'
+profile['uuid'] = str(uuid.uuid4())
+profile['validity'] = {'not-before': now - 300, 'not-after': now + 30 * 24 * 60 * 60}
+profile['debug-info'] = {'device-id-type': 'udid', 'device-ids': [sys.argv[3]]}
+Path(sys.argv[2]).write_text(json.dumps(profile, indent=4) + '\n')
+PY
 
 echo "=== Sign profile ==="
 java -jar "$DIST/hap-sign-tool.jar" sign-profile \
@@ -69,4 +87,4 @@ java -jar "$DIST/hap-sign-tool.jar" sign-app \
 echo
 echo "=== Done ==="
 ls -lh "$SIGNED"
-echo "install with: hdc install $SIGNED"
+printf 'install with: hdc -t %q install %q\n' "$HDC_DEVICE" "$SIGNED"

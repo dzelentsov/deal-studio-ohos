@@ -1,5 +1,5 @@
 import { KeyboardAvoidMode } from '@ohos.arkui.UIContext'
-import router from '@ohos.router'
+import common from '@ohos.app.ability.common'
 import { VeraPreview } from '../components/VeraPreview'
 import { loadRawfileText } from '../vera/LlamaEngine'
 import { logMark, logStep, initTrace } from '../vera/VeraTiming'
@@ -407,8 +407,17 @@ struct ChatPage {
   /** The composed template a completion started from, kept for when the model cannot finish it. */
   private chatFallback: TemplateBuild | null = null
 
+  private hostContext(): common.Context {
+    let context = this.getUIContext().getHostContext()
+    if (context === undefined) {
+      this.status = 'Chat host context is unavailable'
+      throw new Error(this.status)
+    }
+    return context
+  }
+
   aboutToAppear(): void {
-    let dir = getContext(this).filesDir
+    let dir = this.hostContext().filesDir
     settings.init(dir)
     consent.init(dir)
     // The store VeraPreview saves a widget's state in, and the chats themselves.
@@ -416,7 +425,7 @@ struct ChatPage {
     chats.init(dir)
     initTrace(dir)
     this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.RESIZE)
-    let params = router.getParams() as Record<string, string>
+    let params = this.getUIContext().getRouter().getParams() as Record<string, string>
     if (params !== null && params !== undefined && (params['chatId'] || '').length > 0) {
       this.openChat(params['chatId'])
     }
@@ -524,7 +533,7 @@ struct ChatPage {
     if (this.resourcesReady === null) {
       this.resourcesReady = (async (): Promise<void> => {
         try {
-          let context = getContext(this)
+          let context = this.hostContext()
           let capabilities = ensureCapabilities(context)
           loadCatalogFile(context.filesDir)
           let skill = await loadRawfileText(context.resourceManager, 'vera-skill.txt')
@@ -641,7 +650,7 @@ struct ChatPage {
     logMark('chat-send', 'chars=' + text.length.toString())
     try {
       let capsStartedAt = Date.now()
-      await ensureCapabilities(getContext(this))
+      await ensureCapabilities(this.hostContext())
       logStep('ensure-capabilities', capsStartedAt)
       let raw = await chatReply(turns, (soFar: string): void => {
         if (!sawText) { sawText = true; logMark('chat-first-text') }

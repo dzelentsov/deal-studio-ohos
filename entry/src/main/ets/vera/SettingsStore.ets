@@ -34,9 +34,23 @@ function readText(path: string): string {
 }
 
 function writeText(path: string, content: string): void {
-  let file = fs.openSync(path, fs.OpenMode.CREATE | fs.OpenMode.WRITE_ONLY | fs.OpenMode.TRUNC)
-  fs.writeSync(file.fd, content)
-  fs.closeSync(file)
+  let file: fs.File | null = null
+  let failed = false
+  try {
+    file = fs.openSync(path, fs.OpenMode.CREATE | fs.OpenMode.WRITE_ONLY | fs.OpenMode.TRUNC)
+    fs.writeSync(file.fd, content)
+  } catch (e) {
+    failed = true
+    throw e as Error
+  } finally {
+    if (file !== null) {
+      try {
+        fs.closeSync(file)
+      } catch (e) {
+        if (!failed) { throw e as Error }
+      }
+    }
+  }
 }
 
 export class SettingsStore {

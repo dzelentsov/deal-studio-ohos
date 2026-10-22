@@ -1,4 +1,3 @@
-import router from '@ohos.router'
 import { VeraPreview } from '../components/VeraPreview'
 import { store } from '../vera/ProjectStore'
 import { consent } from '../vera/VeraConsentStore'
@@ -18,7 +17,7 @@ struct RunnerPage {
   @State backPressSignal: number = 0
 
   aboutToAppear(): void {
-    let params = router.getParams() as Record<string, string>
+    let params = this.getUIContext().getRouter().getParams() as Record<string, string>
     if (params === null || params === undefined) { this.error = 'No parameters'; return }
     let vbc2 = params['vbc2'] || ''
     if (vbc2.length === 0) { this.error = 'No VBC2 bytecode'; return }
@@ -27,8 +26,14 @@ struct RunnerPage {
     let versionId = params['versionId'] || ''
     if (projectId.length > 0 && versionId.length > 0) {
       this.persistKey = projectId + '/' + versionId
-      store.init(getContext(this).filesDir)
-      consent.init(getContext(this).filesDir)
+      let context = this.getUIContext().getHostContext()
+      if (context === undefined) {
+        this.error = 'Runner host context is unavailable'
+        this.vbc2 = ''
+        return
+      }
+      store.init(context.filesDir)
+      consent.init(context.filesDir)
     }
   }
 

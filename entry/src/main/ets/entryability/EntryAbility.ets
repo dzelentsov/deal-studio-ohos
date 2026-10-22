@@ -3,7 +3,6 @@ import Want from '@ohos.app.ability.Want'
 import AbilityConstant from '@ohos.app.ability.AbilityConstant'
 import window from '@ohos.window'
 import hilog from '@ohos.hilog'
-import router from '@ohos.router'
 import { refreshForms } from '../vera/FormUpdater'
 import { settings } from '../vera/SettingsStore'
 import { requestCalendarPermissions, requestMicrophonePermission } from '../vera/VeraPermissions'
@@ -337,7 +336,11 @@ export default class EntryAbility extends UIAbility {
     try {
       let p = new ProjectNavParams()
       p.projectId = projectId
-      router.pushUrl({ url: 'pages/ProjectPage', params: p })
+      this.context.windowStage.getMainWindowSync().getUIContext().getRouter()
+        .pushUrl({ url: 'pages/ProjectPage', params: p })
+        .catch((e: Error): void => {
+          hilog.error(DOMAIN, 'VERA', 'Navigate to project failed: ' + e.message)
+        })
     } catch (e) {
       hilog.error(DOMAIN, 'VERA', 'Navigate to project failed: ' + (e as Error).message)
     }

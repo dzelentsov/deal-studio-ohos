@@ -1,4 +1,3 @@
-import router from '@ohos.router'
 import { Project, Version, store } from '../vera/ProjectStore'
 import { refreshForms } from '../vera/FormUpdater'
 
@@ -25,7 +24,7 @@ struct ProjectPage {
   @State viewedPrompt: string = ''
 
   aboutToAppear(): void {
-    let params = router.getParams() as Record<string, string>
+    let params = this.getUIContext().getRouter().getParams() as Record<string, string>
     if (params !== null && params !== undefined) {
       this.projectId = params['projectId'] || ''
     }
@@ -179,14 +178,16 @@ struct ProjectPage {
     p.projectId = v.projectId
     p.versionId = v.id
     p.vbc2 = v.vbc2
-    router.pushUrl({ url: 'pages/RunnerPage', params: p })
+    this.getUIContext().getRouter().pushUrl({ url: 'pages/RunnerPage', params: p })
+      .catch((e: Error): void => { console.error('Navigate to runner failed: ' + e.message) })
   }
 
   private openGenerate(baseVersionId: string): void {
     let p = new GenerateNavParams()
     p.projectId = this.projectId
     p.baseVersionId = baseVersionId
-    router.pushUrl({ url: 'pages/GeneratePage', params: p })
+    this.getUIContext().getRouter().pushUrl({ url: 'pages/GeneratePage', params: p })
+      .catch((e: Error): void => { console.error('Navigate to generation failed: ' + e.message) })
   }
 
   private viewSource(v: Version): void {

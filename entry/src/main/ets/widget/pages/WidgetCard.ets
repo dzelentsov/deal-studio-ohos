@@ -1,6 +1,8 @@
 // VERA home-screen card. Tap a project row to open it in the app.
 // Binding data (injected via LocalStorage): { count, hasProjects, projects: [{id, name, icon}] }
-@Entry
+let widgetStorage = new LocalStorage()
+
+@Entry(widgetStorage)
 @Component
 struct WidgetCard {
   @LocalStorageProp('count') count: number = 0

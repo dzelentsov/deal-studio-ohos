@@ -185,11 +185,11 @@ run('Parser recovery: every syntax error in one compile, without cascades',()=>{
   function page(){
     const src=read('entry/src/main/ets/pages/GeneratePage.ets');
     const prefix=src.slice(0,src.indexOf('@Entry')).replace(/^import .*$/gm,'');
-    const code=prefix+'\nclass Controller { '+['callModel','runAttempt','doRefine','traceEnd','doGenerate','tryTemplateSelect','startAttemptOne','tryStructuralEdit','fallBackToTemplate','refineWithModel','stopGeneration','originLabel'].map(n=>method(src,n)).join('\n')+' } module.exports=Controller;';
+    const code=prefix+'\nclass Controller { '+['hostContext','callModel','runAttempt','doRefine','traceEnd','doGenerate','tryTemplateSelect','startAttemptOne','tryStructuralEdit','fallBackToTemplate','refineWithModel','stopGeneration','originLabel'].map(n=>method(src,n)).join('\n')+' } module.exports=Controller;';
     const compiled=ts.transpileModule(code,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2020},reportDiagnostics:true});
     assert.equal((compiled.diagnostics||[]).filter(d=>d.category===ts.DiagnosticCategory.Error).length,0,'Extracted generation controller syntax');
     const globals={ensureCapabilities:async()=>{},logStep:()=>{},logMark:()=>{},trace:(name,fields)=>{traces.push({name,fields});},
-      templateSelectEnabled:()=>true,buildFromTemplates:(...a)=>tpl.build(...a),BUILD_CANCELLED:pipeline.BUILD_CANCELLED,BUILD_SCRATCH:pipeline.BUILD_SCRATCH,BUILD_COMPLETE:pipeline.BUILD_COMPLETE,traceCompile:()=>{},getContext:()=>({}),UI_SELECT_FULL:selection.UI_SELECT_FULL,UI_SELECT_PROMPT:selection.UI_SELECT_PROMPT,settings,deepseek:deep.deepseek,DEEPSEEK_GENERATION_MAX_TOKENS:deep.DEEPSEEK_GENERATION_MAX_TOKENS,
+      templateSelectEnabled:()=>true,buildFromTemplates:(...a)=>tpl.build(...a),BUILD_CANCELLED:pipeline.BUILD_CANCELLED,BUILD_SCRATCH:pipeline.BUILD_SCRATCH,BUILD_COMPLETE:pipeline.BUILD_COMPLETE,traceCompile:()=>{},UI_SELECT_FULL:selection.UI_SELECT_FULL,UI_SELECT_PROMPT:selection.UI_SELECT_PROMPT,settings,deepseek:deep.deepseek,DEEPSEEK_GENERATION_MAX_TOKENS:deep.DEEPSEEK_GENERATION_MAX_TOKENS,
       GenerateRequest:llama.GenerateRequest,GenerateResult:llama.GenerateResult,compileVeraSource:compiler.compileVeraSource,CompileError:compiler.CompileError,
       repairPrompt:repairMod.repairPrompt,applyRepair:repairMod.applyRepair,
       selectUiForPrompt:(...a)=>side.selectUi(...a),describeCatalogForPrompt:()=>'',UI_TOOL_NOTE:'',
@@ -197,6 +197,8 @@ run('Parser recovery: every syntax error in one compile, without cascades',()=>{
       engine:{stop(){},generate(request){return {text:example,inputTokens:1,outputTokens:1,request}}}};
     const mod={exports:{}};new Function('module',...Object.keys(globals),compiled.outputText)(mod,...Object.values(globals));
     const c=new mod.exports();
+    const host={filesDir:'/fixture',resourceManager:{}};
+    c.getUIContext=()=>({getHostContext:()=>host});
     Object.assign(c,{mode:'deepseek',attempt:1,systemPrompt:skill,uiSelected:[],grammar:'',previousSource:'',failedSource:'',
       attempts:[],compiledVbc2:'',cancelRequested:false,completionBase:'',completionBaseVbc2:'',completionComposition:'',compositionJson:'',templateKinds:[],modelWrote:false,runId:0,prompt:'',refinePrompt:'',repairByEdit:true,genStartTime:Date.now(),generatedSource:'',generating:true});
     c.addToProgram=()=>{};c.currentRun=()=>null;c.startRun=()=>{};
@@ -206,6 +208,13 @@ run('Parser recovery: every syntax error in one compile, without cascades',()=>{
   function compilerError(source){try{compiler.compileVeraSource(source);throw Error('Fixture compiled unexpectedly');}catch(e){assert(e instanceof compiler.CompileError);return e.message;}}
   await runAsync('Shared generation token limit is 32768',async()=>{
     assert.equal(deep.DEEPSEEK_GENERATION_MAX_TOKENS,32768);return {maxTokens:32768};
+  });
+  await runAsync('Generate screen uses scoped host context and reports its absence',async()=>{
+    reset();const c=page();assert.equal(c.hostContext().filesDir,'/fixture');
+    c.getUIContext=()=>({getHostContext:()=>undefined});
+    await assert.rejects(c.callModel(new llama.GenerateRequest(),()=>{}),/Generate host context is unavailable/);
+    assert.equal(c.status,'Generate host context is unavailable');assert.equal(requests.length,0);
+    return {scopedContext:true,missingContextReported:true,modelRequests:0};
   });
   await runAsync('Generate screen first candidate compiles with uniform settings and metrics',async()=>{
     reset();responses.push(example);const c=page();await c.runAttempt('An editable amount log.','');

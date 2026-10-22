@@ -264,7 +264,7 @@ export struct VeraPreview {
    */
   private watchDarkMode(): void {
     try {
-      let listener = mediaquery.matchMediaSync('(dark-mode: true)')
+      let listener = this.getUIContext().getMediaQuery().matchMediaSync('(dark-mode: true)')
       this.dark = listener.matches
       listener.on('change', (result: mediaquery.MediaQueryResult) => {
         if (this.disposed || result.matches === this.dark) { return }
@@ -1071,7 +1071,7 @@ export struct VeraPreview {
   private sparklineCommands(series: number[], maximum: number, floor: number, width: number): string {
     if (series.length === 0) { return '' }
     let max = maximum > floor ? maximum : floor + 1
-    let scale = vp2px(1)
+    let scale = this.getUIContext().vp2px(1)
     let h = VeraPreview.SPARKLINE_HEIGHT * scale
     let w = width * scale
     let n = series.length
@@ -1094,7 +1094,7 @@ export struct VeraPreview {
   private sparklineAreaCommands(series: number[], maximum: number, floor: number, width: number): string {
     if (series.length === 0) { return '' }
     let max = maximum > floor ? maximum : floor + 1
-    let scale = vp2px(1)
+    let scale = this.getUIContext().vp2px(1)
     let h = VeraPreview.SPARKLINE_HEIGHT * scale
     let w = width * scale
     let n = series.length
@@ -1204,7 +1204,7 @@ export struct VeraPreview {
   /** One horizontal line per sparklineTicks value, in the same px-corrected space sparklineCommands draws in. */
   private sparklineGridCommands(maximum: number, floor: number, width: number): string {
     let max = maximum > floor ? maximum : floor + 1
-    let scale = vp2px(1)
+    let scale = this.getUIContext().vp2px(1)
     let h = VeraPreview.SPARKLINE_HEIGHT * scale
     let w = width * scale
     let step = (max - floor) / 3
@@ -1938,7 +1938,7 @@ export struct VeraPreview {
             if (node.action.length === 0) { return }
             // The phone's own picker, so the value is always a real time and
             // the program never has to validate one.
-            TimePickerDialog.show({
+            this.getUIContext().showTimePickerDialog({
               selected: this.minutesToDate(node.numberValue),
               useMilitaryTime: true,
               onAccept: (result: TimePickerResult) => {
@@ -2738,7 +2738,7 @@ export struct VeraPreview {
         Stack({ alignContent: Alignment.TopStart }) {
           this.renderChildren(node)
         }
-        .scale({ x: vp2px(this.canvasSide(node.style)) / 100, y: vp2px(this.canvasSide(node.style)) / 100,
+        .scale({ x: this.getUIContext().vp2px(this.canvasSide(node.style)) / 100, y: this.getUIContext().vp2px(this.canvasSide(node.style)) / 100,
                  centerX: 0, centerY: 0 })
       }
       .width('100%')

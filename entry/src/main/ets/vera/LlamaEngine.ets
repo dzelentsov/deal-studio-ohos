@@ -12,6 +12,7 @@
 
 import resourceManager from '@ohos.resourceManager'
 import fs from '@ohos.file.fs'
+import util from '@ohos.util'
 import nativeLlama from 'libllama.so'
 
 export class LlamaConfig {
@@ -46,33 +47,6 @@ export class GenerateResult {
   outputTokens: number = 0
 }
 
-interface NativeGenerateResult {
-  text: string
-  inputTokens: number
-  outputTokens: number
-}
-
-interface NativeLlama {
-  llamaInit(configJson: string): boolean
-  llamaGenerate(paramsJson: string, callback: (token: string) => void): NativeGenerateResult
-  llamaStop(): void
-  llamaFree(): void
-  llamaEmbedInit(configJson: string): boolean
-  llamaEmbedBatch(texts: string[]): number[][]
-  llamaEmbedFree(): void
-  llamaScanCorpus(query: number[], corpus: Float32Array, dimension: number, count: number): Float32Array
-  llamaBuildInfo(): string
-}
-
-let native: NativeLlama | null = null
-
-function getNative(): NativeLlama {
-  if (native === null) {
-    native = nativeLlama as NativeLlama
-  }
-  return native!
-}
-
 /**
  * Passthroughs to the embedding half of the same native module, for
  * VeraEmbeddings.ets -- not a second `import ... from 'libllama.so'` (that
@@ -84,24 +58,24 @@ function getNative(): NativeLlama {
  * undefined). One import, one place; everything else calls through here.
  */
 export function nativeEmbedInit(configJson: string): boolean {
-  return getNative().llamaEmbedInit(configJson)
+  return nativeLlama.llamaEmbedInit(configJson)
 }
 
 export function nativeEmbedBatch(texts: string[]): number[][] {
-  return getNative().llamaEmbedBatch(texts)
+  return nativeLlama.llamaEmbedBatch(texts)
 }
 
 /** "stub" for a build without llama.cpp, "llama.cpp <commit>" otherwise, "unknown" if the module predates the call. */
 export function nativeBuildInfo(): string {
   try {
-    return getNative().llamaBuildInfo()
+    return nativeLlama.llamaBuildInfo()
   } catch (_e) {
     return 'unknown'
   }
 }
 
 export function nativeEmbedFree(): void {
-  getNative().llamaEmbedFree()
+  nativeLlama.llamaEmbedFree()
 }
 
 /** Dot product of `query` against each of `count` `dimension`-wide rows of
@@ -110,7 +84,7 @@ export function nativeEmbedFree(): void {
  * than left for the native side to infer from the typed array alone.
  * Returns one score per row, in corpus order. */
 export function nativeScanCorpus(query: number[], corpus: Float32Array, dimension: number, count: number): Float32Array {
-  return getNative().llamaScanCorpus(query, corpus, dimension, count)
+  return nativeLlama.llamaScanCorpus(query, corpus, dimension, count)
 }
 
 export class LlamaEngine {
@@ -127,7 +101,7 @@ export class LlamaEngine {
       configObj['n_ctx'] = config.nCtx
       configObj['n_threads'] = config.nThreads
       configObj['n_gpu_layers'] = config.nGpuLayers
-      this.initialized = getNative().llamaInit(JSON.stringify(configObj))
+      this.initialized = nativeLlama.llamaInit(JSON.stringify(configObj))
       return this.initialized
     } catch (e) {
       console.error('LlamaEngine init failed: ' + (e as Error).message)
@@ -148,7 +122,7 @@ export class LlamaEngine {
       paramsObj['temperature'] = request.temperature
       paramsObj['top_p'] = request.topP
       paramsObj['seed'] = request.seed
-      let native = getNative().llamaGenerate(JSON.stringify(paramsObj), onToken)
+      let native: GenerateResult = nativeLlama.llamaGenerate(JSON.stringify(paramsObj), onToken) as GenerateResult
       gr.text = native.text
       gr.inputTokens = native.inputTokens
       gr.outputTokens = native.outputTokens
@@ -163,14 +137,14 @@ export class LlamaEngine {
 
   stop(): void {
     if (this.generating) {
-      try { getNative().llamaStop() } catch (_e) {}
+      try { nativeLlama.llamaStop() } catch (_e) {}
       this.generating = false
     }
   }
 
   free(): void {
     if (this.initialized) {
-      try { getNative().llamaFree() } catch (_e) {}
+      try { nativeLlama.llamaFree() } catch (_e) {}
       this.initialized = false
     }
   }
@@ -212,13 +186,12 @@ export class LlamaEngine {
 }
 
 export async function loadRawfileText(mgr: resourceManager.ResourceManager, name: string): Promise<string> {
-  let data = await mgr.getRawFileContent(name)
-  let arr = new Uint8Array(data)
-  let result = ''
-  for (let i = 0; i < arr.length; i++) {
-    result += String.fromCharCode(arr[i])
+  try {
+    let data = await mgr.getRawFileContent(name)
+    return util.TextDecoder.create('utf-8').decodeToString(data)
+  } catch (e) {
+    throw e as Error
   }
-  return result
 }
 
 export const engine: LlamaEngine = new LlamaEngine()

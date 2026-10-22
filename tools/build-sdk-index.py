@@ -54,6 +54,7 @@ BRACE_RE = re.compile(r'[{}]')
 
 KIT_RE = re.compile(r'@kit\s+(\S+)')
 SINCE_RE = re.compile(r'@since\s+(\S+)')
+SYSCAP_RE = re.compile(r'@syscap\s+(SystemCapability(?:\.[A-Za-z0-9_]+)+)\b')
 PERMISSION_RE = re.compile(r'@permission\s+(.+)')
 DEPRECATED_RE = re.compile(r'@deprecated\b')
 SYSTEMAPI_RE = re.compile(r'@systemapi\b')
@@ -292,12 +293,13 @@ def parse_jsdoc(raw):
         'deprecated': bool(DEPRECATED_RE.search(raw)),
         'systemapi': bool(SYSTEMAPI_RE.search(raw)),
         'permission': permission_m.group(1).strip() if permission_m else '',
+        'syscaps': sorted(set(SYSCAP_RE.findall(raw))),
         'paramDoc': param_doc(raw),
     }
 
 
 EMPTY_JSDOC = {'description': '', 'since': '', 'deprecated': False,
-               'systemapi': False, 'permission': '', 'paramDoc': ''}
+               'systemapi': False, 'permission': '', 'syscaps': [], 'paramDoc': ''}
 
 
 def attach_jsdoc(decls, code, comments):

@@ -1,4 +1,4 @@
-import router from '@ohos.router'
+import common from '@ohos.app.ability.common'
 import { KeyboardAvoidMode } from '@ohos.arkui.UIContext'
 import fs from '@ohos.file.fs'
 import http from '@ohos.net.http'
@@ -283,8 +283,17 @@ struct GeneratePage {
   private failedSource: string = ''
   private serverBytecode: string = ''
 
+  private hostContext(): common.Context {
+    let context = this.getUIContext().getHostContext()
+    if (context === undefined) {
+      this.status = 'Generate host context is unavailable'
+      throw new Error(this.status)
+    }
+    return context
+  }
+
   aboutToAppear(): void {
-    let params = router.getParams() as Record<string, string>
+    let params = this.getUIContext().getRouter().getParams() as Record<string, string>
     if (params !== null && params !== undefined) {
       this.projectId = params['projectId'] || ''
       this.baseVersionId = params['baseVersionId'] || ''
@@ -296,8 +305,9 @@ struct GeneratePage {
         this.compositionJson = v!.composition
       }
     }
-    settings.init(getContext(this).filesDir)
-    initTrace(getContext(this).filesDir)
+    let context = this.hostContext()
+    settings.init(context.filesDir)
+    initTrace(context.filesDir)
     // Shrink the page for the keyboard instead of panning it: panning slides
     // the preview up under the title bar, and with the refine field pinned at
     // the bottom the page has to give up height, not move.
@@ -315,7 +325,8 @@ struct GeneratePage {
 
   private async loadResources(): Promise<void> {
     try {
-      let mgr = getContext(this).resourceManager
+      let context = this.hostContext()
+      let mgr = context.resourceManager
       // Both catalogues are generated rather than written out in the rawfile,
       // so the prompt cannot describe a component the compiler rejects or the
       // renderer cannot draw, nor an intent the compiler will not accept and
@@ -323,8 +334,8 @@ struct GeneratePage {
       // Loaded here as well as in EntryAbility: this page can be reached in a
       // process that started somewhere else, and a prompt built without the
       // file would offer fewer intents than the device actually has.
-      consent.init(getContext(this).filesDir)
-      let extra = loadCatalogFile(getContext(this).filesDir)
+      consent.init(context.filesDir)
+      let extra = loadCatalogFile(context.filesDir)
       if (extra.problems.length > 0) {
         console.warn('VERA-CATALOG rejected ' + extra.rejected.toString() + ' rows: ' +
           extra.problems.join('; '))
@@ -340,7 +351,7 @@ struct GeneratePage {
         .replace('{{UI_CATALOG}}', describeCatalogForPrompt())
         .replace('{{UI_TOOL_NOTE}}\n', '')
       // Chat and Generate share index readiness and background embedding work.
-      ensureCapabilities(getContext(this))
+      ensureCapabilities(context)
       this.ensureEmbeddingsReady()
       this.systemPrompt = this.promptTemplate
       this.grammar = await loadRawfileText(mgr, 'vera.gbnf')
@@ -405,7 +416,7 @@ struct GeneratePage {
   }
 
   private async checkModel(): Promise<void> {
-    let filesDir = getContext(this).filesDir
+    let filesDir = this.hostContext().filesDir
     let modelPath = LlamaEngine.defaultModelPath(filesDir)
     if (!LlamaEngine.modelExists(filesDir)) {
       // hdc file send is blocked on release-provisioned installs, so the
@@ -432,26 +443,34 @@ struct GeneratePage {
   }
 
   private async downloadModel(modelPath: string): Promise<void> {
-    let filesDir = getContext(this).filesDir
+    let context = this.hostContext()
+    let filesDir = context.filesDir
     try {
       fs.mkdirSync(filesDir + '/models', true)
     } catch (_e) {}
     this.status = 'Downloading model (one-time, ~1.9GB)...'
     try {
-      let task = await request.downloadFile(getContext(this), {
-        url: serverUrl() + '/models/qwen2.5-coder-3b-instruct-q4_k_m.gguf',
-        filePath: modelPath
-      })
-      task.on('progress', (received: number, total: number): void => {
-        if (total > 0) {
-          this.status = 'Downloading model ' + Math.floor(received * 100 / total).toString() + '%'
+      if (canIUse('SystemCapability.Request.FileTransferAgent')) {
+        if (canIUse('SystemCapability.MiscServices.Download')) {
+          let task = await request.downloadFile(context, {
+            url: serverUrl() + '/models/qwen2.5-coder-3b-instruct-q4_k_m.gguf',
+            filePath: modelPath
+          })
+          task.on('progress', (received: number, total: number): void => {
+            if (total > 0) {
+              this.status = 'Downloading model ' + Math.floor(received * 100 / total).toString() + '%'
+            }
+          })
+          await new Promise<void>((resolve, reject) => {
+            task.on('complete', (): void => { resolve() })
+            task.on('fail', (err: number): void => { reject(new Error('download failed, code ' + err.toString())) })
+          })
+          this.status = 'Model downloaded'
+          return
         }
-      })
-      await new Promise<void>((resolve, reject) => {
-        task.on('complete', (): void => { resolve() })
-        task.on('fail', (err: number): void => { reject(new Error('download failed, code ' + err.toString())) })
-      })
-      this.status = 'Model downloaded'
+        throw new Error('SystemCapability.MiscServices.Download is not supported')
+      }
+      throw new Error('SystemCapability.Request.FileTransferAgent is not supported')
     } catch (e) {
       this.status = 'Model download failed: ' + (e as Error).message
     }
@@ -459,10 +478,11 @@ struct GeneratePage {
 
   /** Preserve UI preparation and evaluation hooks after shared capability preparation. */
   private async ensureEmbeddingsReady(): Promise<void> {
-    let filesDir = getContext(this).filesDir
-    await prepareCapabilityEmbeddings(getContext(this))
-    let sdkPromise = ensureSdkEmbeddings(filesDir, getContext(this).resourceManager)
-    let intentPromise = ensureIntentEmbeddings(filesDir, getContext(this).resourceManager)
+    let context = this.hostContext()
+    let filesDir = context.filesDir
+    await prepareCapabilityEmbeddings(context)
+    let sdkPromise = ensureSdkEmbeddings(filesDir, context.resourceManager)
+    let intentPromise = ensureIntentEmbeddings(filesDir, context.resourceManager)
     let uiPromise = ensureUiEmbeddings(filesDir)
     if (benchmarkRequested()) {
       await sdkPromise
@@ -476,15 +496,15 @@ struct GeneratePage {
     }
     if (uiEvalRequested()) {
       await uiPromise
-      await runUiEval(getContext(this).resourceManager)
+      await runUiEval(context.resourceManager)
     }
     if (uiAbRequested()) {
       await uiPromise
-      await runUiAb(getContext(this).resourceManager)
+      await runUiAb(context.resourceManager)
     }
     if (sdkEvalRequested()) {
       await sdkPromise
-      await runSdkEval(getContext(this).resourceManager)
+      await runSdkEval(context.resourceManager)
     }
   }
 
@@ -741,7 +761,7 @@ struct GeneratePage {
   private async callModel(request: GenerateRequest, onToken: (token: string) => void): Promise<GenerateResult> {
     if (this.mode === MODE_DEEPSEEK) {
       // Initial generation, refinement, and retries share reasoning and output settings.
-      await ensureCapabilities(getContext(this))
+      await ensureCapabilities(this.hostContext())
       if (this.cancelRequested) { return new GenerateResult() }
       deepseek.setThinking(true)
       request.maxTokens = DEEPSEEK_GENERATION_MAX_TOKENS
@@ -1333,7 +1353,7 @@ struct GeneratePage {
     store.createVersion(this.projectId, source, vbc2, note, fullPrompt, this.originLabel(), this.compositionJson)
     this.status = vbc2.length > 0 ? 'Saved with compiled bytecode' : 'Saved (source only — compile errors)'
     refreshForms()
-    router.back()
+    this.getUIContext().getRouter().back()
   }
 
   /** The saved version's origin: the kinds of the composed screen it began as, "+model" when the model finished or rewrote it. */

@@ -1,4 +1,3 @@
-import router from '@ohos.router'
 import { Project, store } from '../vera/ProjectStore'
 import { consent } from '../vera/VeraConsentStore'
 import { refreshForms } from '../vera/FormUpdater'
@@ -18,8 +17,10 @@ struct Index {
   @State selectedIcon: string = '📱'
 
   aboutToAppear(): void {
-    store.init(getContext(this).filesDir)
-    consent.init(getContext(this).filesDir)
+    let context = this.getUIContext().getHostContext()
+    if (context === undefined) { throw new Error('Project library host context is unavailable') }
+    store.init(context.filesDir)
+    consent.init(context.filesDir)
     this.reload()
   }
 
@@ -62,7 +63,8 @@ struct Index {
               .onClick(() => {
                 let nav = new ProjectNavParams()
                 nav.projectId = p.id
-                router.pushUrl({ url: 'pages/ProjectPage', params: nav })
+                this.getUIContext().getRouter().pushUrl({ url: 'pages/ProjectPage', params: nav })
+                  .catch((e: Error): void => { console.error('Navigate to project failed: ' + e.message) })
               })
             }
             .swipeAction({
@@ -134,7 +136,8 @@ struct Index {
     .menus([{
       value: 'Chat',
       icon: 'resources/base/media/startIcon.png',
-      action: () => { router.pushUrl({ url: 'pages/ChatListPage' }) }
+      action: () => { this.getUIContext().getRouter().pushUrl({ url: 'pages/ChatListPage' })
+        .catch((e: Error): void => { console.error('Navigate to chats failed: ' + e.message) }) }
     }, {
       value: '',
       icon: 'resources/base/media/startIcon.png',
@@ -143,7 +146,8 @@ struct Index {
     .toolbarConfiguration([{
       value: 'Chat',
       status: ToolbarItemStatus.NORMAL,
-      action: () => { router.pushUrl({ url: 'pages/ChatListPage' }) }
+      action: () => { this.getUIContext().getRouter().pushUrl({ url: 'pages/ChatListPage' })
+        .catch((e: Error): void => { console.error('Navigate to chats failed: ' + e.message) }) }
     }, {
       value: 'New Project',
       status: ToolbarItemStatus.NORMAL,
@@ -175,6 +179,7 @@ struct Index {
     refreshForms()
     let nav = new ProjectNavParams()
     nav.projectId = project.id
-    router.pushUrl({ url: 'pages/ProjectPage', params: nav })
+    this.getUIContext().getRouter().pushUrl({ url: 'pages/ProjectPage', params: nav })
+      .catch((e: Error): void => { console.error('Navigate to project failed: ' + e.message) })
   }
 }

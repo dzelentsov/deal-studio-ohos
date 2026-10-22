@@ -8,11 +8,35 @@ const fs = require('node:fs')
 const path = require('node:path')
 const cp = require('node:child_process')
 const {loadVera, loadSource, sourceRoot} = require('./source-loader')
+async function main() {
 const C = loadVera('VeraCompiler'), V = loadVera('VeraInterpreter'), U = loadVera('VeraUi')
 const output = path.resolve(process.argv[2] || '/tmp/vera-visual-verification.json')
 const baseline = process.argv.includes('--capture-baseline')
 const cases = [['counter','change',1,'count',8], ['countdown','start',0,'running',true], ['expense','setBudget',140,'budget',140], ['reading','save',0,'saved',true], ['habit','complete',0,'days',4]]
 const results = [], trees = {}, contrasts = []
+const ts = process.env.VERA_TYPESCRIPT_PATH ? require(process.env.VERA_TYPESCRIPT_PATH) : require('typescript')
+function declaration(source, prefix) {
+ const start=source.indexOf(prefix); assert(start>=0,prefix)
+ const scanner=ts.createScanner(ts.ScriptTarget.Latest,true,ts.LanguageVariant.Standard,source.slice(start))
+ let depth=0
+ while(scanner.scan()!==ts.SyntaxKind.EndOfFileToken) {
+  if(scanner.getToken()===ts.SyntaxKind.OpenBraceToken)depth++
+  if(scanner.getToken()===ts.SyntaxKind.CloseBraceToken&&--depth===0)return source.slice(start,start+scanner.getTextPos())
+ }
+ throw Error(prefix)
+}
+function platformModule(name, mocks, suffix='') {
+ const source=fs.readFileSync(path.join(sourceRoot,'vera',name+'.ets'),'utf8')+suffix
+ const compiled=ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2020,esModuleInterop:true},reportDiagnostics:true})
+ assert.equal((compiled.diagnostics||[]).filter(d=>d.category===ts.DiagnosticCategory.Error).length,0,name+' syntax')
+ const mod={exports:{}}
+ new Function('require','module','exports',compiled.outputText)(name=>{
+  if(Object.hasOwn(mocks,name))return mocks[name]
+  if(name.startsWith('.'))return loadVera(name.slice(2))
+  throw Error('Unexpected dependency: '+name)
+ },mod,mod.exports)
+ return mod.exports
+}
 function test(name, action) { try { action(); results.push({name, result:'PASS'}) } catch(e) { results.push({name, result:'FAIL', error:String(e.stack || e)}) } }
 function vm(bytecode) { return new V.VirtualMachine(V.deserializeVbc2(bytecode), new U.UiHostEnvironment()) }
 function walk(node) { return [node, ...(node.children || []).flatMap(walk)] }
@@ -105,7 +129,83 @@ if (!baseline) {
   }
   assert(renderer.includes("node.kind === 'hero'")); assert(renderer.includes("node.kind === 'adaptivecolumns'")); assert(renderer.includes('node.layoutWidth ='))
  })
- test('renderer measurement survives state reconciliation only', () => {
+  test('scoped renderer APIs preserve dark listener lifecycle and density', () => {
+   const renderer=fs.readFileSync(path.join(sourceRoot,'components/VeraPreview.ets'),'utf8')
+   assert(!/mediaquery\.matchMediaSync|TimePickerDialog\.show|(?<![\w.])vp2px\(/.test(renderer.replace(/\/\*[\s\S]*?\*\//g,'').replace(/\/\/[^\n]*/g,'')))
+   assert(renderer.includes('private darkListener: mediaquery.MediaQueryListener | null'))
+   assert(renderer.includes('this.getUIContext().showTimePickerDialog({'))
+   assert(renderer.includes('x: this.getUIContext().vp2px(this.canvasSide(node.style)) / 100, y: this.getUIContext().vp2px(this.canvasSide(node.style)) / 100'))
+   const names=['watchDarkMode','sparklineCommands','sparklineAreaCommands','sparklineGridCommands']
+   const body=names.map(n=>declaration(renderer,'  private '+n+'(').replace('  private ','')).join('\n')+'\n'+declaration(renderer,'  aboutToDisappear(')
+   const code=ts.transpileModule('class Probe { static SPARKLINE_HEIGHT=200; '+body+' }',{compilerOptions:{target:ts.ScriptTarget.ES2020}}).outputText
+   const Probe=new Function(code+'; const VeraPreview=Probe; return Probe')(), probe=new Probe(), queries=[], events=[]
+   let change, renders=0, density=1
+   const listener={matches:true,on(event,cb){events.push(event);change=cb},off(event){events.push('off:'+event)}}
+   probe.getUIContext=()=>({getMediaQuery:()=>({matchMediaSync(query){queries.push(query);return listener}}),vp2px:value=>value*density})
+   probe.renderView=()=>renders++;probe.stopAllTimers=()=>events.push('stop');probe.dark=false;probe.disposed=false
+   probe.watchDarkMode();assert.deepEqual(queries,['(dark-mode: true)']);assert.equal(probe.dark,true);assert.equal(probe.darkListener,listener)
+   change({matches:true});assert.equal(renders,0);change({matches:false});assert.equal(renders,1);assert.equal(probe.dark,false)
+   for(density of [1,2,3.5]) {
+    assert.equal(probe.sparklineCommands([0,10],10,0,100),`M 0.00 ${(200*density).toFixed(2)} L ${(100*density).toFixed(2)} 0.00`)
+    assert.equal(probe.sparklineCommands([10],10,0,100),`M ${(50*density).toFixed(2)} 0.00`)
+    assert.equal(probe.sparklineCommands([],10,0,100),'')
+    assert.equal(probe.sparklineAreaCommands([0,10],10,0,100),`M 0.00 ${(200*density).toFixed(2)} L ${(100*density).toFixed(2)} 0.00 L ${(100*density).toFixed(2)} ${(200*density).toFixed(2)} L 0.00 ${(200*density).toFixed(2)} Z`)
+    assert(probe.sparklineGridCommands(10,0,100).startsWith(`M 0 ${(200*density).toFixed(2)} L ${(100*density).toFixed(2)} ${(200*density).toFixed(2)}`))
+   }
+   probe.aboutToDisappear();assert.equal(probe.disposed,true);assert.equal(probe.darkListener,null);assert.deepEqual(events,['change','stop','off:change'])
+   change({matches:true});assert.equal(renders,1)
+  })
+  test('native declarations match all nine C++ exports and local package wiring', () => {
+   const root=path.resolve(sourceRoot,'../../../..'), nativeDir=path.join(root,'entry/src/main/cpp/types/libllama')
+   const cpp=fs.readFileSync(path.join(root,'entry/src/main/cpp/napi_llama.cpp'),'utf8')
+   const typings=fs.readFileSync(path.join(nativeDir,'index.d.ts'),'utf8')
+   const nativeNames=[...cpp.matchAll(/\{"(llama\w+)", nullptr,/g)].map(m=>m[1]).sort()
+   assert.equal(nativeNames.length,9)
+   assert.deepEqual([...typings.matchAll(/export const (llama\w+):/g)].map(m=>m[1]).sort(),nativeNames)
+   const pkg=JSON.parse(fs.readFileSync(path.join(nativeDir,'oh-package.json5'),'utf8'))
+   assert.equal(pkg.name,'libllama.so');assert.equal(pkg.types,'./index.d.ts')
+   assert.equal(JSON.parse(fs.readFileSync(path.join(root,'entry/oh-package.json5'),'utf8')).dependencies[pkg.name],'file:./src/main/cpp/types/libllama')
+   const engine=fs.readFileSync(path.join(sourceRoot,'vera/LlamaEngine.ets'),'utf8')
+   assert.equal((engine.match(/^import .* from 'libllama.so'$/gm)||[]).length,1)
+   assert(!engine.includes('interface NativeLlama'));assert(!engine.includes('interface NativeGenerateResult'));assert(!engine.includes('getNative()'))
+   const calls=[], mock=Object.fromEntries(nativeNames.map(name=>[name,(...args)=>{calls.push([name,...args]);return name==='llamaBuildInfo'?'fixture':name==='llamaEmbedInit'?true:name==='llamaEmbedBatch'?[[1]]:new Float32Array([.5])}]))
+   const L=platformModule('LlamaEngine',{'@ohos.file.fs':{},'@ohos.util':{},'libllama.so':mock})
+   assert.equal(L.nativeEmbedInit('{}'),true);assert.deepEqual(L.nativeEmbedBatch(['a']),[[1]])
+   const query=[1],corpus=new Float32Array([2]);assert.deepEqual(L.nativeScanCorpus(query,corpus,1,1),new Float32Array([.5]));L.nativeEmbedFree();assert.equal(L.nativeBuildInfo(),'fixture')
+   assert.deepEqual(calls.map(c=>c[0]),['llamaEmbedInit','llamaEmbedBatch','llamaScanCorpus','llamaEmbedFree','llamaBuildInfo'])
+   assert.equal(calls[2][1],query);assert.equal(calls[2][2],corpus)
+   mock.llamaBuildInfo=()=>{throw Error('old native module')};assert.equal(L.nativeBuildInfo(),'unknown')
+  })
+  test('chat writes close once, preserve primary errors and keep save contract', () => {
+   const failure={open:new Error('open failed'),write:new Error('write failed'),close:new Error('close failed')}
+   for(const mode of ['ok','open','write','close','write+close']) {
+    const calls=[], file={fd:42}, logs=[]
+    const disk={OpenMode:{CREATE:1,WRITE_ONLY:2,TRUNC:4},mkdirSync(){},openSync(p,flags){calls.push(['open',p,flags]);if(mode==='open')throw failure.open;return file},writeSync(fd,text){calls.push(['write',fd,text]);if(mode.includes('write'))throw failure.write},closeSync(f){calls.push(['close',f]);if(mode.includes('close'))throw failure.close}}
+    const S=platformModule('ChatStore',{'@ohos.file.fs':disk},'\nexport { writeText }')
+    const original=mode==='open'?failure.open:mode.includes('write')?failure.write:failure.close
+    if(mode==='ok')S.writeText('/chat','你好 café');else assert.throws(()=>S.writeText('/chat','content'),e=>e===original)
+    assert.equal(calls.filter(c=>c[0]==='close').length,mode==='open'?0:1)
+    if(mode!=='open')assert.equal(calls.at(-1)[1],file)
+    calls.length=0
+    const store=new S.ChatStore(),chat=new S.StoredChat();store.init('/fixture');chat.id='saved';chat.title='你好';chat.messages=[new S.StoredMessage()]
+    const error=console.error;console.error=text=>logs.push(text)
+    try { assert.equal(store.save(chat),undefined) } finally { console.error=error }
+    assert(chat.updatedAt>0);assert.equal(logs.length,mode==='ok'?0:1)
+    if(logs.length)assert.equal(logs[0],'VERA-CHAT save failed: '+original.message)
+    if(mode==='ok')assert.deepEqual(JSON.parse(calls.find(c=>c[0]==='write')[2]),JSON.parse(JSON.stringify(chat)))
+    assert.equal(calls.filter(c=>c[0]==='close').length,mode==='open'?0:1)
+   }
+  })
+  try {
+   const L=platformModule('LlamaEngine',{'@ohos.file.fs':{},'libllama.so':{},'@ohos.util':{TextDecoder:{create(encoding){assert.equal(encoding,'utf-8');return{decodeToString:bytes=>new TextDecoder(encoding).decode(bytes)}}}}})
+   for(const text of ['', 'plain ASCII', '你好 — café'])assert.equal(await L.loadRawfileText({getRawFileContent:async name=>{assert.equal(name,'fixture');return new Uint8Array(Buffer.from(text))}},'fixture'),text)
+   for(const sync of [true,false]) {
+    const error=new Error(sync?'SDK synchronous throw':'SDK rejection')
+    await assert.rejects(()=>L.loadRawfileText({getRawFileContent(){if(sync)throw error;return Promise.reject(error)}},'fixture'),e=>e===error)
+   }
+   results.push({name:'rawfile UTF-8 decoding and original SDK errors',result:'PASS'})
+  } catch(e) { results.push({name:'rawfile UTF-8 decoding and original SDK errors',result:'FAIL',error:String(e.stack||e)}) }
+  test('renderer measurement survives state reconciliation only', () => {
   global.ObservedV2=c=>c; global.Trace=()=>{};
   const L=loadSource(path.join(sourceRoot,'components/VeraLiveTree.ets'))
   const n=new U.VeraUiNode(); n.kind='adaptivecolumns'; n.minimum=240
@@ -122,8 +222,10 @@ if (!baseline) {
   assert(/preserve.*visual|visual.*preserve/i.test(skill));assert(/repair/i.test(skill));assert(/Hero/.test(widget)&&/AdaptiveColumns/.test(widget));assert(/visual preferences|visual direction|style preferences/i.test(chat))
  })
 }
-const report={expected:'All workflows and compatibility checks pass. New components decode correctly. Theme targets match the plan. Enabled text and button contrast is at least 4.5:1. Adaptive columns use one column before measurement and two only when both fit. Widget display and metric roles are capped at 32 vp.',revision:cp.execFileSync('git',['rev-parse','HEAD'],{cwd:path.join(__dirname,'../..'),encoding:'utf8'}).trim(), command:process.argv.join(' '), sourceRoot, baseline, results, trees, contrasts, native:'Unavailable: ArkTS Agent Kit, hdc and hapsigner were not found. Host rendering is approximate.'}
+const report={expected:'All workflows and compatibility checks pass. New components decode correctly. Theme targets match the plan. Enabled text and button contrast is at least 4.5:1. Adaptive columns use one column before measurement and two only when both fit. Widget display and metric roles are capped at 32 vp.',revision:cp.execFileSync('git',['rev-parse','HEAD'],{cwd:path.join(__dirname,'../..'),encoding:'utf8'}).trim(), command:process.argv.join(' '), sourceRoot, baseline, results, trees, contrasts, native:'Not run: host-only verification requested. ArkUI and native module calls are mocked; this does not replace an ArkTS build or device validation.'}
 fs.writeFileSync(output,JSON.stringify(report,null,2)+'\n')
 console.log(`${results.filter(r=>r.result==='PASS').length}/${results.length} PASS; report ${output}`)
 for(const r of results.filter(r=>r.result==='FAIL'))console.error(r.name+': '+r.error.split('\n')[0])
 process.exitCode=results.some(r=>r.result==='FAIL')?1:0
+}
+main().catch(e=>{console.error(e);process.exitCode=1})

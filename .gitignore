@@ -1,5 +1,6 @@
 build/
 .hvigor/
+.vscode/
 node_modules/
 oh_modules/
 /tmp/

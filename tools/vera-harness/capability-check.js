@@ -31,7 +31,10 @@ function fixture(options = {}) {
     assert.equal((result.diagnostics||[]).filter(d=>d.category===ts.DiagnosticCategory.Error).length,0)
     const req=id=>{if(id.includes('insightIntentDriver'))return driver;if(Object.hasOwn(stubs,id))return stubs[id];if(id.startsWith('./'))return load(id.slice(2));throw Error('Unexpected dependency '+id)}
     const timer=(fn,ms)=>setTimeout(fn,ms===10000?20:ms)
-    new Function('require','module','exports','setTimeout','clearTimeout',result.outputText)(req,mod,mod.exports,timer,clearTimeout)
+    const supports = new Set(['SystemCapability.Request.FileTransferAgent','SystemCapability.MiscServices.Download'])
+    if(options.unsupported)supports.delete(options.unsupported)
+    const canIUse = capability => supports.has(capability)
+    new Function('require','module','exports','setTimeout','clearTimeout','canIUse',result.outputText)(req,mod,mod.exports,timer,clearTimeout,canIUse)
     return mod.exports
   }
   return {load,events,release,context:{filesDir:'/test',resourceManager:{}}}
@@ -54,7 +57,13 @@ async function test(name,fn){try{const observed=await fn();checks.push({name,sta
    const f=fixture(options);await f.load('VeraCapabilities').ensureCapabilities(f.context);await pause();await pause()
    if(options.downloadFails||options.modelFails)assert(!f.events.includes('intent-vectors'));return {fallbackAvailable:true,events:f.events}
  })
- await test('Index timeout is bounded; late indexes still prepare embeddings',async()=>{
+  for(const unsupported of ['SystemCapability.Request.FileTransferAgent','SystemCapability.MiscServices.Download'])await test('Unsupported download capability '+unsupported,async()=>{
+    const f=fixture({missingModel:true,unsupported}), service=f.load('VeraCapabilities')
+    await service.ensureCapabilities(f.context);await service.prepareCapabilityEmbeddings(f.context)
+    assert(!f.events.includes('download'));assert(!f.events.includes('model'));assert(!f.events.includes('sdk-vectors'));assert(!f.events.includes('intent-vectors'))
+    assert(f.load('VeraSdkIndex').sdkIndexSize()>0);return {fallbackAvailable:true,events:f.events}
+  })
+  await test('Index timeout is bounded; late indexes still prepare embeddings',async()=>{
    const f=fixture({delayed:true});await f.load('VeraCapabilities').ensureCapabilities(f.context)
    assert(!f.events.includes('intent-vectors'));f.release();await pause();await pause();assert(f.events.includes('intent-vectors'));return f.events
  })
