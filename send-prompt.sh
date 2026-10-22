@@ -14,7 +14,9 @@
 # focus already is.
 set -uo pipefail
 . "$(cd -- "$(dirname -- "$0")" && pwd)/tool-paths.sh"
-export PATH="$(vera_hdc_dir):$PATH"
+
+PATH="$(vera_hdc_dir):$PATH"
+export PATH
 
 TAP_X=""; TAP_Y=""
 if [ "${1:-}" = "-t" ]; then TAP_X="$2"; TAP_Y="$3"; shift 3; fi

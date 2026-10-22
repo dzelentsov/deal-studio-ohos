@@ -194,8 +194,12 @@ function cameraManagerOnce(): camera.CameraManager | null {
   if (cameraManagerInstance !== null) { return cameraManagerInstance }
   let context = AbilityContext.value
   if (context === null) { return null }
-  cameraManagerInstance = camera.getCameraManager(context)
-  return cameraManagerInstance
+  try {
+    cameraManagerInstance = camera.getCameraManager(context)
+    return cameraManagerInstance
+  } catch (e) {
+    throw e as Error
+  }
 }
 
 let audioManagerInstance: audio.AudioManager | null = null
@@ -259,10 +263,14 @@ async function requireAudioPermission(manageConfig: boolean): Promise<void> {
   let context = AbilityContext.value
   if (context === null) { throw new Error('no ability context yet') }
   let permission = manageConfig ? 'ohos.permission.MANAGE_AUDIO_CONFIG' : 'ohos.permission.ACCESS_NOTIFICATION_POLICY'
-  let status = await abilityAccessCtrl.createAtManager().checkAccessToken(context.applicationInfo.accessTokenId,
-    manageConfig ? 'ohos.permission.MANAGE_AUDIO_CONFIG' : 'ohos.permission.ACCESS_NOTIFICATION_POLICY')
-  if (status !== abilityAccessCtrl.GrantStatus.PERMISSION_GRANTED) {
-    throw new Error('permission not granted: ' + permission)
+  try {
+    let status = await abilityAccessCtrl.createAtManager().checkAccessToken(context.applicationInfo.accessTokenId,
+      manageConfig ? 'ohos.permission.MANAGE_AUDIO_CONFIG' : 'ohos.permission.ACCESS_NOTIFICATION_POLICY')
+    if (status !== abilityAccessCtrl.GrantStatus.PERMISSION_GRANTED) {
+      throw new Error('permission not granted: ' + permission)
+    }
+  } catch (e) {
+    throw e as Error
   }
 }
 
@@ -4723,14 +4731,6 @@ const ADAPTERS: Map<string, SdkAdapter> = new Map<string, SdkAdapter>([
   ['PerformanceAnalysisKit.hidebug.disableGwpAsanGrayscale', async (params: Map<string, string>): Promise<string> => {
     if (canIUse('SystemCapability.HiviewDFX.HiProfiler.HiDebug')) {
       hidebug.disableGwpAsanGrayscale()
-      return 'ok'
-    }
-    throw new Error('unsupported capability: SystemCapability.HiviewDFX.HiProfiler.HiDebug')
-  }],
-  ['PerformanceAnalysisKit.hidebug.dumpJsHeapData', async (params: Map<string, string>): Promise<string> => {
-    if (canIUse('SystemCapability.HiviewDFX.HiProfiler.HiDebug')) {
-      let filename = paramString(params, 'filename', '')
-      hidebug.dumpJsHeapData(filename)
       return 'ok'
     }
     throw new Error('unsupported capability: SystemCapability.HiviewDFX.HiProfiler.HiDebug')

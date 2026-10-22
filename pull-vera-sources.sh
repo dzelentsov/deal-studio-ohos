@@ -15,7 +15,9 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 . "$SCRIPT_DIR/tool-paths.sh"
-export PATH="$(vera_hdc_dir):$PATH"
+
+PATH="$(vera_hdc_dir):$PATH"
+export PATH
 
 OUT="${1:-$SCRIPT_DIR/vera-src}"
 BASE="/data/app/el2/100/base/com.vera.probe.dyn/haps/entry/files/vera"

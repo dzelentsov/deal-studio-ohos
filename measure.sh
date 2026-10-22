@@ -76,7 +76,7 @@ for page in tictactoe dashboard; do
       echo "Screenshot the device and set ${var}=\"<x> <y>\"." >&2
       exit 1
     }
-    hdc shell uitest uiInput click $xy >/dev/null 2>&1
+    hdc shell uitest uiInput click "$xy" >/dev/null 2>&1
     sleep 6
 
     log=$(hdc shell "hilog -x" 2>/dev/null | tr -d '\r')
