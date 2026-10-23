@@ -15,13 +15,20 @@
 set -uo pipefail
 . "$(cd -- "$(dirname -- "$0")" && pwd)/tool-paths.sh"
 
-PATH="$(vera_hdc_dir):$PATH"
-export PATH
+vera_use_hdc || exit 1
+export HDC_DEVICE="${HDC_DEVICE:-}"
 
 TAP_X=""; TAP_Y=""
-if [ "${1:-}" = "-t" ]; then TAP_X="$2"; TAP_Y="$3"; shift 3; fi
+if [ "${1:-}" = "-t" ]; then
+  if ! [[ "${2:-}" =~ ^[0-9]+$ && "${3:-}" =~ ^[0-9]+$ ]]; then
+    echo "usage: -t X Y (two integers)" >&2
+    exit 2
+  fi
+  TAP_X="$2"; TAP_Y="$3"; shift 3
+fi
 
 if [ "${1:-}" = "-f" ]; then
+  [ -r "${2:-}" ] || { echo "cannot read file: ${2:-<missing>}" >&2; exit 2; }
   TEXT=$(cat "$2")
 elif [ "${1:-}" = "-" ]; then
   TEXT=$(cat)
@@ -41,13 +48,16 @@ fi
 
 # uitest types a single line; newlines would silently truncate the rest.
 python3 - "$TEXT" <<'PY'
-import shlex, subprocess, sys
+import os, shlex, subprocess, sys
 text = sys.argv[1]
 if '\n' in text:
     print('note: newlines collapsed to spaces -- uitest types one line', file=sys.stderr)
     text = ' '.join(line.strip() for line in text.splitlines() if line.strip())
 cmd = 'uitest uiInput text ' + shlex.quote(text)
-r = subprocess.run(['hdc', 'shell', cmd], capture_output=True, text=True)
+target = os.environ.get('HDC_DEVICE', '')
+argv = ['hdc'] + (['-t', target] if target else []) + ['shell', cmd]
+r = subprocess.run(argv, capture_output=True, text=True, encoding='utf-8', errors='replace')
 out = (r.stdout + r.stderr).strip()
 print(out if out else 'sent', f'({len(text)} chars)')
+sys.exit(r.returncode)
 PY

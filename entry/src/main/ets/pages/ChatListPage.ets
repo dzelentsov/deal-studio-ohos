@@ -82,7 +82,7 @@ struct ChatListPage {
       .height('100%')
     }
     .title('Chats')
-    .titleMode(NavigationTitleMode.Full)
+    .titleMode(NavigationTitleMode.Mini)
     .toolbarConfiguration([{
       value: 'New chat',
       status: ToolbarItemStatus.NORMAL,

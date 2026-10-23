@@ -38,16 +38,18 @@ HVIGOR_EXIT=0
   cd -- "$SCRIPT_DIR" || exit
 
   exec 3>&1                                       # настоящий терминал — в fd 3
-  : > /tmp/hvigor-full.log                        # обнуляем перед запуском (нужно для -a)
+  : > /tmp/hvigor-out.log                         # обнуляем перед запуском (нужно для -a)
+  : > /tmp/hvigor-err.log                         # обнуляем перед запуском (нужно для -a)
 
   bash "$HVIGORW" clean --mode module -p module=entry -p product=default createHapTask --analyze=normal --parallel --incremental --no-daemon \
-    2> >(tee -a /tmp/hvigor-full.log \
+    2> >(tee -a /tmp/hvigor-err.log \
     | awk '
         BEGIN {
           filter = "is[ \t]+system[ \t]+api|system[ \t]+capacity[ \t]+of[ \t]+this[ \t]+api|to[ \t]+use[ \t]+this[ \t]+api,[ \t]+you[ \t]+need[ \t]+to[ \t]+apply[ \t]+for[ \t]+the[ \t]+permissions:|can[ \t]+only[ \t]+be[ \t]+used[ \t]+for[ \t]+testing[ \t]+directories"
-          ansi   = "\033\\[[0-9;]*[A-Za-z]"
+          ansi   = "\033\\[[0-9;?]*[A-Za-z]"
+          reset  = "\033[0m"
           pending = ""
-          suppress_blanks = 0        # 1 = гасим пустые строки после отфильтрованного WARN
+          suppress_blanks = 0
         }
 
         function norm(s) {
@@ -56,11 +58,21 @@ HVIGOR_EXIT=0
         }
 
         {
-          c        = norm($0)
+          c = norm($0)                                            # ВАЖНО: сначала нормализуем
+
+          # 0) hvigor-эхо отфильтрованного предупреждения:
+          #    "> hvigor WARN: ... WARN: ArkTS:WARN File: ..."
+          #    Проверяем по c (ANSI снят), шаблон свободный — двойной warn: + file:
+          if (c ~ /hvigor.*warn:.*warn:.*file:/) {
+            pending = ""
+            printf "%s", reset; fflush()
+            next
+          }
+
           hit      = (c ~ filter)
           is_blank = (c ~ /^[ \t\r]*$/)
 
-          # 1) сразу после отфильтрованного WARN — глотаем все пустые строки подряд
+          # 1) после отфильтрованного WARN — глотаем пустые строки и ohos.permission.*
           if (suppress_blanks) {
             if (is_blank || c ~ /^[ \t]*ohos\.permission\./) { next }
             suppress_blanks = 0
@@ -68,29 +80,45 @@ HVIGOR_EXIT=0
 
           # 2) держим шапку — решаем судьбу пары
           if (pending != "") {
-            if (hit) { pending = ""; suppress_blanks = 1; next }  # тело фильтруемое → гасим пару и последующие пустые
-            print pending; fflush()
-            pending = ""
+            if (hit) {
+              pending = ""; suppress_blanks = 1
+              printf "%s", reset; fflush()
+              next
+            }
+            if (c ~ /^>[ \t]*hvigor /) {
+              pending = ""; suppress_blanks = 1        # шапку-сироту выбросить, статус — печатаем
+            } else {
+              print pending; fflush()
+              pending = ""
+            }
           }
 
           # 3) текущая строка — шапка WARN
           if (c ~ /^warn:.*file:/) {
-            if (hit) { suppress_blanks = 1; next }                 # однострочное WARN — гасим + пустые после
+            if (hit) {
+              suppress_blanks = 1
+              printf "%s", reset; fflush()
+              next
+            }
             pending = $0
             next
           }
 
           # 4) одиночная строка с фильтр-текстом
-          if (hit) { suppress_blanks = 1; next }
+          if (hit) {
+            suppress_blanks = 1
+            printf "%s", reset; fflush()
+            next
+          }
 
-          print; fflush()                                          # всё остальное — как есть, с цветом
+          print; fflush()
         }
 
         END {
           if (pending != "") { print pending; fflush() }
         }
       ' >&3) \
-  | tee /tmp/hvigor-full.log
+  | tee /tmp/hvigor-out.log
 
   status=$?
   wait                                            # дождаться, пока фоновые tee/awk допишут хвост

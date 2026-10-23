@@ -1,6 +1,7 @@
 import { Project, store } from '../vera/ProjectStore'
 import { consent } from '../vera/VeraConsentStore'
 import { refreshForms } from '../vera/FormUpdater'
+import { projectIconResource } from '../vera/ProjectIcons'
 
 const ICONS: string[] = ['📱', '🎮', '📊', '🧮', '🎯', '📝', '🔧', '🎨', '🌍', '⚡']
 
@@ -44,7 +45,8 @@ struct Index {
           ForEach(this.projects, (p: Project) => {
             ListItem() {
               Row() {
-                Text(p.icon).fontSize(36).margin({ right: 14 })
+                Image(projectIconResource(p.icon))
+                  .width(44).height(44).objectFit(ImageFit.Contain).margin({ right: 14 })
                 Column() {
                   Text(p.name).fontSize(17).fontWeight(FontWeight.Medium)
                   Text(new Date(p.createdAt).toLocaleDateString())
@@ -90,16 +92,18 @@ struct Index {
               .margin({ bottom: 16 })
 
             Text('Icon').fontSize(14).fontColor('#666666').margin({ bottom: 8 })
-            Row() {
+            Flex({ wrap: FlexWrap.Wrap, justifyContent: FlexAlign.Center }) {
               ForEach(ICONS, (icon: string) => {
-                Text(icon)
-                  .fontSize(28)
+                Image(projectIconResource(icon))
+                  .width(40)
+                  .height(40)
+                  .objectFit(ImageFit.Contain)
                   .padding(6)
                   .backgroundColor(this.selectedIcon === icon ? '#E0E8FF' : '#00000000')
                   .borderRadius(8)
                   .onClick(() => { this.selectedIcon = icon })
               }, (icon: string) => icon)
-            }.width('100%').justifyContent(FlexAlign.SpaceAround)
+            }.width('100%')
 
             Row({ space: 12 }) {
               Button('Cancel')
@@ -162,12 +166,41 @@ struct Index {
         .backgroundColor('#FF3B30')
         .fontColor('#FFFFFF')
         .height('100%')
-        .onClick(() => {
-          store.deleteProject(id)
-          this.reload()
-          refreshForms()
-        })
+        .onClick(() => { this.confirmDelete(id) })
     }.height('100%').padding({ left: 8 })
+  }
+
+  private confirmDelete(id: string): void {
+    let project = store.getProject(id)
+    if (project === null) { return }
+    this.getUIContext().showAlertDialog({
+      title: 'Delete mini-app?',
+      message: 'Delete "' + project.name + '" and all its saved versions and data? This cannot be undone.',
+      primaryButton: {
+        value: 'Cancel',
+        action: () => {}
+      },
+      secondaryButton: {
+        value: 'Delete',
+        fontColor: '#FF3B30',
+        action: () => { this.doDelete(id) }
+      }
+    })
+  }
+
+  private doDelete(id: string): void {
+    try {
+      store.deleteProject(id)
+    } catch (e) {
+      console.error('Delete project failed: ' + (e as Error).message)
+      try {
+        this.getUIContext().getPromptAction().showToast({ message: 'Could not delete mini-app.' })
+      } catch (toastError) {
+        console.error('Show deletion error failed: ' + (toastError as Error).message)
+      }
+    }
+    this.reload()
+    refreshForms()
   }
 
   private doCreate(): void {

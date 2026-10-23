@@ -89,7 +89,7 @@ A program that calls `std/intent` needs system signing, because
 For shell-only changes, run:
 
 ```bash
-for script in build-hap.sh sign-system.sh update-phone.sh tool-paths.sh measure.sh; do
+for script in build-hap.sh sign-system.sh update-phone.sh tool-paths.sh measure.sh pull-vera-sources.sh send-prompt.sh; do
   bash -n "$script" || exit
 done
 git diff --check
@@ -101,7 +101,9 @@ available.
 ## Three traps that cost real time
 
 **Never `hdc uninstall`.** It destroys `{filesDir}/vera`: every saved project,
-every program's state and the DeepSeek API key. There is no backup route. If an
+every program's state and the DeepSeek API key. The sandbox is readable from
+`hdc shell`, so before anything risky run `./pull-vera-sources.sh --raw` (sources,
+prompts, raw JSON; the API key is not copied). If an
 install is refused, work out why. A normal app cannot be updated into a system
 app in place (`9568294 apptype not same`), so a bundle that has ever been
 installed normally must be built under a throwaway `bundleName` to test a system
@@ -120,6 +122,20 @@ in the source.
 
 **Prompts typed into the Generate screen are written in English**, even when the
 conversation is not.
+
+## Reading from and driving the phone
+
+Three helper scripts talk to the phone through `hdc` and honour `HDC_DEVICE`:
+
+- `./pull-vera-sources.sh [--raw] [dir]` copies every saved version (the `.vera`
+  program plus its `.prompt.txt`; `--raw` adds the raw JSON and program state)
+  off the phone. Use it to see what the model actually generated, and as a
+  backup before anything risky. Programs that were generated but never saved are
+  not on the device. The output holds the person's prompts: do not commit it.
+- `./send-prompt.sh [-t X Y] "text"` types text into the focused field. Prompts
+  are English (see above).
+- `./measure.sh [reps]` is the cold-run benchmark. It needs `arkui-device-cli`
+  and writes `results/device.jsonl`.
 
 ## Checking things without a device
 

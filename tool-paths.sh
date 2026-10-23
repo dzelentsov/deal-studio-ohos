@@ -97,6 +97,22 @@ vera_hdc_dir() {
   return 1
 }
 
+# Puts hdc on PATH and defines an `hdc` function that targets HDC_DEVICE when it
+# is set (otherwise hdc picks the only connected device itself). Scripts that call
+# plain `hdc` run `vera_use_hdc || exit 1` first.
+vera_use_hdc() {
+  local dir
+  dir=$(vera_hdc_dir) || return 1
+  export PATH="$dir:$PATH"
+  hdc() {
+    if [ -n "${HDC_DEVICE:-}" ]; then
+      command hdc -t "$HDC_DEVICE" "$@"
+    else
+      command hdc "$@"
+    fi
+  }
+}
+
 vera_signing_device() {
   local targets actual_udid
   HDC_DIR=$(vera_hdc_dir) || return 1

@@ -6,6 +6,7 @@ oh_modules/
 /tmp/
 /entry/.cxx/
 local.properties
+results/*.prev
 
 # The device catalogue never belongs here.
 #

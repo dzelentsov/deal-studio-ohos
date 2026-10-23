@@ -89,8 +89,8 @@ The programs are the exact artifacts the benchmark scored, compiled to vbc1 and
 embedded as literals so the timed region has no network and no file I/O:
 `tictactoe` (6557 B) and `dashboard` (1439 B) from `results/cortex5`.
 
-`./measure.sh 3` runs three cold repetitions per program and writes
-`results/device.jsonl`.
+`./measure.sh 3` runs three cold repetitions per program and writes one JSON
+object per run to `results/device.jsonl` (details under "Helper scripts").
 
 ## Generation modes
 
@@ -130,8 +130,11 @@ The same file holds `model` and `baseUrl`, so pointing the app at another
 OpenAI-compatible endpoint needs no rebuild.
 
 This keeps the key out of git and out of the HAP, but it is not a secret against
-someone holding the unlocked phone. Use a key dedicated to this project and
-revoke it in the DeepSeek console if the phone leaves your hands.
+someone holding the unlocked phone: the app sandbox is readable from `hdc shell`
+on the current system-signed build (`pull-vera-sources.sh` relies on this), and
+`settings.json` is in the same directory, so assume it is readable too. Use a key
+dedicated to this project and revoke it in the DeepSeek console if the phone
+leaves your hands.
 
 ## Running it
 
@@ -144,7 +147,7 @@ and real UDIDs out of the repo.
 |---|---|---|
 | Hvigor 7.26.0.static wrapper | every build | `HVIGORW`: absolute path to the wrapper; never resolved from `PATH` |
 | Build SDK 26.0.0 | every build | `OHOS_BASE_SDK_HOME` and `DEVECO_SDK_HOME`, both naming existing SDK directories |
-| hdc | install/update, device-bound signing, measurement | SDK toolchains directory on `PATH`, or `HDC_DIR` naming the directory that contains `hdc` |
+| hdc | install/update, device-bound signing, measurement, `pull-vera-sources.sh`, `send-prompt.sh` | SDK toolchains directory on `PATH`, or `HDC_DIR` naming the directory that contains `hdc` |
 | hapsigner | signing | `HAPSIGNER`: directory whose `dist/` holds `hap-sign-tool.jar`, `OpenHarmony.p12`, `OpenHarmonyProfileRelease.pem` and `OpenHarmonyApplication.pem` |
 | Java | signing | a JRE providing `java` on `PATH` |
 | Python 3 | device-bound signing and update | `python3` on `PATH` |
@@ -262,11 +265,24 @@ An already-installed normal build cannot be updated into a system one
 
 **Never uninstall the app or clear its data.** That destroys `{filesDir}/vera`:
 every project, every saved program state and the stored API key. The sandbox is
-not readable from `hdc shell` on a release-signed build, so there is no backup
-route. If an install is refused, find out why. To test a system profile on a
+readable from `hdc shell` on the current system-signed build, so a copy can be
+taken first with `./pull-vera-sources.sh --raw` (sources, prompts and the raw
+version and state JSON; the API key is not copied). If an install is refused,
+find out why. To test a system profile on a
 bundle that was ever installed normally, build under a throwaway `bundleName` and
 install alongside it; never change the bundle name to work around an update
 failure.
+
+## Helper scripts
+
+| script | what it does |
+|---|---|
+| `./measure.sh [reps]` | Cold-run measurement loop (see "What it measures"). Finds the two bench buttons in a layout dump (needs the Agent Kit's `arkui-device-cli`), falls back to fixed coordinates, and writes one JSON object per run to `results/device.jsonl`, with the device model and OS build in `results/device.meta`. A run with no `VERA_PROBE` line in hilog stops with an error; the previous results are kept as `device.jsonl.prev` |
+| `./pull-vera-sources.sh [--raw] [dir]` | Copies every saved version off the phone into `dir` (default `./vera-src`): `<project>--<version>.vera` (the program) and `<project>--<version>.prompt.txt` (the prompt that produced it). `--raw` also keeps the original version and state JSON under `raw/`. Programs that were generated but never saved are not on the device and are not pulled. Exits non-zero if any file could not be fetched. The output contains your prompts, so keep it out of git |
+| `./send-prompt.sh [-t X Y] "text"` | Types text into the focused field of the phone (`-f FILE` reads it from a file, `-` from stdin); `-t X Y` taps a point first. Newlines are collapsed to spaces, because `uitest` types one line |
+
+All three call plain `hdc`. When more than one phone is connected, export
+`HDC_DEVICE` first, as for the build scripts.
 
 ## Historical notes
 

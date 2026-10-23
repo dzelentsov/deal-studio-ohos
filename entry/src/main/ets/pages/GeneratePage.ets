@@ -3,7 +3,7 @@ import { KeyboardAvoidMode } from '@ohos.arkui.UIContext'
 import fs from '@ohos.file.fs'
 import http from '@ohos.net.http'
 import request from '@ohos.request'
-import { store } from '../vera/ProjectStore'
+import { Version, VersionMetrics, store } from '../vera/ProjectStore'
 import { refreshForms } from '../vera/FormUpdater'
 import { engine, LlamaEngine, GenerateRequest, GenerateResult, loadRawfileText } from '../vera/LlamaEngine'
 import { compileVeraSource, CompileError } from '../vera/VeraCompiler'
@@ -217,6 +217,10 @@ struct GeneratePage {
   @State projectId: string = ''
   @State baseVersionId: string = ''
   @State prompt: string = ''
+  @State requestHistory: string = ''
+  @State baseVersionNumber: number = 0
+  @State nextVersionNumber: number = 1
+  @State baseError: string = ''
   @State generatedSource: string = ''
   @State status: string = ''
   @State generating: boolean = false
@@ -312,6 +316,177 @@ struct GeneratePage {
   private lastRequest: string = ''
   private failedSource: string = ''
   private serverBytecode: string = ''
+  private pendingHistory: string = ''
+  private pendingRequest: string = ''
+  private acceptedRequest: string = ''
+  private acceptedComposition: string = ''
+  private acceptedOrigin: string = ''
+  private acceptedMetrics: VersionMetrics | null = null
+  private metricTotals: VersionMetrics = new VersionMetrics()
+  private metricRunId: number = -1
+  private metricMode: string = ''
+  private metricModel: string = ''
+  private metricPriced: boolean = false
+  private metricRates: number[] = []
+  private metricSeenSideCalls: Set<SideCall> = new Set<SideCall>()
+  private metricPendingRuns: Set<number> = new Set<number>()
+  private metricStaleRuns: Set<number> = new Set<number>()
+
+  private prepareRequest(ask: string): void {
+    this.finishMetrics(this.runId)
+    this.pendingRequest = ask
+    this.pendingHistory = this.requestHistory.length > 0 ?
+      this.requestHistory + '\n\nRefinement:\n' + ask : ask
+    this.metricRunId = this.runId + 1
+    this.metricMode = this.mode
+    this.metricModel = this.mode === MODE_DEEPSEEK ? settings.getModel() :
+      (this.mode === MODE_LOCAL ? 'qwen2.5-coder-3b-instruct-q4_k_m' : '')
+    this.metricPriced = this.mode === MODE_DEEPSEEK && this.metricModel === 'deepseek-flash' &&
+      settings.getBaseUrl().replace(/\/+$/, '') === 'https://api.deepseek.com'
+    this.metricRates = [this.ratePerMillion('cache'), this.ratePerMillion('fresh'), this.ratePerMillion('output')]
+    this.metricSeenSideCalls = new Set<SideCall>(deepseek.getSideCalls())
+    let totals = this.metricTotals
+    if (totals.runs === 0) {
+      totals.provider = this.modeLabel()
+      totals.model = this.metricModel
+    } else {
+      if (totals.provider !== this.modeLabel()) { totals.provider = 'Mixed' }
+      if (totals.model !== this.metricModel) { totals.model = 'Mixed' }
+    }
+    totals.runs++
+    if (!this.metricPriced) { totals.partial = true }
+  }
+
+  private measuredTotal(total: number, value: number): number {
+    return value < 0 ? total : Math.max(0, total) + value
+  }
+
+  private addMetricUsage(input: number, cached: number, output: number, priced: boolean): void {
+    let totals = this.metricTotals
+    totals.inputTokens = this.measuredTotal(totals.inputTokens, input)
+    totals.cacheHitTokens = this.measuredTotal(totals.cacheHitTokens, cached)
+    totals.outputTokens = this.measuredTotal(totals.outputTokens, output)
+    if (priced && input >= 0 && cached >= 0 && output >= 0) {
+      let usd = (cached * this.metricRates[0] + Math.max(0, input - cached) * this.metricRates[1] +
+        output * this.metricRates[2]) / 1000000
+      totals.estimatedUsd = this.measuredTotal(totals.estimatedUsd, usd)
+    } else {
+      totals.partial = true
+    }
+    if (input < 0 || cached < 0 || output < 0) { totals.partial = true }
+  }
+
+  private async metricWork<T>(run: number, work: () => Promise<T>): Promise<T> {
+    this.metricPendingRuns.add(run)
+    try {
+      return await work()
+    } finally {
+      this.metricPendingRuns.delete(run)
+      if (this.metricStaleRuns.delete(run) && this.metricRunId >= 0) {
+        this.metricSeenSideCalls = new Set<SideCall>(deepseek.getSideCalls())
+        this.metricTotals.partial = true
+      }
+    }
+  }
+
+  private collectMetricSideCalls(run: number): void {
+    if (this.metricRunId !== run || this.metricMode === MODE_SERVER) { return }
+    if (this.metricStaleRuns.size > 0) {
+      this.metricTotals.partial = true
+      return
+    }
+    for (let call of deepseek.getSideCalls()) {
+      if (this.metricSeenSideCalls.has(call)) { continue }
+      this.metricSeenSideCalls.add(call)
+      if (!call.ok || (call.inputTokens === 0 && call.outputTokens === 0)) {
+        this.metricTotals.partial = true
+        continue
+      }
+      this.addMetricUsage(call.inputTokens, call.cachedTokens, call.outputTokens, this.metricPriced)
+    }
+  }
+
+  private beginMetricAttempt(run: number): void {
+    if (this.metricRunId === run) { this.metricTotals.attempts++ }
+  }
+
+  private recordMetricResult(run: number, result: GenerateResult): void {
+    if (this.metricRunId !== run) { return }
+    let known = result.inputTokens > 0 || result.outputTokens > 0
+    let completeCache = this.metricMode === MODE_DEEPSEEK && deepseek.lastToolRounds() === 0 &&
+      this.metricStaleRuns.size === 0
+    let cached = completeCache && known ? deepseek.lastCacheHitTokens() : -1
+    this.addMetricUsage(known ? result.inputTokens : -1, cached,
+      known ? result.outputTokens : -1, this.metricPriced && completeCache)
+    this.collectMetricSideCalls(run)
+  }
+
+  private finishMetrics(run: number): void {
+    if (this.metricRunId !== run) { return }
+    this.collectMetricSideCalls(run)
+    this.metricTotals.elapsedMs += Math.max(0, Date.now() - this.genStartTime)
+    this.metricRunId = -1
+  }
+
+  private copyMetrics(metrics: VersionMetrics): VersionMetrics {
+    let copy = new VersionMetrics()
+    copy.provider = metrics.provider
+    copy.model = metrics.model
+    copy.elapsedMs = metrics.elapsedMs
+    copy.runs = metrics.runs
+    copy.attempts = metrics.attempts
+    copy.inputTokens = metrics.inputTokens
+    copy.cacheHitTokens = metrics.cacheHitTokens
+    copy.outputTokens = metrics.outputTokens
+    copy.estimatedUsd = metrics.estimatedUsd
+    copy.partial = metrics.partial
+    return copy
+  }
+
+  private acceptRequest(): void {
+    this.requestHistory = this.pendingHistory
+    this.acceptedRequest = this.pendingRequest
+    this.acceptedComposition = this.compositionJson
+    this.acceptedOrigin = this.originLabel()
+    this.totalMs = Math.max(0, Date.now() - this.genStartTime)
+    this.finishMetrics(this.runId)
+    this.acceptedMetrics = this.copyMetrics(this.metricTotals)
+  }
+
+  private startNew(): void {
+    this.baseVersionId = ''
+    this.baseVersionNumber = 0
+    this.baseError = ''
+    this.previousSource = ''
+    this.requestHistory = ''
+    this.pendingHistory = ''
+    this.pendingRequest = ''
+    this.acceptedRequest = ''
+    this.acceptedComposition = ''
+    this.acceptedOrigin = ''
+    this.acceptedMetrics = null
+    this.metricTotals = new VersionMetrics()
+    this.metricRunId = -1
+    this.metricSeenSideCalls = new Set<SideCall>()
+    this.compiledSource = ''
+    this.compiledVbc2 = ''
+    this.generatedSource = ''
+    this.compositionJson = ''
+    this.completionBase = ''
+    this.completionBaseVbc2 = ''
+    this.completionComposition = ''
+    this.templateKinds = []
+    this.modelWrote = false
+    this.previewVbc2 = ''
+    this.previewNote = ''
+    this.compiled = false
+    this.compileErrors = ''
+    this.prompt = ''
+    this.refinePrompt = ''
+    this.lastRequest = ''
+    this.composerOpen = true
+    this.nextVersionNumber = store.listVersions(this.projectId).length + 1
+  }
 
   private hostContext(): common.Context {
     let context = this.getUIContext().getHostContext()
@@ -328,14 +503,24 @@ struct GeneratePage {
       this.projectId = params['projectId'] || ''
       this.baseVersionId = params['baseVersionId'] || ''
     }
+    let context = this.hostContext()
+    store.init(context.filesDir)
+    let versions = store.listVersions(this.projectId)
+    this.nextVersionNumber = versions.length + 1
     if (this.baseVersionId.length > 0) {
       let v = store.getVersion(this.projectId, this.baseVersionId)
-      if (v !== null) {
-        this.previousSource = v!.source
-        this.compositionJson = v!.composition
+      let index = versions.findIndex((version: Version): boolean => version.id === this.baseVersionId)
+      if (v !== null && v.source.length > 0 && index >= 0) {
+        this.baseVersionNumber = versions.length - index
+        this.previousSource = v.source
+        this.requestHistory = v.prompt
+        this.compositionJson = v.composition
+        this.templateKinds = v.origin.replace('+model', '').split(',').filter((kind: string): boolean => kind.length > 0)
+        this.modelWrote = v.origin.endsWith('+model')
+      } else {
+        this.baseError = 'The selected version is unavailable or has no source. Return to the version list.'
       }
     }
-    let context = this.hostContext()
     settings.init(context.filesDir)
     initTrace(context.filesDir)
     // Shrink the page for the keyboard instead of panning it: panning slides
@@ -539,7 +724,8 @@ struct GeneratePage {
   }
 
   private doGenerate(): void {
-    if (this.prompt.trim().length === 0) { return }
+    if (this.prompt.trim().length === 0 || this.baseError.length > 0 || this.generating) { return }
+    if (this.compiledSource.length > 0) { this.previousSource = this.compiledSource }
     if (this.mode === MODE_SERVER) {
       if (!settings.hasServerUrl()) { this.checkServer(); return }
       this.doServerGenerate()
@@ -550,6 +736,7 @@ struct GeneratePage {
       return
     }
     if (this.mode === MODE_LOCAL && !this.modelReady) { return }
+    this.prepareRequest(this.prompt.trim())
     this.generating = true
     this.generatedSource = ''
     this.compiled = false
@@ -566,8 +753,6 @@ struct GeneratePage {
     this.routeFallback = ''
     this.sideCalls = []
     this.serverBytecode = ''
-    this.compiledVbc2 = ''
-    this.compiledSource = ''
     this.previewVbc2 = ''
     this.previewNote = ''
     this.settleQuestion(null)
@@ -577,10 +762,12 @@ struct GeneratePage {
     this.completionBase = ''
     this.completionBaseVbc2 = ''
     this.completionComposition = ''
-    this.modelWrote = false
+    if (this.previousSource.length === 0) {
+      this.modelWrote = false
+      this.templateKinds = []
+      this.compositionJson = ''
+    }
     this.runId++
-    this.templateKinds = []
-    this.compositionJson = ''
     this.program = new RunTotals()
     this.delta = new SourceDelta()
     this.runs = []
@@ -621,14 +808,20 @@ struct GeneratePage {
 
   private async tryRoute(userPrompt: string, route: RouteRequest): Promise<void> {
     let run = this.runId
+    this.metricTotals.partial = true
     let host = appAgentHost((s: string): void => { if (run === this.runId) { this.status = s } }, (vbc2: string): void => {
       if (run !== this.runId || this.cancelRequested) { return }
       this.previewVbc2 = vbc2
       this.previewNote = 'Sketching the screen...'
     }, (): boolean => run !== this.runId || this.cancelRequested, this.promptTemplate)
     host.ask = (question: AgentQuestion): Promise<number | null> => this.askPerson(question)
-    let outcome: RouteOutcome = await buildScreen(route, host)
-    if (run !== this.runId || outcome.kind === OUTCOME_CANCELLED) { return }
+    let outcome: RouteOutcome = await this.metricWork(run, (): Promise<RouteOutcome> => buildScreen(route, host))
+    if (run !== this.runId) { return }
+    if (outcome.kind === OUTCOME_CANCELLED) {
+      this.metricTotals.partial = true
+      this.finishMetrics(run)
+      return
+    }
     if (outcome.agent !== null) { this.traceAgent(outcome.agent!) }
     if (outcome.blocks !== null) { this.noteBlocks(outcome.blocks!) }
     if (outcome.kind === OUTCOME_AGENT) {
@@ -654,6 +847,7 @@ struct GeneratePage {
     this.status = 'Not built (' + (this.totalMs / 1000).toFixed(1) + ' s): ' + outcome.reason
     if (this.previewVbc2.length > 0) { this.previewNote = 'Preview from the sketch only — the app was not built' }
     this.traceEnd('not built: ' + outcome.reason)
+    this.finishMetrics(run)
   }
 
   private traceAgent(result: AgentResult): void {
@@ -679,6 +873,7 @@ struct GeneratePage {
     this.generatedSource = result.source
     this.compiledSource = result.source
     this.compiledVbc2 = result.vbc2
+    this.acceptRequest()
     this.compiled = true
     this.compileErrors = ''
     this.composerOpen = false
@@ -716,6 +911,7 @@ struct GeneratePage {
     this.compiledVbc2 = build.vbc2
     this.compiledSource = build.source
     this.compositionJson = build.composition
+    this.acceptRequest()
     this.composerOpen = false
     this.tab = TAB_PREVIEW
     this.compiled = true
@@ -746,7 +942,8 @@ struct GeneratePage {
     if (UI_SELECT_MODE !== UI_SELECT_FULL && this.mode === MODE_DEEPSEEK && this.skillText.length > 0) {
       this.status = 'Choosing UI components...'
       let selectStartedAt = Date.now()
-      let selected = await selectUiForPrompt(UI_SELECT_MODE, userPrompt, this.previousSource)
+      let selected = await this.metricWork(run,
+        (): Promise<Set<string> | null> => selectUiForPrompt(UI_SELECT_MODE, userPrompt, this.previousSource))
       logStep('ui-select', selectStartedAt, 'mode=' + UI_SELECT_MODE)
       if (run !== this.runId || this.cancelRequested) { return }
       if (selected === null) {
@@ -769,10 +966,16 @@ struct GeneratePage {
       }
     }
     this.status = label + ' (attempt 1/' + MAX_RETRIES + ')...'
-    this.runAttempt(plan.length > 0 ? userPrompt + '\n\n' + plan : userPrompt, '')
+    let contextPrompt = this.requestHistory.length > 0 ?
+      'Version request history:\n' + this.requestHistory + '\n\nCurrent change request:\n' + userPrompt : userPrompt
+    this.runAttempt(plan.length > 0 ? contextPrompt + '\n\n' + plan : contextPrompt, '')
   }
 
-  private async doServerGenerate(): Promise<void> {
+  private async doServerGenerate(ask: string = ''): Promise<void> {
+    let submitted = ask.length > 0 ? ask : this.prompt.trim()
+    this.prepareRequest(submitted)
+    this.cancelRequested = false
+    let run = ++this.runId
     this.generating = true
     this.generatedSource = ''
     this.compiled = false
@@ -788,28 +991,27 @@ struct GeneratePage {
     this.routeFallback = ''
     this.sideCalls = []
     this.serverBytecode = ''
-    this.compiledVbc2 = ''
-    this.compiledSource = ''
     this.program = new RunTotals()
     this.delta = new SourceDelta()
     this.runs = []
-    this.startRun(this.prompt.trim())
+    this.startRun(submitted)
     this.genStartTime = Date.now()
-    this.lastRequest = this.prompt.trim()
+    this.lastRequest = submitted
     this.status = this.previousSource.length > 0 ? 'Server refining...' : 'Server generating...'
 
     let metrics = new AttemptMetrics()
     metrics.attempt = 1
+    this.beginMetricAttempt(run)
     let client = http.createHttp()
     try {
       let genStart = Date.now()
       // Refinement: send the base version's source so the server can edit it
       // instead of regenerating from scratch.
-      let requestBody: string = this.prompt.trim()
+      let requestBody: string = this.pendingHistory
       let contentType: string = 'text/plain; charset=utf-8'
       if (this.previousSource.length > 0) {
         let refine = new RefineRequest()
-        refine.prompt = this.prompt.trim()
+        refine.prompt = this.pendingHistory
         refine.previousSource = this.previousSource
         requestBody = JSON.stringify(refine)
         contentType = 'application/json'
@@ -821,15 +1023,25 @@ struct GeneratePage {
         connectTimeout: 10000,
         readTimeout: 180000
       })
+      if (run !== this.runId || this.cancelRequested) { return }
       metrics.genMs = Date.now() - genStart
 
       if (resp.responseCode === 200) {
         let body = resp.result as string
         let decoded = decodeServerResponse(body)
+        if (decoded.source.trim().length === 0 || decoded.bytecode.trim().length === 0) {
+          this.status = 'Server result has no source/bytecode pair; the previous successful result is unchanged'
+          this.generating = false
+          this.totalMs = Date.now() - this.genStartTime
+          return
+        }
         this.generatedSource = decoded.source
         this.serverBytecode = decoded.bytecode
         this.compiledVbc2 = decoded.bytecode
         this.compiledSource = decoded.source
+        this.compositionJson = ''
+        this.modelWrote = true
+        this.acceptRequest()
         this.composerOpen = false
         this.tab = TAB_PREVIEW
         this.compiled = true
@@ -858,10 +1070,12 @@ struct GeneratePage {
         this.status = 'Server generation failed'
       }
     } catch (e) {
+      if (run !== this.runId || this.cancelRequested) { return }
       this.compileErrors = 'Request failed: ' + (e as Error).message
       this.status = 'Server unreachable'
     } finally {
       client.destroy()
+      if (run === this.runId) { this.finishMetrics(run) }
     }
 
     this.attempts = [metrics]
@@ -873,11 +1087,11 @@ struct GeneratePage {
    * The one place that knows which model is behind the loop. Everything after
    * it -- compile, collect diagnostics, retry -- is identical for both.
    */
-  private async callModel(request: GenerateRequest, onToken: (token: string) => void): Promise<GenerateResult> {
+  private async callModel(request: GenerateRequest, onToken: (token: string) => void, run: number): Promise<GenerateResult> {
     if (this.mode === MODE_DEEPSEEK) {
       // Initial generation, refinement, and retries share reasoning and output settings.
       await ensureCapabilities(this.hostContext())
-      if (this.cancelRequested) { return new GenerateResult() }
+      if (run !== this.runId || this.cancelRequested) { return new GenerateResult() }
       // Finishing a composed screen only adds to it, and reasoning was most of that call's output; repairs and a
       // generation from scratch still think.
       let finishingBase = this.completionBase.length > 0 && request.previousSource === this.completionBase
@@ -927,17 +1141,21 @@ struct GeneratePage {
     let genStart = Date.now()
     let firstTokenAt = 0
     let genResult: GenerateResult
+    this.beginMetricAttempt(run)
     try {
-      genResult = await this.callModel(request, (token: string) => {
+      genResult = await this.metricWork(run, (): Promise<GenerateResult> => this.callModel(request, (token: string) => {
+        if (run !== this.runId || this.cancelRequested) { return }
         if (firstTokenAt === 0) { firstTokenAt = Date.now() }
         this.generatedSource += token
-      })
+      }, run))
       if (run !== this.runId) { return }
+      this.recordMetricResult(run, genResult)
       if (genResult.text.length > 0) {
         this.generatedSource = genResult.text
       }
     } catch (e) {
       if (run !== this.runId) { return }
+      this.metricTotals.partial = true
       metrics.genMs = Date.now() - genStart
       metrics.failLayer = 'request'
       this.attempts = [...this.attempts, metrics]
@@ -948,6 +1166,7 @@ struct GeneratePage {
         this.status = 'Generation failed: ' + (e as Error).message
       }
       this.generating = false
+      this.finishMetrics(run)
       return
     }
     metrics.genMs = Date.now() - genStart
@@ -957,6 +1176,8 @@ struct GeneratePage {
       this.totalMs = Date.now() - this.genStartTime
       this.status = 'Stopped'
       this.generating = false
+      this.metricTotals.partial = true
+      this.finishMetrics(run)
       return
     }
     metrics.inputTokens = genResult.inputTokens
@@ -994,6 +1215,7 @@ struct GeneratePage {
             this.status = 'Compilation failed after ' + MAX_RETRIES + ' attempts'
           }
           this.generating = false
+          this.finishMetrics(run)
         }
         return
       }
@@ -1010,6 +1232,7 @@ struct GeneratePage {
       this.attempts = [...this.attempts, metrics]
       this.totalMs = Date.now() - this.genStartTime
       this.addToProgram(metrics)
+      this.finishMetrics(run)
       return
     }
 
@@ -1065,6 +1288,8 @@ struct GeneratePage {
       this.compiled = true
       this.compileErrors = ''
       this.modelWrote = true
+      this.compositionJson = ''
+      this.acceptRequest()
       this.status = 'Compiled successfully on attempt ' + this.attempt
       logMark('gen-compiled', 'attempt=' + this.attempt.toString())
       let endFields: Record<string, Object> = {}
@@ -1100,6 +1325,7 @@ struct GeneratePage {
         this.status = (metrics.failLayer === 'runtime' ? 'Still stopping on its first run' : 'Compilation failed') +
           ' after ' + MAX_RETRIES + ' attempts'
       }
+      this.finishMetrics(run)
     }
   }
 
@@ -1114,6 +1340,7 @@ struct GeneratePage {
     this.compiledSource = this.completionBase
     this.compiledVbc2 = this.completionBaseVbc2
     this.compositionJson = this.completionComposition
+    this.acceptRequest()
     this.compileErrors = ''
     this.compiled = true
     this.composerOpen = false
@@ -1366,7 +1593,7 @@ struct GeneratePage {
   }
 
   private hasResult(): boolean {
-    return this.compiledVbc2.length > 0
+    return this.compiledVbc2.length > 0 && this.compiledSource.length > 0
   }
 
   /**
@@ -1378,7 +1605,7 @@ struct GeneratePage {
    */
   private doRefine(): void {
     let ask = this.refinePrompt.trim()
-    if (ask.length === 0 || this.compiledSource.length === 0) { return }
+    if (ask.length === 0 || this.compiledSource.length === 0 || this.generating || this.baseError.length > 0) { return }
     // A change that only adds, removes, replaces or moves a block of a composed screen is made on its
     // record, with no model rewrite; anything else, and any step that does not hold, refines as before.
     if (this.compositionJson.length > 0 && this.mode === MODE_DEEPSEEK && templateSelectEnabled() && settings.hasSelectorKey()) {
@@ -1395,18 +1622,20 @@ struct GeneratePage {
       this.refineWithModel(ask)
       return
     }
+    this.prepareRequest(ask)
     this.generating = true
     this.cancelRequested = false
     let run = ++this.runId
     this.genStartTime = Date.now()
+    this.metricTotals.partial = true
     this.status = 'Checking whether this changes the structure...'
-    let result: EditResult = await editComposition(ask, record, this.mode,
-      (request: string, c: Composition): Promise<CompositionEdit> => selectEdit(request, c, settings.getSelectorKey()))
+    let result: EditResult = await this.metricWork(run, (): Promise<EditResult> => editComposition(ask, record!, this.mode,
+      (request: string, c: Composition): Promise<CompositionEdit> => selectEdit(request, c, settings.getSelectorKey())))
     // Stop bumps runId too, and has already said Stopped.
     if (run !== this.runId) { return }
     this.lastTemplatePick = result.note
     if (!result.applied || result.composition === null) {
-      this.refineWithModel(ask)
+      this.refineWithModel(ask, true)
       return
     }
     this.startRun(ask)
@@ -1417,6 +1646,7 @@ struct GeneratePage {
     this.compiledVbc2 = result.vbc2
     this.compositionJson = compositionToJson(result.composition!)
     this.templateKinds = result.composition!.kinds()
+    this.acceptRequest()
     this.compiled = true
     this.compileErrors = ''
     this.generating = false
@@ -1425,11 +1655,16 @@ struct GeneratePage {
     this.status = 'Changed the structure: ' + result.note
   }
 
-  private refineWithModel(ask: string): void {
-    this.compositionJson = ''
+  private refineWithModel(ask: string, continuing: boolean = false): void {
     // Refine from the last program that compiled, not from generatedSource --
     // a failed attempt leaves its broken text in there.
     this.previousSource = this.compiledSource
+    if (this.mode === MODE_SERVER) {
+      if (!settings.hasServerUrl()) { this.checkServer(); return }
+      this.doServerGenerate(ask)
+      return
+    }
+    if (!continuing) { this.prepareRequest(ask) }
     this.completionBase = ''
     this.completionBaseVbc2 = ''
     this.completionComposition = ''
@@ -1449,11 +1684,11 @@ struct GeneratePage {
     this.sideCalls = []
     this.serverBytecode = ''
     this.cancelRequested = false
-    this.runId++
+    if (!continuing) { this.runId++ }
     this.failedSource = ''
     this.delta = new SourceDelta()
     this.startRun(ask)
-    this.genStartTime = Date.now()
+    if (!continuing) { this.genStartTime = Date.now() }
     this.lastRequest = ask
     this.status = 'Refining (attempt 1/' + MAX_RETRIES + ')...'
     this.startAttemptOne(ask, 'Refining')
@@ -1480,6 +1715,10 @@ struct GeneratePage {
   }
 
   private stopGeneration(): void {
+    if (!this.generating) { return }
+    this.metricTotals.partial = true
+    this.finishMetrics(this.runId)
+    if (this.metricPendingRuns.has(this.runId)) { this.metricStaleRuns.add(this.runId) }
     this.settleQuestion(null)
     this.cancelRequested = true
     this.runId++
@@ -1491,20 +1730,13 @@ struct GeneratePage {
   }
 
   private doSave(): void {
-    let source = this.compiledSource.length > 0 ? this.compiledSource : this.generatedSource.trim()
-    if (source.length === 0) { return }
-    let fullPrompt = this.lastRequest.length > 0 ? this.lastRequest : this.prompt.trim()
-    let note = fullPrompt
+    if (this.generating || this.compiledSource.length === 0 || !this.hasResult()) { return }
+    let note = this.acceptedRequest
     if (note.length > 100) { note = note.substring(0, 100) + '...' }
-    let vbc2 = this.compiledVbc2
-    if (vbc2.length === 0 && this.compiled) {
-      try {
-        let result = compileVeraSource(source)
-        vbc2 = result.vbc2
-      } catch (_e) {}
-    }
-    store.createVersion(this.projectId, source, vbc2, note, fullPrompt, this.originLabel(), this.compositionJson)
-    this.status = vbc2.length > 0 ? 'Saved with compiled bytecode' : 'Saved (source only — compile errors)'
+    store.createVersion(this.projectId, this.compiledSource, this.compiledVbc2, note,
+      this.requestHistory, this.acceptedOrigin, this.acceptedComposition, this.acceptedRequest, this.baseVersionId,
+      this.acceptedMetrics)
+    this.status = 'Saved with compiled bytecode'
     refreshForms()
     this.getUIContext().getRouter().back()
   }
@@ -1563,6 +1795,7 @@ struct GeneratePage {
   }
 
   private canGenerate(): boolean {
+    if (this.baseError.length > 0) { return false }
     if (this.mode === MODE_SERVER) { return settings.hasServerUrl() }
     if (this.mode === MODE_DEEPSEEK) { return settings.hasApiKey() }
     return this.modelReady
@@ -1719,9 +1952,26 @@ struct GeneratePage {
   build() {
     Navigation() {
       Column() {
-        if (this.previousSource.length > 0 && !this.hasResult()) {
-          Text('Refining existing version')
-            .fontSize(13).fontColor('#007DFF').padding({ left: 16, top: 8 })
+        if (this.baseError.length > 0) {
+          Text(this.baseError)
+            .fontSize(13).fontColor('#C62828').padding({ left: 16, right: 16, top: 8 })
+        } else if (this.baseVersionId.length > 0) {
+          Text('Changes apply to version ' + this.baseVersionNumber.toString() +
+            '. Save creates version ' + this.nextVersionNumber.toString() + '.')
+            .fontSize(13).fontColor('#007DFF').padding({ left: 16, right: 16, top: 8 })
+        }
+        if (this.requestHistory.length > 0) {
+          Column({ space: 4 }) {
+            Text('Version request').fontSize(12).fontColor('#888888').width('100%')
+            Scroll() {
+              Text(this.requestHistory).fontSize(13).fontColor('#333333').width('100%')
+                .copyOption(CopyOptions.LocalDevice)
+            }
+            .width('100%')
+            .constraintSize({ maxHeight: 110 })
+          }
+          .width('100%')
+          .padding({ left: 16, right: 16, top: 8 })
         }
 
         Row({ space: 8 }) {
@@ -1747,7 +1997,7 @@ struct GeneratePage {
         // the composer to start over from a new request.
         if (this.hasResult() && !this.composerOpen) {
           Row({ space: 8 }) {
-            Text(this.lastRequest.length > 0 ? this.lastRequest : this.prompt)
+            Text(this.acceptedRequest)
               .fontSize(12)
               .fontColor('#666666')
               .maxLines(1)
@@ -1761,7 +2011,7 @@ struct GeneratePage {
               .backgroundColor('#F0F0F0')
               .fontColor('#666666')
               .enabled(!this.generating)
-              .onClick(() => { this.composerOpen = true })
+              .onClick(() => { this.startNew() })
             Button('Save')
               .type(ButtonType.Normal)
               .fontSize(11)
@@ -1772,14 +2022,15 @@ struct GeneratePage {
           .width('100%')
           .padding({ left: 16, right: 16, top: 8 })
         } else {
-          TextArea({ placeholder: 'Describe the app you want...', text: this.prompt })
+          TextArea({ placeholder: this.baseVersionId.length > 0 || this.hasResult() ? 'What to change?' : 'Describe the app you want...', text: this.prompt })
             .onChange((value: string) => { this.prompt = value })
+            .enabled(!this.generating && this.baseError.length === 0)
             .width('100%')
             .height(100)
             .margin(16)
 
           Row({ space: 10 }) {
-            Button(this.generating ? 'Stop' : 'Generate')
+            Button(this.generating ? 'Stop' : (this.baseVersionId.length > 0 || this.hasResult() ? 'Refine' : 'Generate'))
               .type(ButtonType.Normal)
               .layoutWeight(1)
               .enabled(this.canGenerate() || this.generating)
@@ -1793,7 +2044,7 @@ struct GeneratePage {
             Button('Save')
               .type(ButtonType.Normal)
               .layoutWeight(1)
-              .enabled(this.generatedSource.trim().length > 0 && !this.generating)
+              .enabled(this.hasResult() && !this.generating)
               .onClick(() => { this.doSave() })
           }
           .width('100%')
@@ -1810,6 +2061,12 @@ struct GeneratePage {
         }
         .width('100%')
         .padding({ left: 16, right: 16, top: 8, bottom: 4 })
+
+        if (!this.generating && this.hasResult() && this.generatedSource.trim() !== this.compiledSource.trim()) {
+          Text('The last attempt was not applied. Save keeps the previous successful code and version request.')
+            .fontSize(12).fontColor('#B25000')
+            .padding({ left: 16, right: 16, bottom: 4 })
+        }
 
         if (this.routeKnown) {
           Column({ space: 2 }) {
@@ -1946,7 +2203,8 @@ struct GeneratePage {
           .clip(true)
         } else if (this.tab === TAB_CODE) {
           Scroll() {
-            Text(this.generatedSource.length > 0 ? this.generatedSource : '(generated source will appear here)')
+            Text(!this.generating && this.hasResult() ? this.compiledSource :
+              (this.generatedSource.length > 0 ? this.generatedSource : '(generated source will appear here)'))
               .fontSize(12)
               .fontFamily('monospace')
               .fontColor(this.generatedSource.length > 0 ? '#333333' : '#CCCCCC')
@@ -2155,7 +2413,7 @@ struct GeneratePage {
       .width('100%')
       .height('100%')
     }
-    .title('Generate')
+    .title(this.baseVersionId.length > 0 ? 'Refine · Version ' + this.nextVersionNumber.toString() : 'Generate')
     .titleMode(NavigationTitleMode.Mini)
   }
 }

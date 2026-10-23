@@ -4,6 +4,7 @@ import AbilityConstant from '@ohos.app.ability.AbilityConstant'
 import window from '@ohos.window'
 import hilog from '@ohos.hilog'
 import { refreshForms } from '../vera/FormUpdater'
+import { store } from '../vera/ProjectStore'
 import { settings } from '../vera/SettingsStore'
 import { requestCalendarPermissions, requestMicrophonePermission } from '../vera/VeraPermissions'
 import { runProbe } from '../vera/IntentProbe'
@@ -24,8 +25,17 @@ class ProjectNavParams {
   projectId: string = ''
 }
 
+class RunProjectNavParams {
+  projectId: string = ''
+  versionId: string = ''
+  vbc2: string = ''
+}
+
 export default class EntryAbility extends UIAbility {
   private pendingProjectId: string = ''
+  private pendingRunLatest: boolean = false
+  private contentReady: boolean = false
+  private windowStageGeneration: number = 0
 
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     hilog.info(DOMAIN, 'VERA', 'EntryAbility onCreate')
@@ -338,11 +348,14 @@ export default class EntryAbility extends UIAbility {
   }
 
   private extractProjectId(want: Want): void {
+    this.pendingProjectId = ''
+    this.pendingRunLatest = false
     if (want.parameters !== null && want.parameters !== undefined) {
       let params = want.parameters as Record<string, Object>
       let id = params['projectId']
       if (id !== null && id !== undefined && typeof id === 'string') {
         this.pendingProjectId = id as string
+        this.pendingRunLatest = params['launchMode'] === 'runLatest'
         hilog.info(DOMAIN, 'VERA', 'Launch with projectId: ' + this.pendingProjectId)
       }
     }
@@ -350,32 +363,58 @@ export default class EntryAbility extends UIAbility {
 
   onWindowStageCreate(windowStage: window.WindowStage): void {
     hilog.info(DOMAIN, 'VERA', 'EntryAbility onWindowStageCreate')
+    this.contentReady = false
+    let generation = ++this.windowStageGeneration
     // READ_CALENDAR, WRITE_CALENDAR and MICROPHONE are user_grant and so cannot
     // come from the signature. Asked here, not in the middle of a handler.
     requestCalendarPermissions(this.context).then((): Promise<void> => {
       return requestMicrophonePermission(this.context)
     })
     windowStage.loadContent('pages/Index', (err): void => {
+      if (generation !== this.windowStageGeneration) { return }
       if (err?.code) {
         hilog.error(DOMAIN, 'VERA', 'loadContent failed')
         return
       }
       hilog.info(DOMAIN, 'VERA', 'loadContent ok')
-      if (this.pendingProjectId.length > 0) {
-        setTimeout(() => { this.navigateToProject() }, 100)
-      }
+      this.contentReady = true
+      this.navigateToProject()
     })
   }
 
   private navigateToProject(): void {
-    if (this.pendingProjectId.length === 0) { return }
+    if (!this.contentReady || this.pendingProjectId.length === 0) { return }
     let projectId = this.pendingProjectId
+    let runLatest = this.pendingRunLatest
     this.pendingProjectId = ''
+    this.pendingRunLatest = false
     try {
+      store.init(this.context.filesDir)
+      let ui = this.context.windowStage.getMainWindowSync().getUIContext()
+      let router = ui.getRouter()
+      if (store.getProject(projectId) === null) {
+        router.back({ url: 'pages/Index' })
+        ui.getPromptAction().showToast({ message: 'Mini-app no longer exists.' })
+        return
+      }
+      if (runLatest) {
+        let version = store.getLatestRunnableVersion(projectId)
+        if (version !== null) {
+          let p = new RunProjectNavParams()
+          p.projectId = projectId
+          p.versionId = version.id
+          p.vbc2 = version.vbc2
+          router.pushUrl({ url: 'pages/RunnerPage', params: p })
+            .catch((e: Error): void => {
+              hilog.error(DOMAIN, 'VERA', 'Navigate to runner failed: ' + e.message)
+            })
+          return
+        }
+        ui.getPromptAction().showToast({ message: 'Run is unavailable: no version has compiled code.' })
+      }
       let p = new ProjectNavParams()
       p.projectId = projectId
-      this.context.windowStage.getMainWindowSync().getUIContext().getRouter()
-        .pushUrl({ url: 'pages/ProjectPage', params: p })
+      router.pushUrl({ url: 'pages/ProjectPage', params: p })
         .catch((e: Error): void => {
           hilog.error(DOMAIN, 'VERA', 'Navigate to project failed: ' + e.message)
         })
@@ -389,6 +428,8 @@ export default class EntryAbility extends UIAbility {
   }
 
   onWindowStageDestroy(): void {
+    this.windowStageGeneration++
+    this.contentReady = false
     hilog.info(DOMAIN, 'VERA', 'EntryAbility onWindowStageDestroy')
   }
 
