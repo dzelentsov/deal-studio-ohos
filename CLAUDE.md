@@ -102,8 +102,8 @@ available.
 
 **Never `hdc uninstall`.** It destroys `{filesDir}/vera`: every saved project,
 every program's state and the DeepSeek API key. The sandbox is readable from
-`hdc shell`, so before anything risky run `./pull-vera-sources.sh --raw` (sources,
-prompts, raw JSON; the API key is not copied). If an
+`hdc shell`, so before anything risky run `./pull-vera-sources.sh --raw` (a
+complete copy; add `--no-settings` to leave the API key out). If an
 install is refused, work out why. A normal app cannot be updated into a system
 app in place (`9568294 apptype not same`), so a bundle that has ever been
 installed normally must be built under a throwaway `bundleName` to test a system
@@ -127,11 +127,21 @@ conversation is not.
 
 Three helper scripts talk to the phone through `hdc` and honour `HDC_DEVICE`:
 
-- `./pull-vera-sources.sh [--raw] [dir]` copies every saved version (the `.vera`
-  program plus its `.prompt.txt`; `--raw` adds the raw JSON and program state)
-  off the phone. Use it to see what the model actually generated, and as a
-  backup before anything risky. Programs that were generated but never saved are
-  not on the device. The output holds the person's prompts: do not commit it.
+- `./pull-vera-sources.sh [--raw [--no-settings]] [dir]` pulls the saved programs
+  off the phone: `<project>--<version>.vera`, `.prompt.txt` and `.vbc2` plus
+  `manifest.json` (version order, hashes, phone times, every other version field,
+  and a `rebuildable` flag). With `--raw` it also makes a complete copy of the
+  app's data in `dir/raw/` (including the catalogue, program state and
+  `settings.json` with the API key): use it as the backup before anything risky.
+  Programs that were generated but never saved are not on the device. The output
+  holds the person's prompts and, with `--raw`, the API key: never commit it,
+  never paste it.
+- `./push-vera-sources.sh [--check | --apply] [--raw] [dir]` copies programs onto
+  a phone: by default rebuilt from the plain files and `manifest.json` (projects
+  with a version that is not `rebuildable` are skipped), with `--raw` from the
+  complete copy. Dry run by default. Run `--check` first (it only works if the
+  phone lets the hdc shell write into the sandbox with the app's owner) and do
+  not run `--apply` without the person's go-ahead.
 - `./send-prompt.sh [-t X Y] "text"` types text into the focused field. Prompts
   are English (see above).
 - `./measure.sh [reps]` is the cold-run benchmark. It needs `arkui-device-cli`

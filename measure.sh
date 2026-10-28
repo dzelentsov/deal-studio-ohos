@@ -33,8 +33,11 @@ trap 'rm -rf "$WORK"' EXIT
 locate() {
   rm -f "$WORK"/*.json
   "$DEVICE_CLI" dump-layout "$WORK" >/dev/null 2>&1 || return 1
-  local f
-  f=$(ls -t "$WORK"/*.json 2>/dev/null | head -1 || true)
+  local f="" cand
+  for cand in "$WORK"/*.json; do
+    [[ -e "$cand" ]] || continue
+    if [[ -z "$f" || "$cand" -nt "$f" ]]; then f="$cand"; fi
+  done
   [[ -n "$f" ]] || return 1
   python3 - "$f" "$1" <<'PY'
 import json, sys
@@ -79,7 +82,7 @@ for page in tictactoe dashboard; do
     hdc shell aa start -a EntryAbility -b "$BUNDLE" >/dev/null 2>&1
     sleep 4                                        # let the ArkUI page settle
 
-    src=env
+    src="env"
     xy="${!var:-}"
     [[ -n "$xy" ]] || { src="layout dump"; xy=$(locate "Bench $page" 2>/dev/null) || xy=""; }
     [[ -n "$xy" ]] || { src=fallback; xy="${FALLBACK[$page]:-}"; }

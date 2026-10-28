@@ -1,7 +1,9 @@
 import UIAbility from '@ohos.app.ability.UIAbility'
 import Want from '@ohos.app.ability.Want'
 import AbilityConstant from '@ohos.app.ability.AbilityConstant'
+import contextConstant from '@ohos.app.ability.contextConstant'
 import window from '@ohos.window'
+import routerApi from '@ohos.router'
 import hilog from '@ohos.hilog'
 import { refreshForms } from '../vera/FormUpdater'
 import { store } from '../vera/ProjectStore'
@@ -29,16 +31,41 @@ class RunProjectNavParams {
   projectId: string = ''
   versionId: string = ''
   vbc2: string = ''
+  shortcutMode: string = ''
+  launchError: string = ''
+}
+
+class LaunchRoute {
+  kind: string = 'home'
+  projectId: string = ''
+  revision: number = 0
 }
 
 export default class EntryAbility extends UIAbility {
-  private pendingProjectId: string = ''
-  private pendingRunLatest: boolean = false
+  private pendingRoute: LaunchRoute | null = null
+  private lastDestination: LaunchRoute | null = null
+  private launchRevision: number = 0
   private contentReady: boolean = false
   private windowStageGeneration: number = 0
+  private activeWindowStage: window.WindowStage | null = null
+  private routeDrainGeneration: number = -1
+  private isolatedRoot: boolean = false
+  private rootNeedsReset: boolean = false
+  private normalLayoutFullScreen: boolean = false
 
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     hilog.info(DOMAIN, 'VERA', 'EntryAbility onCreate')
+    try {
+      this.context.setOnNewWantSkipScenarios(
+        contextConstant.Scenarios.SCENARIO_MOVE_MISSION_TO_FRONT |
+        contextConstant.Scenarios.SCENARIO_SHOW_ABILITY |
+        contextConstant.Scenarios.SCENARIO_BACK_TO_CALLER_ABILITY_WITH_RESULT
+      ).catch((e: Error): void => {
+        hilog.error(DOMAIN, 'VERA', 'Configure resume launch handling failed: ' + e.message)
+      })
+    } catch (e) {
+      hilog.error(DOMAIN, 'VERA', 'Configure resume launch handling failed: ' + (e as Error).message)
+    }
     // Before anything can be generated or compiled: the vocabulary a program is
     // allowed to use must not change underneath a program that is being written.
     loadCatalogFile(this.context.filesDir)
@@ -77,9 +104,7 @@ export default class EntryAbility extends UIAbility {
     this.extractUiAb(want)
     this.extractCompose(want)
     this.extractTemplateSelect(want)
-    if (this.pendingProjectId.length > 0) {
-      this.navigateToProject()
-    }
+    this.navigateToProject()
   }
 
   /**
@@ -348,88 +373,209 @@ export default class EntryAbility extends UIAbility {
   }
 
   private extractProjectId(want: Want): void {
-    this.pendingProjectId = ''
-    this.pendingRunLatest = false
     if (want.parameters !== null && want.parameters !== undefined) {
       let params = want.parameters as Record<string, Object>
       let id = params['projectId']
-      if (id !== null && id !== undefined && typeof id === 'string') {
-        this.pendingProjectId = id as string
-        this.pendingRunLatest = params['launchMode'] === 'runLatest'
-        hilog.info(DOMAIN, 'VERA', 'Launch with projectId: ' + this.pendingProjectId)
+      if (typeof id === 'string' && id.trim().length > 0) {
+        this.queueRoute(params['launchMode'] === 'runLatest' ? 'shortcut' : 'project', id.trim())
+        hilog.info(DOMAIN, 'VERA', 'Launch with projectId: ' + id.trim())
+        return
       }
     }
+    let homeAction = want.action === 'action.system.home'
+    let homeEntity = want.entities !== null && want.entities !== undefined &&
+      want.entities.indexOf('entity.system.home') >= 0
+    let emptyAction = want.action === null || want.action === undefined || want.action.length === 0
+    let emptyEntities = want.entities === null || want.entities === undefined || want.entities.length === 0
+    let emptyParameters = want.parameters === null || want.parameters === undefined ||
+      Object.keys(want.parameters).length === 0
+    if (homeAction || homeEntity || (emptyAction && emptyEntities && emptyParameters)) {
+      this.queueRoute('home', '')
+    }
+  }
+
+  private queueRoute(kind: string, projectId: string): void {
+    let request = new LaunchRoute()
+    request.kind = kind
+    request.projectId = projectId
+    request.revision = ++this.launchRevision
+    this.pendingRoute = request
   }
 
   onWindowStageCreate(windowStage: window.WindowStage): void {
     hilog.info(DOMAIN, 'VERA', 'EntryAbility onWindowStageCreate')
     this.contentReady = false
     let generation = ++this.windowStageGeneration
-    // READ_CALENDAR, WRITE_CALENDAR and MICROPHONE are user_grant and so cannot
-    // come from the signature. Asked here, not in the middle of a handler.
-    requestCalendarPermissions(this.context).then((): Promise<void> => {
-      return requestMicrophonePermission(this.context)
-    })
-    windowStage.loadContent('pages/Index', (err): void => {
-      if (generation !== this.windowStageGeneration) { return }
-      if (err?.code) {
-        hilog.error(DOMAIN, 'VERA', 'loadContent failed')
-        return
+    this.activeWindowStage = windowStage
+    this.routeDrainGeneration = -1
+    this.isolatedRoot = false
+    this.rootNeedsReset = false
+    this.normalLayoutFullScreen = false
+    if (this.pendingRoute === null && this.lastDestination !== null) {
+      this.queueRoute(this.lastDestination.kind, this.lastDestination.projectId)
+    }
+    try {
+      this.normalLayoutFullScreen = windowStage.getMainWindowSync().getWindowProperties().isLayoutFullScreen
+    } catch (e) {
+      hilog.error(DOMAIN, 'VERA', 'Read normal window layout failed: ' + (e as Error).message)
+    }
+    try {
+      requestCalendarPermissions(this.context).then((): void => {
+        if (generation !== this.windowStageGeneration) { return }
+        requestMicrophonePermission(this.context).catch((e: Error): void => {
+          hilog.error(DOMAIN, 'VERA', 'Microphone permission request failed: ' + e.message)
+        })
+      }).catch((e: Error): void => {
+        hilog.error(DOMAIN, 'VERA', 'Calendar permission request failed: ' + e.message)
+      })
+    } catch (e) {
+      hilog.error(DOMAIN, 'VERA', 'Permission request failed: ' + (e as Error).message)
+    }
+    try {
+      windowStage.loadContent('pages/Index', (err): void => {
+        if (generation !== this.windowStageGeneration) { return }
+        if (err?.code) {
+          hilog.error(DOMAIN, 'VERA', 'loadContent failed')
+          return
+        }
+        hilog.info(DOMAIN, 'VERA', 'loadContent ok')
+        setTimeout(() => {
+          if (generation !== this.windowStageGeneration) { return }
+          this.contentReady = true
+          this.navigateToProject()
+        }, 100)
+      })
+    } catch (e) {
+      hilog.error(DOMAIN, 'VERA', 'loadContent failed: ' + (e as Error).message)
+    }
+  }
+
+  private routeIsCurrent(generation: number, revision: number): boolean {
+    return this.contentReady && this.activeWindowStage !== null &&
+      generation === this.windowStageGeneration && revision === this.launchRevision
+  }
+
+  private async applyWindowMode(mainWindow: window.Window, isolated: boolean,
+    generation: number, revision: number): Promise<void> {
+    if (!this.routeIsCurrent(generation, revision)) { return }
+    try {
+      await mainWindow.setWindowLayoutFullScreen(isolated ? true : this.normalLayoutFullScreen)
+    } catch (e) {
+      hilog.error(DOMAIN, 'VERA', 'Set window layout failed: ' + (e as Error).message)
+    }
+    if (!this.routeIsCurrent(generation, revision)) { return }
+    try {
+      if (isolated) {
+        await mainWindow.setWindowSystemBarEnable([])
+      } else {
+        await mainWindow.setWindowSystemBarEnable(['status', 'navigation'])
       }
-      hilog.info(DOMAIN, 'VERA', 'loadContent ok')
-      this.contentReady = true
-      this.navigateToProject()
-    })
+    } catch (e) {
+      hilog.error(DOMAIN, 'VERA', 'Set window system bars failed: ' + (e as Error).message)
+    }
+    if (!this.routeIsCurrent(generation, revision)) { return }
   }
 
   private navigateToProject(): void {
-    if (!this.contentReady || this.pendingProjectId.length === 0) { return }
-    let projectId = this.pendingProjectId
-    let runLatest = this.pendingRunLatest
-    this.pendingProjectId = ''
-    this.pendingRunLatest = false
-    try {
-      store.init(this.context.filesDir)
-      let ui = this.context.windowStage.getMainWindowSync().getUIContext()
-      let router = ui.getRouter()
-      if (store.getProject(projectId) === null) {
-        router.back({ url: 'pages/Index' })
-        ui.getPromptAction().showToast({ message: 'Mini-app no longer exists.' })
-        return
-      }
-      if (runLatest) {
-        let version = store.getLatestRunnableVersion(projectId)
-        if (version !== null) {
-          let p = new RunProjectNavParams()
-          p.projectId = projectId
-          p.versionId = version.id
-          p.vbc2 = version.vbc2
-          router.pushUrl({ url: 'pages/RunnerPage', params: p })
-            .catch((e: Error): void => {
-              hilog.error(DOMAIN, 'VERA', 'Navigate to runner failed: ' + e.message)
-            })
-          return
+    let generation = this.windowStageGeneration
+    if (!this.contentReady || this.activeWindowStage === null || this.pendingRoute === null ||
+      this.routeDrainGeneration === generation) { return }
+    this.routeDrainGeneration = generation
+    this.drainRoutes(this.activeWindowStage, generation).catch((e: Error): void => {
+      hilog.error(DOMAIN, 'VERA', 'Route drain failed: ' + e.message)
+    }).finally((): void => {
+      if (generation !== this.windowStageGeneration) { return }
+      this.routeDrainGeneration = -1
+      if (this.pendingRoute !== null) { this.navigateToProject() }
+    })
+  }
+
+  private async drainRoutes(windowStage: window.WindowStage, generation: number): Promise<void> {
+    while (this.contentReady && generation === this.windowStageGeneration && this.pendingRoute !== null) {
+      let request = this.pendingRoute
+      try {
+        let mainWindow = windowStage.getMainWindowSync()
+        let ui = mainWindow.getUIContext()
+        let router = ui.getRouter()
+        let options: routerApi.RouterOptions = { url: 'pages/Index' }
+        let isolated = request.kind === 'shortcut'
+        let replaceRoot = request.kind !== 'project' || this.isolatedRoot || this.rootNeedsReset
+        let missingProject = false
+        if (request.kind !== 'home') {
+          store.init(this.context.filesDir)
+          let project = store.getProject(request.projectId)
+          missingProject = project === null
+          if (isolated) {
+            let p = new RunProjectNavParams()
+            p.shortcutMode = 'true'
+            if (project === null) {
+              p.launchError = 'Mini-app no longer exists.'
+            } else {
+              p.projectId = request.projectId
+              let version = store.getLatestRunnableVersion(request.projectId)
+              if (version === null) {
+                p.launchError = 'Run is unavailable: no version has compiled code.'
+              } else {
+                p.versionId = version.id
+                p.vbc2 = version.vbc2
+              }
+            }
+            options = { url: 'pages/RunnerPage', params: p }
+          } else if (project !== null) {
+            let p = new ProjectNavParams()
+            p.projectId = request.projectId
+            options = { url: 'pages/ProjectPage', params: p }
+          } else {
+            replaceRoot = true
+          }
         }
-        ui.getPromptAction().showToast({ message: 'Run is unavailable: no version has compiled code.' })
+        if (!this.routeIsCurrent(generation, request.revision)) { continue }
+        if (replaceRoot) {
+          this.rootNeedsReset = true
+          await router.replaceUrl(options, routerApi.RouterMode.Standard)
+          if (!this.routeIsCurrent(generation, request.revision)) { continue }
+          router.clear()
+        } else {
+          await router.pushUrl(options, routerApi.RouterMode.Standard)
+          if (!this.routeIsCurrent(generation, request.revision)) { continue }
+        }
+        await this.applyWindowMode(mainWindow, isolated, generation, request.revision)
+        if (!this.routeIsCurrent(generation, request.revision)) { continue }
+        this.isolatedRoot = isolated
+        this.rootNeedsReset = false
+        this.lastDestination = request
+        this.pendingRoute = null
+        if (missingProject && !isolated) {
+          ui.getPromptAction().showToast({ message: 'Mini-app no longer exists.' })
+        }
+      } catch (e) {
+        hilog.error(DOMAIN, 'VERA', 'Navigate launch route failed: ' + (e as Error).message)
+        if (!this.routeIsCurrent(generation, request.revision)) { continue }
+        this.pendingRoute = null
       }
-      let p = new ProjectNavParams()
-      p.projectId = projectId
-      router.pushUrl({ url: 'pages/ProjectPage', params: p })
-        .catch((e: Error): void => {
-          hilog.error(DOMAIN, 'VERA', 'Navigate to project failed: ' + e.message)
-        })
-    } catch (e) {
-      hilog.error(DOMAIN, 'VERA', 'Navigate to project failed: ' + (e as Error).message)
+    }
+  }
+
+  private invalidateWindowStage(): void {
+    this.windowStageGeneration++
+    this.contentReady = false
+    this.activeWindowStage = null
+    this.routeDrainGeneration = -1
+    if (this.pendingRoute === null && this.lastDestination !== null) {
+      this.queueRoute(this.lastDestination.kind, this.lastDestination.projectId)
     }
   }
 
   onDestroy(): void {
+    this.invalidateWindowStage()
+    this.launchRevision++
+    this.pendingRoute = null
+    this.lastDestination = null
     hilog.info(DOMAIN, 'VERA', 'EntryAbility onDestroy')
   }
 
   onWindowStageDestroy(): void {
-    this.windowStageGeneration++
-    this.contentReady = false
+    this.invalidateWindowStage()
     hilog.info(DOMAIN, 'VERA', 'EntryAbility onWindowStageDestroy')
   }
 

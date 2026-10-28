@@ -1,6 +1,7 @@
 import { VeraPreview } from '../components/VeraPreview'
 import { store } from '../vera/ProjectStore'
 import { consent } from '../vera/VeraConsentStore'
+import { common } from '@kit.AbilityKit'
 
 @Entry
 @Component
@@ -15,10 +16,14 @@ struct RunnerPage {
   // See VeraPreview's backPressSignal/onBackHandlerChanged for the other half.
   @State hasBackHandler: boolean = false
   @State backPressSignal: number = 0
+  @State shortcutMode: boolean = false
+  private closing: boolean = false
 
   aboutToAppear(): void {
     let params = this.getUIContext().getRouter().getParams() as Record<string, string>
     if (params === null || params === undefined) { this.error = 'No parameters'; return }
+    this.shortcutMode = params['shortcutMode'] === 'true'
+    if (this.shortcutMode && params['launchError']) { this.error = params['launchError']; return }
     let vbc2 = params['vbc2'] || ''
     if (vbc2.length === 0) { this.error = 'No VBC2 bytecode'; return }
     this.vbc2 = vbc2
@@ -42,7 +47,21 @@ struct RunnerPage {
   // swallow the gesture (true); otherwise let the system do its own thing (false).
   onBackPress(): boolean {
     if (this.hasBackHandler) { this.backPressSignal += 1; return true }
+    if (this.shortcutMode) { this.closeShortcut(); return true }
     return false
+  }
+
+  private async closeShortcut(): Promise<void> {
+    if (this.closing) { return }
+    this.closing = true
+    try {
+      const context = this.getUIContext().getHostContext() as common.UIAbilityContext
+      await context.terminateSelf()
+    } catch (e) {
+      console.error('Close mini-app failed: ' + (e as Error).message)
+    } finally {
+      this.closing = false
+    }
   }
 
   build() {
@@ -67,5 +86,7 @@ struct RunnerPage {
     }
     .title('App')
     .titleMode(NavigationTitleMode.Mini)
+    .hideTitleBar(this.shortcutMode)
+    .hideBackButton(this.shortcutMode)
   }
 }

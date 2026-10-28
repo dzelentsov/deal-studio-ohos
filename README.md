@@ -17,7 +17,7 @@ The `'use static'` original (`../vera-probe`) did not run on either available
 device:
 
 | device | blocker |
-|---|---|
+| --- | --- |
 | SGT-AL00, API 22 | SDK 26 emits Panda bytecode 0.1.0.7; the VM accepts ≤ 0.0.0.5 |
 | Mate 60 Pro, API 26 | SDK 26.0.0.26 is ABI-incompatible with the device's 26.0.0.37 |
 
@@ -52,7 +52,7 @@ Before quoting any timing, confirm that the rendered tree matches what
 differs.
 
 | static | dynamic |
-|---|---|
+| --- | --- |
 | `'use static'` | removed |
 | `final class` | `class` |
 | `int`, `double` | `number` |
@@ -71,7 +71,7 @@ real runtime: that artifact contains no container constants at all (16 numbers,
 ## What it measures
 
 | metric | from |
-|---|---|
+| --- | --- |
 | `parseUs` | `parseBytecodeAssembly(vbc1)` |
 | `bootUs` | `new VeraVM(program)` + `run()` |
 | `renderUs` | `invokeFunction('render')` |
@@ -98,7 +98,7 @@ The Generate screen cycles through three ways to turn a prompt into a VERA-L
 program; the button top-left switches between them.
 
 | mode | model | who writes the code |
-|---|---|---|
+| --- | --- | --- |
 | `DeepSeek` | `deepseek-flash` over HTTPS | the device: generate, compile, feed diagnostics back, retry |
 | `Local` | Qwen2.5-Coder-3B in-process via llama.cpp | the device, same loop |
 | `Server` | whatever `vera-server` runs | the server, which returns finished vbc2 |
@@ -144,7 +144,7 @@ explicitly set variable never falls back to another installation. Keep tool path
 and real UDIDs out of the repo.
 
 | tool | needed for | configuration |
-|---|---|---|
+| --- | --- | --- |
 | Hvigor 7.26.0.static wrapper | every build | `HVIGORW`: absolute path to the wrapper; never resolved from `PATH` |
 | Build SDK 26.0.0 | every build | `OHOS_BASE_SDK_HOME` and `DEVECO_SDK_HOME`, both naming existing SDK directories |
 | hdc | install/update, device-bound signing, measurement, `pull-vera-sources.sh`, `send-prompt.sh` | SDK toolchains directory on `PATH`, or `HDC_DIR` naming the directory that contains `hdc` |
@@ -265,10 +265,9 @@ An already-installed normal build cannot be updated into a system one
 
 **Never uninstall the app or clear its data.** That destroys `{filesDir}/vera`:
 every project, every saved program state and the stored API key. The sandbox is
-readable from `hdc shell` on the current system-signed build, so a copy can be
-taken first with `./pull-vera-sources.sh --raw` (sources, prompts and the raw
-version and state JSON; the API key is not copied). If an install is refused,
-find out why. To test a system profile on a
+readable from `hdc shell` on the current system-signed build, so take a complete
+copy first with `./pull-vera-sources.sh --raw` (add `--no-settings` to leave the
+API key out). If an install is refused, find out why. To test a system profile on a
 bundle that was ever installed normally, build under a throwaway `bundleName` and
 install alongside it; never change the bundle name to work around an update
 failure.
@@ -276,9 +275,10 @@ failure.
 ## Helper scripts
 
 | script | what it does |
-|---|---|
+| --- | --- |
 | `./measure.sh [reps]` | Cold-run measurement loop (see "What it measures"). Finds the two bench buttons in a layout dump (needs the Agent Kit's `arkui-device-cli`), falls back to fixed coordinates, and writes one JSON object per run to `results/device.jsonl`, with the device model and OS build in `results/device.meta`. A run with no `VERA_PROBE` line in hilog stops with an error; the previous results are kept as `device.jsonl.prev` |
-| `./pull-vera-sources.sh [--raw] [dir]` | Copies every saved version off the phone into `dir` (default `./vera-src`): `<project>--<version>.vera` (the program) and `<project>--<version>.prompt.txt` (the prompt that produced it). `--raw` also keeps the original version and state JSON under `raw/`. Programs that were generated but never saved are not on the device and are not pulled. Exits non-zero if any file could not be fetched. The output contains your prompts, so keep it out of git |
+| `./pull-vera-sources.sh [--raw [--no-settings]] [dir]` | Pulls the saved programs off the phone into `dir` (default `./vera-src`): for every saved version `<project>--<version>.vera` (the program), `.prompt.txt` (the prompt that produced it) and `.vbc2` (the compiled bytecode), plus `manifest.json` (project catalogue, every other field of each version, version order, SHA-256 and phone modification times, phone model, OS and app version, and a `rebuildable` flag per version: the version file can be rebuilt exactly from these plain files). With `--raw` it also makes a complete copy of the app's `vera` directory in `dir/raw/` (every file byte for byte and checked against its size: catalogue, version JSON, program state, `settings.json`). `settings.json` holds the API key in plain text (mode 600); `--no-settings` leaves it out. Programs that were generated but never saved exist only as a catalogue entry. Exits non-zero if any file could not be copied. The output contains your prompts (and, with `--raw`, your key), so keep it out of git |
+| `./push-vera-sources.sh [--check \| --apply] [--raw] [dir]` | The reverse of `pull-vera-sources.sh`. By default it rebuilds the app's version files from the plain files and `manifest.json` in `dir` (default `./vera-src`) and adds the projects to a phone, for example a second one: a project is added only if all its versions are `rebuildable`, the others are listed as skipped; program state is not restored. With `--raw` it restores from the complete copy in `dir/raw/` instead (byte for byte, including program state). Dry run by default; `--check` tests whether the phone lets the hdc shell write files the app can read; `--apply` stops the app, adds only projects whose id is not on the phone yet, never overwrites a file, replaces `index.json` last and keeps a copy of the old one in `dir/push-backups/`. Use the same app version on both phones; `settings.json` (the API key) is never copied to a phone |
 | `./send-prompt.sh [-t X Y] "text"` | Types text into the focused field of the phone (`-f FILE` reads it from a file, `-` from stdin); `-t X Y` taps a point first. Newlines are collapsed to spaces, because `uitest` types one line |
 
 All three call plain `hdc`. When more than one phone is connected, export

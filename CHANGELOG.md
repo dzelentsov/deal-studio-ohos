@@ -1,6 +1,40 @@
 # Changelog
 
-## Unreleased — SDK 26 compatibility, version provenance, and saved metrics
+## Shortcut processing
+
+### Desktop shortcuts and launch behavior
+
+- Added one home-screen shortcut per mini-app, identified by `vera_project_<projectId>` and the owning bundle. Shortcuts belong to mini-apps, not individual versions.
+- A shortcut launches the newest saved version with compiled bytecode. The project/version IDs remain unchanged, preserving the program's saved-state identity.
+- Shortcut launches open an isolated, full-screen Runner without VERA's title bar or navigation into other sections. A mini-app's own BackHandler retains priority; otherwise Back closes the ability.
+- Tapping VERA's main icon restores the project list and normal window/navigation mode. Tapping another mini-app shortcut replaces the isolated Runner instead of accumulating navigation history. Ordinary foreground/resume does not reset the current page.
+- Missing projects and projects without runnable bytecode show an isolated error screen rather than opening the library. Launch routing rejects stale asynchronous work when another launch or window-stage change supersedes it.
+- Added separate 72×72 PNG resources for all ten project icons, including the default phone fallback. `shortcutFor()` sends these resources as base64 PNG in `foregroundIcon`; original UI icons remain unchanged.
+
+### System state, launcher IPC, and operation safety
+
+- Removed persisted `pinned` state. Legacy values are ignored and disappear on the next normal index write; shortcut presence is read from the system using both shortcut ID and owning bundle.
+- The project page shows checking, retry, add, and remove states, with `Adding…`/`Removing…` progress labels. Initial display performs a single refresh, and stale responses from hidden pages or older refreshes are ignored.
+- Add/remove actions are idempotent against actual system state. `ProjectOperations` owns asynchronous SDK/launcher calls, per-project operation locks, and error handling; `ProjectStore` remains synchronous persistence.
+- Desktop creation/removal uses SceneBoard's private launcher service rather than assuming a BMS-only record creates a visible desktop icon. Results are verified against the system shortcut list; launcher updates may change this private interface.
+- Launcher requests time out after ten seconds with `launcher did not answer`, releasing operation locks and UI pending state. Completion cancels the timeout, repeated callbacks are harmless, and a late connection does not send a new request after settlement.
+- Result verification uses increasing pauses totaling approximately 5.6 seconds, followed by a final state query before reporting failure. Query errors remain errors, not evidence that a shortcut is absent.
+- Host context is resolved lazily inside the service error boundary and explicitly checked for `null`/`undefined` before launcher access. The owning bundle name is cached only after a successful lookup; failed lookups remain retryable.
+- Native error details are logged by the service; UI callers receive operation statuses and user-facing messages. Missing projects return to the project list rather than leaving an empty project page.
+
+### Deletion and partial success
+
+- Deleting a mini-app, or its last remaining version, attempts to remove the mini-app's shared shortcut. Shortcut-removal failure is best-effort and no longer blocks data deletion.
+- A completed deletion with unsuccessful shortcut cleanup returns `ProjectDeletedShortcutRemovalFailed`; both deletion entry points warn that the mini-app was deleted but its home-screen icon could not be removed.
+- Deleting an ordinary version does not remove the mini-app's shortcut. Version lists and project existence are rechecked after asynchronous work, including when another version is saved while deletion is pending.
+- Explicit **Remove shortcut** remains a verified operation: failure is reported without deleting project data. Storage failures are not converted into shortcut-cleanup warnings.
+- Confirmation for last-version deletion explains that the mini-app and its saved data will be deleted and that shortcut cleanup will be attempted. Lists and widgets refresh after deletion attempts, including failures.
+
+Main files: `entry/src/main/ets/vera/ProjectOperations.ets`, `entry/src/main/ets/vera/ProjectStore.ets`, `entry/src/main/ets/vera/ProjectIcons.ets`, `entry/src/main/ets/entryability/EntryAbility.ets`, `entry/src/main/ets/pages/Index.ets`, `entry/src/main/ets/pages/ProjectPage.ets`, `entry/src/main/ets/pages/RunnerPage.ets`, and `entry/src/main/resources/base/media/project_icon_*_72.png`.
+
+Validation included host tests for launch routing, system-state handling, context validation, timeouts, polling, and best-effort deletion. Full-screen launch behavior was confirmed on the device; later hardening changes were checked on the host without another build or installation. These checks do not certify compatibility with future launcher versions or eliminate existing filesystem-cleanup limitations in `ProjectStore`.
+
+## SDK 26 compatibility, version provenance, and saved metrics
 
 This entry records the work covered by the development session: platform and deployment compatibility work, followed by version/refinement tracking and persistent generation metrics. It is a handoff reference for people and AI agents, not a complete history of the application or a release certification.
 
@@ -17,19 +51,8 @@ Some SDK migration work was brought in from upstream and reconciled with this br
 - Restyled saved metrics with the same tile-based visual language as Generate's Metrics tab.
 - The project's main **Run** button now selects the newest version with compiled bytecode. A note identifies the selected version when newer versions need compilation; if none are compiled, Run is disabled with an explanation.
 - Added **Cancel/Delete** confirmation dialogs for mini-app and individual-version deletion, warning that deletion is irreversible. Deleting the only remaining version explicitly warns that the entire mini-app and its saved program data will also be deleted.
-- Implemented **Pin/Unpin** with dynamic shortcuts, matching mini-app icons, and direct launch of the latest compiled version from the shortcut. The New Project icon picker now wraps within the dialog.
 
 ### 1. SDK 26 and platform compatibility
-
-#### Build configuration
-
-- Normalized compatible, target, and compile SDK values to `26.0.0`, retaining `runtimeOS: OpenHarmony`. This was compatibility work on an already API-26-oriented codebase, not a claim that API 26 was first introduced here.
-- Retained ARM64 native builds through the `arm64-v8a` ABI configuration.
-- Added the custom Hvigor `createHapTask`, which depends on `assembleHap` and gives the unsigned artifact the expected `vera-probe-dyn-unsigned.hap` name.
-- Updated the build wrapper to invoke the configured Hvigor wrapper through Bash, perform a clean build, and copy the resulting HAP to the configured output directory.
-- Kept offline `--unsigned` builds independent of signing and device prerequisites.
-
-Main files: `build-profile.json5`, `entry/build-profile.json5`, `entry/hvigorfile.ts`, `build-hap.sh`.
 
 #### ArkUI context and native bindings
 
@@ -151,56 +174,7 @@ A `VersionMetrics` object is stored inside the version JSON. Opening the saved v
 
 Main file: `entry/src/main/ets/pages/ProjectPage.ets`.
 
-### 6. Pin/Unpin, shortcut icons, and direct mini-app launch
-
-#### Dynamic shortcut registration and removal
-
-- Replaced the initial Pin/Unpin placeholder with `shortcutManager.addDynamicShortcutInfos()` and `deleteDynamicShortcutInfos()`. Desktop-shortcut bookkeeping APIs are not used as a substitute for dynamic registration.
-- Each shortcut uses the stable ID `shortcut_item_<projectId>` and the mini-app's name as its label. Unpin supplies that specific shortcut ID rather than deleting every dynamic shortcut belonging to the application.
-- Persisted the project's `pinned` flag in the project index so the page restores the Pin/Unpin button state after reopening. Older projects without this field default to unpinned; no migration is required.
-- Project deletion invokes the same Unpin path for a pinned mini-app. Confirmed deletion of its only remaining version follows the project-deletion path as well.
-- The integration uses the system shortcut API and declares `ohos.permission.MANAGE_SHORTCUTS`; the installed application's system signing and permission grant remain prerequisites.
-
-#### Shared icon resources
-
-- Added ten packaged PNG resources corresponding to the existing mini-app icon choices, with a single `projectIconResource()` mapping and a default phone icon for unknown values.
-- The library, project header, New Project picker, and dynamic shortcut now use the same artwork instead of passing an emoji string as a shortcut image reference.
-- Shortcut metadata supplies the icon's resource reference and numeric `iconId`, with `moduleName: 'entry'` for resource resolution.
-- Existing persisted emoji identifiers remain unchanged; the mapping supplies the images without rewriting saved projects. The packaged artwork replaces font-dependent emoji rendering in the affected screens.
-- Changed the New Project icon picker to a wrapping, centered layout so all ten choices remain inside the dialog on narrow screens.
-
-#### Launch routing
-
-- The shortcut Want targets `EntryAbility` and carries string parameters `projectId` and `launchMode=runLatest`. The stable project ID, not its editable name, identifies the mini-app.
-- `EntryAbility` reads these parameters on both `onCreate` and `onNewWant`, covering cold starts and taps while the main application is already running.
-- Execution is resolved when the shortcut is tapped: `getLatestRunnableVersion()` selects the newest saved version with nonempty compiled bytecode, matching the main Run button's selection rule. The shortcut does not embed bytecode or permanently select a version.
-- Opens `RunnerPage` with `projectId`, `versionId`, and `vbc2`, preserving the normal runner's version-specific state handling.
-- If no version has compiled code, opens the project page with an explanation instead of starting an empty runner. A stale shortcut for a deleted project returns to the library with a message.
-- Navigation waits for successful content loading, initializes the project store before reading it, and ignores callbacks from destroyed or superseded window stages. Launches carrying only `projectId`, such as existing widgets, retain their project-page behavior.
-
-#### Verification and remaining limitations
-
-- Unsigned ArkTS builds and `git diff --check` passed. Focused host checks passed 34 scoped cases covering routing/lifecycle behavior, shortcut metadata, runnable-version selection, all ten icon mappings, and the fallback icon.
-- A host layout proof checked icon bounds at viewport widths of 320, 360, 400, and 600 vp. The user subsequently confirmed that the feature and corrected picker work on the device; the assistant did not install these changes.
-- Previously created shortcuts need to be recreated through Unpin → Pin to receive the new icon metadata and launch parameters.
-- Pin/Unpin still starts the platform operation asynchronously without awaiting its completion before saving the local flag. A later API rejection can therefore leave the displayed/persisted state inconsistent with the launcher. Project deletion likewise does not await shortcut removal; this is a known limitation, not transactional cleanup.
-- The prototype still targets OS account ID `100`; current-account discovery and reconciliation with shortcuts changed outside the app are not implemented.
-
-Main files: `entry/src/main/ets/vera/ProjectStore.ets`, `entry/src/main/ets/vera/ProjectIcons.ets`, `entry/src/main/ets/entryability/EntryAbility.ets`, `entry/src/main/ets/pages/Index.ets`, `entry/src/main/ets/pages/ProjectPage.ets`, `entry/src/main/resources/base/media/project_icon_*.png`, `entry/src/main/module.json5`.
-
-### 7. Verification performed during the session
-
-The following are historical session results, not tests executed merely by adding this document:
-
-- Earlier compatibility work passed the calendar SDK harness (27 checks across 20 targets), a strict SDK backend typecheck, deprecation checks (10), and signing-workflow mock checks (68).
-- An earlier device-bound signed ARM64 build was verified and installed; the user confirmed the signing/installation blocker was resolved.
-- Request/refinement persistence, saved metrics, and the final tile-based metrics presentation each passed `./build-hap.sh --unsigned` after their respective changes.
-- For the version/metrics phase, verification was deliberately restricted to unsigned builds. No additional tests, signing, installation, or device checks were performed for those UI changes.
-- Successful compilation does not establish on-device visual correctness, full runtime behavior, or exact billing accuracy.
-- Missing `entry/src/main/cpp/llama.cpp` produced the expected stub-build warning: local model generation and embedding support are unavailable in that artifact. An unsigned build succeeding does not prove that model support is present.
-- Some unrelated host regression failures and SDK capability/permission warnings remained outside this task's scope; this entry does not claim a clean full-suite result.
-
-### 8. Handoff rules for future changes
+### 6. Handoff rules for future changes
 
 1. Treat accepted source, bytecode, request history, composition/origin, and metrics as one coherent result. Do not replace part of that result with data from a failed candidate.
 2. Preserve explicitly selected parent IDs. Displayed version numbers are list ordinals, not durable IDs or a substitute for provenance.

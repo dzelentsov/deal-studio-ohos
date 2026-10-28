@@ -89,8 +89,8 @@ vera_hdc_dir() {
     printf 'ERROR: HDC_DIR is %s but there is no executable hdc in it.\n' "$HDC_DIR" >&2
     return 1
   fi
-  if command -v hdc >/dev/null 2>&1; then
-    dirname "$(command -v hdc)"
+  if type -P hdc >/dev/null 2>&1; then
+    dirname "$(type -P hdc)"
     return 0
   fi
   printf 'ERROR: cannot find hdc. Add its toolchains directory to PATH or set HDC_DIR.\n' >&2
@@ -104,6 +104,8 @@ vera_use_hdc() {
   local dir
   dir=$(vera_hdc_dir) || return 1
   export PATH="$dir:$PATH"
+  # hdc() below is called by the scripts that run vera_use_hdc; shellcheck cannot see that.
+  # shellcheck disable=SC2317
   hdc() {
     if [ -n "${HDC_DEVICE:-}" ]; then
       command hdc -t "$HDC_DEVICE" "$@"

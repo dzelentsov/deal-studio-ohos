@@ -37,9 +37,9 @@ HVIGOR_EXIT=0
   set -o pipefail
   cd -- "$SCRIPT_DIR" || exit
 
-  exec 3>&1                                       # настоящий терминал — в fd 3
-  : > /tmp/hvigor-out.log                         # обнуляем перед запуском (нужно для -a)
-  : > /tmp/hvigor-err.log                         # обнуляем перед запуском (нужно для -a)
+  exec 3>&1                                       # the real terminal is on fd 3
+  : > /tmp/hvigor-out.log                         # truncate before running (needed for -a)
+  : > /tmp/hvigor-err.log                         # truncate before running (needed for -a)
 
   bash "$HVIGORW" clean --mode module -p module=entry -p product=default createHapTask --analyze=normal --parallel --incremental --no-daemon \
     2> >(tee -a /tmp/hvigor-err.log \
@@ -58,11 +58,11 @@ HVIGOR_EXIT=0
         }
 
         {
-          c = norm($0)                                            # ВАЖНО: сначала нормализуем
+          c = norm($0)                                            # IMPORTANT: normalize first
 
-          # 0) hvigor-эхо отфильтрованного предупреждения:
+          # 0) hvigor echo of a filtered warning:
           #    "> hvigor WARN: ... WARN: ArkTS:WARN File: ..."
-          #    Проверяем по c (ANSI снят), шаблон свободный — двойной warn: + file:
+          #    Check c (ANSI stripped), loose pattern: double warn: + file:
           if (c ~ /hvigor.*warn:.*warn:.*file:/) {
             pending = ""
             printf "%s", reset; fflush()
@@ -72,13 +72,13 @@ HVIGOR_EXIT=0
           hit      = (c ~ filter)
           is_blank = (c ~ /^[ \t\r]*$/)
 
-          # 1) после отфильтрованного WARN — глотаем пустые строки и ohos.permission.*
+          # 1) after a filtered WARN, swallow blank lines and ohos.permission.*
           if (suppress_blanks) {
             if (is_blank || c ~ /^[ \t]*ohos\.permission\./) { next }
             suppress_blanks = 0
           }
 
-          # 2) держим шапку — решаем судьбу пары
+          # 2) hold the header and decide what to do with the pair
           if (pending != "") {
             if (hit) {
               pending = ""; suppress_blanks = 1
@@ -86,14 +86,14 @@ HVIGOR_EXIT=0
               next
             }
             if (c ~ /^>[ \t]*hvigor /) {
-              pending = ""; suppress_blanks = 1        # шапку-сироту выбросить, статус — печатаем
+              pending = ""; suppress_blanks = 1        # discard the orphaned header, print the status
             } else {
               print pending; fflush()
               pending = ""
             }
           }
 
-          # 3) текущая строка — шапка WARN
+          # 3) the current line is a WARN header
           if (c ~ /^warn:.*file:/) {
             if (hit) {
               suppress_blanks = 1
@@ -104,7 +104,7 @@ HVIGOR_EXIT=0
             next
           }
 
-          # 4) одиночная строка с фильтр-текстом
+          # 4) a standalone line containing the filter text
           if (hit) {
             suppress_blanks = 1
             printf "%s", reset; fflush()
@@ -121,7 +121,7 @@ HVIGOR_EXIT=0
   | tee /tmp/hvigor-out.log
 
   status=$?
-  wait                                            # дождаться, пока фоновые tee/awk допишут хвост
+  wait                                            # wait for the background tee/awk processes to finish writing
   exit $status
 ) || HVIGOR_EXIT=$?
 

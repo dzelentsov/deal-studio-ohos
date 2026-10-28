@@ -1,6 +1,8 @@
 import { Project, Version, VersionMetrics, store } from '../vera/ProjectStore'
 import { refreshForms } from '../vera/FormUpdater'
 import { projectIconResource } from '../vera/ProjectIcons'
+import { projectOperations, ProjectOperationStatus, ProjectShortcutState } from '../vera/ProjectOperations'
+import { common } from '@kit.AbilityKit'
 
 class RunVersionParams {
   projectId: string = ''
@@ -19,6 +21,12 @@ struct ProjectPage {
   @State project: Project | null = null
   @State versions: Version[] = []
   @State projectId: string = ''
+  @State projectOperationPending: boolean = false
+  @State shortcutOperation: string = ''
+  @State shortcutState: ProjectShortcutState = ProjectShortcutState.Unknown
+  private shortcutRefreshGeneration: number = 0
+  private pageVisible: boolean = true
+  private returningToIndex: boolean = false
   @State viewedSource: string = ''
   @State viewedVersionNumber: number = 0
   @State viewedMetricsVersion: Version | null = null
@@ -28,21 +36,67 @@ struct ProjectPage {
   @State viewedPrompt: string = ''
 
   aboutToAppear(): void {
+    this.pageVisible = true
     let params = this.getUIContext().getRouter().getParams() as Record<string, string>
     if (params !== null && params !== undefined) {
       this.projectId = params['projectId'] || ''
     }
-    this.reload()
   }
 
   onPageShow(): void {
+    this.pageVisible = true
+    this.returningToIndex = false
     this.reload()
+  }
+
+  onPageHide(): void {
+    this.pageVisible = false
+    this.shortcutRefreshGeneration++
+    this.shortcutState = ProjectShortcutState.Unknown
   }
 
   private reload(): void {
     if (this.projectId.length === 0) { return }
     this.project = store.getProject(this.projectId)
     this.versions = store.listVersions(this.projectId)
+    if (this.project === null) {
+      this.shortcutRefreshGeneration++
+      this.shortcutState = ProjectShortcutState.Unknown
+      this.returnToIndex()
+      return
+    }
+    this.refreshShortcutState()
+  }
+
+  private returnToIndex(): void {
+    if (!this.pageVisible || this.returningToIndex) { return }
+    try {
+      this.returningToIndex = true
+      this.getUIContext().getRouter().back({ url: 'pages/Index' })
+    } catch (e) {
+      this.returningToIndex = false
+      console.error('Return to projects failed: ' + (e as Error).message)
+    }
+  }
+
+  private async refreshShortcutState(): Promise<void> {
+    const generation = ++this.shortcutRefreshGeneration
+    const projectId = this.projectId
+    this.shortcutState = ProjectShortcutState.Unknown
+    if (!this.pageVisible || this.projectOperationPending || this.project === null) { return }
+    const state = await projectOperations.getShortcutState(projectId)
+    if (generation !== this.shortcutRefreshGeneration || projectId !== this.projectId ||
+        this.projectOperationPending) { return }
+    if (store.getProject(projectId) === null) { this.reload(); return }
+    this.shortcutState = state
+  }
+
+  private shortcutButtonLabel(): string {
+    if (this.shortcutOperation === 'add') { return 'Adding…' }
+    if (this.shortcutOperation === 'remove') { return 'Removing…' }
+    if (this.shortcutState === ProjectShortcutState.Present) { return 'Remove shortcut' }
+    if (this.shortcutState === ProjectShortcutState.Absent) { return 'Add shortcut' }
+    return this.shortcutState === ProjectShortcutState.Failed ? 'Check shortcut' : 'Checking shortcut…'
   }
 
   build() {
@@ -71,12 +125,14 @@ struct ProjectPage {
               .layoutWeight(1)
               .enabled(this.latestRunnableIndex() >= 0)
               .onClick(() => { this.runLatest() })
-            Button(this.project!.pinned ? 'Unpin' : 'Pin')
+            Button(this.shortcutButtonLabel())
               .type(ButtonType.Normal)
               .fontSize(14)
+              .enabled(!this.projectOperationPending && this.shortcutState !== ProjectShortcutState.Unknown)
               .onClick(() => {
-                if (this.project!.pinned) { this.unpinFromHome() }
-                else { this.pinToHome() }
+                if (this.shortcutState === ProjectShortcutState.Present) { this.unpinFromHome() }
+                else if (this.shortcutState === ProjectShortcutState.Absent) { this.pinToHome() }
+                else { this.refreshShortcutState() }
               })
           }
           .width('100%')
@@ -190,6 +246,7 @@ struct ProjectPage {
         .backgroundColor('#FF3B30')
         .fontColor('#FFFFFF')
         .height('100%')
+        .enabled(!this.projectOperationPending)
         .onClick(() => { this.confirmDeleteVersion(v) })
     }.height('100%').padding({ left: 8 })
   }
@@ -202,8 +259,11 @@ struct ProjectPage {
     }
     if (index < 0) { this.reload(); return }
     let lastVersion = versions.length === 1
+    let shortcutWarning = this.shortcutState === ProjectShortcutState.Present ?
+      ' Its desktop shortcut will also be removed.' : ' Any desktop shortcut will also be removed.'
     let message = lastVersion ?
-      'This is the only remaining version. Deleting it will also delete the mini-app and all its saved program data. This cannot be undone.' :
+      'This is the only remaining version. Deleting it will also delete the mini-app and all its saved program data.' +
+        shortcutWarning + ' This cannot be undone.' :
       'Delete v' + (versions.length - index).toString() + ' and its saved program data? This cannot be undone.'
     this.getUIContext().showAlertDialog({
       title: lastVersion ? 'Delete mini-app?' : 'Delete version?',
@@ -215,25 +275,29 @@ struct ProjectPage {
       secondaryButton: {
         value: 'Delete',
         fontColor: '#FF3B30',
-        action: () => { this.doDeleteVersion(v, lastVersion) }
+        action: () => { this.doDeleteVersion(v) }
       }
     })
   }
 
-  private doDeleteVersion(v: Version, confirmedProjectDeletion: boolean): void {
-    let projectDeleted = false
-    try {
-      projectDeleted = store.deleteVersion(v.projectId, v.id, confirmedProjectDeletion)
-    } catch (e) {
-      console.error('Delete version failed: ' + (e as Error).message)
-      this.reload()
-      this.showProjectMessage('Could not delete version. Please try again.')
-      return
+  private async doDeleteVersion(v: Version): Promise<void> {
+    if (this.projectOperationPending) {
+      return;
+    }
+    this.projectOperationPending = true
+    let context = (): common.UIAbilityContext => this.getUIContext().getHostContext() as common.UIAbilityContext
+    const status = await projectOperations.deleteVersion(context, v.projectId, v.id)
+    this.projectOperationPending = false
+    if (status === ProjectOperationStatus.ProjectDeletedShortcutRemovalFailed) {
+      this.showProjectMessage('Mini-application was deleted, but its shortcut cannot be removed.')
     }
     this.reload()
-    refreshForms()
-    if (projectDeleted) {
-      this.getUIContext().getRouter().back({ url: 'pages/Index' })
+    refreshForms();
+    if (status === ProjectOperationStatus.ProjectDeleted || status === ProjectOperationStatus.NotFound ||
+        status === ProjectOperationStatus.ProjectDeletedShortcutRemovalFailed) {
+      this.returnToIndex()
+    } else if (status !== ProjectOperationStatus.Success) {
+      this.showProjectMessage('Cannot delete version.')
     }
   }
 
@@ -450,17 +514,21 @@ struct ProjectPage {
     this.setPinnedState(false)
   }
 
-  private setPinnedState(pin: boolean): void {
-    let updated: Project | null = null
-    try {
-      updated = pin ? store.pinProject(this.projectId) : store.unpinProject(this.projectId)
-    } catch (e) {
-      console.error('Save pinned state failed: ' + (e as Error).message)
-      this.showProjectMessage('Could not save pinned state.')
-      return
-    }
-    if (updated !== null) {
-      this.project = updated
+  private async setPinnedState(pin: boolean): Promise<void> {
+    if (this.projectOperationPending) { return }
+    this.projectOperationPending = true
+    this.shortcutOperation = pin ? 'add' : 'remove'
+    let context = (): common.UIAbilityContext => this.getUIContext().getHostContext() as common.UIAbilityContext
+
+    const status = pin ? await projectOperations.pinProject(context, this.projectId) :
+      await projectOperations.unpinProject(context, this.projectId)
+    this.shortcutOperation = ''
+    this.projectOperationPending = false
+    this.reload()
+    if (status === ProjectOperationStatus.NotFound) {
+      this.returnToIndex()
+    } else if (status !== ProjectOperationStatus.Success) {
+      this.showProjectMessage(pin ? 'Cannot add shortcut.' : 'Cannot delete shortcut.')
     }
   }
 

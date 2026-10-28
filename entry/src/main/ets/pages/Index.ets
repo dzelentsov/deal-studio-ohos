@@ -1,7 +1,9 @@
 import { Project, store } from '../vera/ProjectStore'
+import { projectOperations, ProjectOperationStatus } from '../vera/ProjectOperations'
 import { consent } from '../vera/VeraConsentStore'
 import { refreshForms } from '../vera/FormUpdater'
 import { projectIconResource } from '../vera/ProjectIcons'
+import { common } from '@kit.AbilityKit'
 
 const ICONS: string[] = ['📱', '🎮', '📊', '🧮', '🎯', '📝', '🔧', '🎨', '🌍', '⚡']
 
@@ -14,6 +16,7 @@ class ProjectNavParams {
 struct Index {
   @State projects: Project[] = []
   @State showCreate: boolean = false
+  @State deletionPending: boolean = false
   @State newName: string = ''
   @State selectedIcon: string = '📱'
 
@@ -166,6 +169,7 @@ struct Index {
         .backgroundColor('#FF3B30')
         .fontColor('#FFFFFF')
         .height('100%')
+        .enabled(!this.deletionPending)
         .onClick(() => { this.confirmDelete(id) })
     }.height('100%').padding({ left: 8 })
   }
@@ -188,19 +192,23 @@ struct Index {
     })
   }
 
-  private doDelete(id: string): void {
-    try {
-      store.deleteProject(id)
-    } catch (e) {
-      console.error('Delete project failed: ' + (e as Error).message)
+  private async doDelete(id: string): Promise<void> {
+    if (this.deletionPending) { return }
+    this.deletionPending = true
+    let context = (): common.UIAbilityContext => this.getUIContext().getHostContext() as common.UIAbilityContext
+    const status = await projectOperations.deleteProject(context, id)
+    this.deletionPending = false
+    this.reload()
+    refreshForms()
+    if (status !== ProjectOperationStatus.Success) {
+      const message = status === ProjectOperationStatus.ProjectDeletedShortcutRemovalFailed ?
+        'Mini-application was deleted, but its shortcut cannot be removed.' : 'Error deleting mini-app.'
       try {
-        this.getUIContext().getPromptAction().showToast({ message: 'Could not delete mini-app.' })
+        this.getUIContext().getPromptAction().showToast({ message: message })
       } catch (toastError) {
         console.error('Show deletion error failed: ' + (toastError as Error).message)
       }
     }
-    this.reload()
-    refreshForms()
   }
 
   private doCreate(): void {

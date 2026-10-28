@@ -3,19 +3,19 @@ import { getNode, HvigorNode } from '@ohos/hvigor';
 import * as fs from 'fs';
 import * as path from 'path';
 
-// 1. Получаем объект текущего модуля
+// 1. Get the current module object
 const currentNode: HvigorNode = getNode(__filename);
 
-// 2. Регистрируем нашу задачу переименования
+// 2. Register our renaming task
 currentNode.registerTask({
     name: 'createHapTask',
-    // Жестко прописываем в граф сборщика, что наша задача
-    // ДОЛЖНА запускаться только ПОСЛЕ официальной assembleHap
+    // Explicitly specify in the build graph that our task
+    // MUST run only AFTER the official assembleHap
     dependencies: ['assembleHap'],
     run() {
         const outputDir = path.resolve(__dirname, 'build/default/outputs/default');
         const oldHapPath = path.join(outputDir, 'entry-default-unsigned.hap');
-        const newHapPath = path.join(outputDir, 'vera-probe-dyn-unsigned.hap'); // Ваше имя файла
+        const newHapPath = path.join(outputDir, 'vera-probe-dyn-unsigned.hap'); // Your file name
 
         if (fs.existsSync(oldHapPath)) {
             try {

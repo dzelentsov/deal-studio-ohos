@@ -1,14 +1,10 @@
 import fs from '@ohos.file.fs'
-import { shortcutManager } from '@kit.AbilityKit';
-import { BusinessError, osAccount } from '@kit.BasicServicesKit';
-import { projectIconResource } from './ProjectIcons'
 
 
 export class Project {
   id: string = ''
   name: string = ''
   icon: string = ''
-  pinned: boolean = false
   createdAt: number = 0
 }
 
@@ -165,7 +161,6 @@ export class ProjectStore {
         p.id = obj['id'] as string
         p.name = obj['name'] as string
         p.icon = obj['icon'] as string
-        p.pinned = obj['pinned'] === true
         p.createdAt = obj['createdAt'] as number
         result.push(p)
       }
@@ -180,7 +175,6 @@ export class ProjectStore {
       obj['id'] = p.id
       obj['name'] = p.name
       obj['icon'] = p.icon
-      obj['pinned'] = p.pinned
       obj['createdAt'] = p.createdAt
       arr.push(obj)
     }
@@ -224,197 +218,12 @@ export class ProjectStore {
     this.writeIndex(projects)
   }
 
-  setProjectPinned(id: string, pinned: boolean): Project | null {
-    let projects = this.readIndex()
-    for (let p of projects) {
-      if (p.id === id) {
-        p.pinned = pinned
-        this.writeIndex(projects)
-        return p;
-      }
-    }
-    return null;
-  }
-
-/*
-  pinProject(id: string): Project | null {
-    let project = this.getProject(id);
-    if (project === null) {
-      return null;
-    }
-
-    const icon = projectIconResource(project.icon)
-
-    let data: shortcutManager.ShortcutInfo = {
-      id: `shortcut_item_${id}`,
-      bundleName: 'com.vera.probe.dyn',
-      moduleName: 'entry',
-      hostAbility: 'EntryAbility',
-      appIndex: 0,
-      sourceType: 0,
-      label: project.name,
-      icon: "$media:app_icon", //  `$media:${icon.id}`,
-      iconId: 1, //icon.id,
-      wants: [
-        {
-          targetBundle: 'com.vera.probe.dyn',
-          targetModule: 'entry',
-          targetAbility: 'EntryAbility',
-          parameters: [
-            { key: 'projectId', value: project.id },
-            { key: 'launchMode', value: 'runLatest' }
-          ],
-        }
-      ],
-      visible: true
-    }
-
-    try {
-      // Динамически получаем ID текущего пользователя перед добавлением
-      let accountManager = osAccount.getAccountManager();
-      accountManager.getOsAccountLocalIdFromProcess()
-        .then((userId: number) => {
-          console.info(`Текущий активный пользователь: ${userId}`);
-
-
-      shortcutManager.addDesktopShortcutInfo(data, userId)})
-        .then(() => {
-          console.info(`Shortcut ${data.id} was added successfully.`);
-        }).catch((err: BusinessError) => {
-          console.error(`Cannot add shortcut. Error code: ${err.code}, message: ${err.message}`);
-      });
-    } catch (error) {
-      let code = (error as BusinessError).code;
-      let message = (error as BusinessError).message;
-      console.error(`Cannot add shortcut. Error code: ${code}, message: ${message}`);
-    }
-
-shortcutManager.getAllDesktopShortcutInfo(100)
-  .then((shortcuts: Array<shortcutManager.ShortcutInfo>) => {
-    console.info(`Desktop shortcuts: ${JSON.stringify(shortcuts)}`);
-    const found = shortcuts.find(s => s.id === data.id);
-    if (found) {
-      console.info(`Ярлык найден. visible=${found.visible}, sourceType=${found.sourceType}`);
-    } else {
-      console.warn('Ярлык НЕ найден в системе, хотя addDesktopShortcutInfo вернул success');
-    }
-  })
-  .catch((err: BusinessError) => {
-    console.error(`getAllDesktopShortcutInfo failed: ${err.code} ${err.message}`);
-  });
-
-    return this.setProjectPinned(id, true);
-  }
-
-  unpinProject(id: string): Project | null {
-    let project = this.getProject(id);
-
-    let data: shortcutManager.ShortcutInfo = {
-      id: `shortcut_item_${id}`,
-      bundleName: 'com.vera.probe.dyn',
-      moduleName: 'entry',
-      hostAbility: 'EntryAbility',
-      appIndex: 0,
-      sourceType: 0,
-      label: project !== null ? project.name : "default",
-      icon: project !== null ? `$media:${projectIconResource(project.icon).id}` : "",
-      iconId: project !== null ? projectIconResource(project.icon).id : 1,
-      wants: []
-    }
-
-    try {
-      shortcutManager.deleteDesktopShortcutInfo(data, 100)
-        .then(() => {
-          console.info('Shortcut ${data.id} was deleted successfully.');
-        }).catch((err: BusinessError) => {
-          console.error(`Cannot delete shortcut. Error code: ${err.code}, message: ${err.message}`);
-      });
-    } catch (error) {
-      let code = (error as BusinessError).code;
-      let message = (error as BusinessError).message;
-      console.error(`Cannot delete shortcut. Error code: ${code}, message: ${message}`);
-    }
-
-    return this.setProjectPinned(id, false);
-  }
-*/
-
-  pinProject(id: string): Project | null {
-    let project = this.getProject(id);
-    if (project === null) {
-      return null;
-    }
-
-    const icon = projectIconResource(project.icon)
-    const shortcutToDelete: shortcutManager.ShortcutInfo = {
-      id: `shortcut_item_${id}`,
-      bundleName: 'com.vera.probe.dyn',
-      moduleName: 'entry',
-      hostAbility: 'EntryAbility',
-      appIndex: 0,
-      sourceType: 2,
-      label: project.name,
-      icon: `$media:${icon.id}`,
-      iconId: icon.id,
-      wants: [
-        {
-          targetBundle: 'com.vera.probe.dyn',
-          targetModule: 'entry',
-          targetAbility: 'EntryAbility',
-          parameters: [
-            { key: 'projectId', value: project.id },
-            { key: 'launchMode', value: 'runLatest' }
-          ],
-        }
-      ],
-      visible: true
-    }
-
-    try {
-      shortcutManager.addDynamicShortcutInfos([shortcutToDelete], 100)
-        .then(() => {
-          console.info(`Shortcut ${shortcutToDelete.id} was added successfully.`);
-        }).catch((err: Error) => {
-          console.error(`Cannot add shortcut. Error code: ${(err as BusinessError).code}, message: ${(err as BusinessError).message}`);
-          return null;
-      });
-    } catch (err) {
-      console.error(`Cannot add shortcut. Error code: ${(err as BusinessError).code}, message: ${(err as BusinessError).message}`);
-      return null;
-    }
-
-    return this.setProjectPinned(id, true);
-  }
-
-  unpinProject(id: string): Project | null {
-    const bundleName = "com.vera.probe.dyn";
-    const shortcutId: string = `shortcut_item_${id}`;
-
-    try {
-      shortcutManager.deleteDynamicShortcutInfos(bundleName, 0, 100, [shortcutId])
-        .then(() => {
-          console.info('Shortcut ${shortcutId} was deleted successfully.');
-        }).catch((err: Error) => {
-          console.error(`Cannot delete shortcut. Error code: ${(err as BusinessError).code}, message: ${(err as BusinessError).message}`);
-          return null;
-      });
-    } catch (err) {
-      console.error(`Cannot delete shortcut. Error code: ${(err as BusinessError).code}, message: ${(err as BusinessError).message}`);
-      return null;
-    }
-
-    return this.setProjectPinned(id, false);
-  }
-
   deleteProject(id: string): void {
     let projects = this.readIndex()
+    if (!projects.some((p: Project) => p.id === id)) { return }
     let filtered: Project[] = []
     for (let p of projects) {
-      if (p.id !== id) {
-        filtered.push(p)
-      } else if (p.pinned) {
-        this.unpinProject(id)
-      }
+      if (p.id !== id) { filtered.push(p) }
     }
     this.writeIndex(filtered)
     removeRecursive(this.projectDir(id))
@@ -517,7 +326,7 @@ shortcutManager.getAllDesktopShortcutInfo(100)
     writeJson(this.versionPath(projectId, versionId), JSON.stringify(obj))
   }
 
-  deleteVersion(projectId: string, versionId: string, deleteProjectIfLast: boolean = false): boolean {
+  deleteVersion(projectId: string, versionId: string): boolean {
     let versions = this.listVersions(projectId)
     let found = false
     for (let v of versions) {
@@ -525,15 +334,10 @@ shortcutManager.getAllDesktopShortcutInfo(100)
     }
     if (!found) { return false }
     if (versions.length === 1) {
-      if (!deleteProjectIfLast) { throw new Error('Deleting the last version requires project deletion confirmation') }
       this.deleteProject(projectId)
       return true
     }
-    try {
-      fs.unlinkSync(this.versionPath(projectId, versionId))
-    } catch (e) {
-      throw e as Error
-    }
+    fs.unlinkSync(this.versionPath(projectId, versionId))
     this.clearState(projectId, versionId)
     return false
   }
