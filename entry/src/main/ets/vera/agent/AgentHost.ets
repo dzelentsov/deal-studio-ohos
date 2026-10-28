@@ -8,7 +8,7 @@ import { SketchAsk, JevAsk } from '../VeraCompose'
 import { blockDefaults } from '../VeraTemplateContent'
 import { BlockRequest, BlockFill } from '../SectionFill'
 import { CodeAsk } from './AgentCustom'
-import { AgentQuestion } from './AgentQuestions'
+import { AgentQuestion, PersonAnswer } from './AgentQuestions'
 
 /** The catalogue's defaults for every section: what a host with no model to ask gives. */
 export async function defaultBlockFill(request: BlockRequest): Promise<BlockFill> {
@@ -65,8 +65,8 @@ export class AgentHost {
   lookup: (need: string) => Promise<string> = async (_need: string): Promise<string> => ''
   /** The language as generation is shown it (the skill prompt with the UI catalogue), for the custom section. */
   language: string = ''
-  /** Asks the person a blocking question: the answer's index, or null for the default (the default host never asks). */
-  ask: (question: AgentQuestion) => Promise<number | null> = async (_question: AgentQuestion): Promise<number | null> => null
+  /** Asks the person a blocking question: an answer's index, their own words, or null for the default (the default host never asks). */
+  ask: (question: AgentQuestion) => Promise<PersonAnswer> = async (_question: AgentQuestion): Promise<PersonAnswer> => null
   /**
    * What this request's holes already learned, so a later, wider hole does not repeat it: each phone need a writer said
    * it cannot do, with its sentence for the person, and each lookup made.

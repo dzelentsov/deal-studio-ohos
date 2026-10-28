@@ -16,7 +16,7 @@ import { chats, StoredChat, StoredMessage } from '../vera/ChatStore'
 import { store } from '../vera/ProjectStore'
 import { compileVeraSource } from '../vera/VeraCompiler'
 import { appAgentHost } from '../vera/agent/AgentAppHost'
-import { AgentQuestion } from '../vera/agent/AgentQuestions'
+import { AgentQuestion, PersonAnswer } from '../vera/agent/AgentQuestions'
 import { QuestionCard } from '../components/QuestionCard'
 import { buildScreen, RouteRequest, RouteOutcome, OUTCOME_AGENT, OUTCOME_NOT_BUILT } from '../vera/agent/VeraBuildRoute'
 
@@ -51,8 +51,8 @@ class ChatMessage {
   question: string = ''
   questionOptions: string[] = []
   questionFallback: number = 0
-  /** Answers the open question: an index, or null for its default. Never saved. */
-  answerQuestion: ((index: number | null) => void) | null = null
+  /** Answers the open question: an index, the person's own words, or null for its default. Never saved. */
+  answerQuestion: ((answer: PersonAnswer) => void) | null = null
   /** Added under the streamed text by this page, so the next streamed piece does not wipe it. */
   beforeNote: string = ''
   source: string = ''
@@ -275,6 +275,14 @@ struct MessageBubble {
   @Prop chatId: string = ''
   @State showCode: boolean = false
 
+  /** Answers the widget's open question and takes the card away. */
+  private settle(given: PersonAnswer): void {
+    let answer = this.msg.answerQuestion
+    this.msg.answerQuestion = null
+    this.msg.question = ''
+    if (answer !== null) { answer(given) }
+  }
+
   build() {
     Column({ space: 8 }) {
       if (this.msg.before.length > 0) {
@@ -297,12 +305,8 @@ struct MessageBubble {
       }
       if (this.msg.appState === APP_BUILDING && this.msg.question.length > 0) {
         QuestionCard({ question: this.msg.question, options: this.msg.questionOptions, fallback: this.msg.questionFallback,
-          onPick: (index: number): void => {
-            let answer = this.msg.answerQuestion
-            this.msg.answerQuestion = null
-            this.msg.question = ''
-            if (answer !== null) { answer(index) }
-          } })
+          onPick: (index: number): void => { this.settle(index) },
+          onTyped: (text: string): void => { this.settle(text) } })
           .constraintSize({ maxWidth: '92%' })
       }
       if (this.msg.appState === APP_BUILDING && this.msg.previewVbc2.length === 0) {
@@ -775,7 +779,7 @@ struct ChatPage {
           this.scrollDown(true)
         }, (): boolean => false, this.skillPrompt)
         // A blocking question goes in the bubble of the widget it is for; an invalidated widget takes the default.
-        host.ask = (question: AgentQuestion): Promise<number | null> => new Promise<number | null>((resolve: (index: number | null) => void) => {
+        host.ask = (question: AgentQuestion): Promise<PersonAnswer> => new Promise<PersonAnswer>((resolve: (answer: PersonAnswer) => void) => {
           if (msg.appState !== APP_BUILDING) { resolve(null); return }
           msg.questionOptions = question.options
           msg.questionFallback = question.fallback

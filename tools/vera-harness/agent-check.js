@@ -229,6 +229,15 @@ const request = (prompt, widget = false) => Object.assign(new AgentRequest(), {p
     log = []
     assert.equal(await askBlocking('a converter', sketch.questions, jev(0.9, 0.1), async () => null, log), '')
     assert.match(log[0].answer, /km to miles \(default\)/)
+    // Words the person typed are their own answer, none of the options: the plan is drawn again with them; only blanks are the default.
+    log = []
+    settled = await askBlocking('a converter', sketch.questions, jev(0.9, 0.1), async () => '  feet to metres ', log)
+    assert.match(settled, /Which units\? feet to metres$/)
+    assert.equal(log[0].changed, true)
+    assert.equal(log[0].answer, 'feet to metres (typed)')
+    log = []
+    assert.equal(await askBlocking('a converter', sketch.questions, jev(0.9, 0.1), async () => '   ', log), '')
+    assert.match(log[0].answer, /km to miles \(default\)/)
     // Through the agent: an answer that differs draws the plan again, with the answer in the request.
     const {host} = replayHost('tip')
     const plans = []

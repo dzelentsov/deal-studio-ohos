@@ -15,8 +15,11 @@ export class AgentQuestion {
   fallback: number = 0
 }
 
-/** Asks the person: the index of the answer they chose, or null for the default. */
-export type PersonAsk = (question: AgentQuestion) => Promise<number | null>
+/** What the person answered: the index of an answer offered, their own words typed in, or null for the default. */
+export type PersonAnswer = number | string | null
+
+/** Asks the person a question. */
+export type PersonAsk = (question: AgentQuestion) => Promise<PersonAnswer>
 
 /** A question is asked only when Jev leans clearly toward the default being wrong; with no answer from Jev, none is. */
 const ASK_ABOVE: number = 0.6
@@ -85,12 +88,22 @@ export async function askBlocking(prompt: string, questions: SketchQuestion[], a
     let waitStart = Date.now()
     let picked = await ask(shown)
     let waited = Date.now() - waitStart
-    let index = picked === null || picked < 0 || picked >= q.options.length ? q.fallback : picked
     let entry = new Asked()
     entry.question = q.ask
-    entry.answer = q.options[index] + (picked === null ? ' (default)' : '')
-    entry.changed = index !== q.fallback
     entry.waitedMs = waited
+    // Words the person typed are an answer of their own: none of the options, so the plan is always drawn again with them.
+    let typed = typeof picked === 'string' ? (picked as string).trim() : ''
+    if (typed.length > 0) {
+      entry.answer = typed + ' (typed)'
+      entry.changed = true
+      log.push(entry)
+      lines.push(q.ask + ' ' + typed)
+      continue
+    }
+    let chosen = typeof picked === 'number' ? picked as number : -1
+    let index = chosen < 0 || chosen >= q.options.length ? q.fallback : chosen
+    entry.answer = q.options[index] + (typeof picked === 'number' ? '' : ' (default)')
+    entry.changed = index !== q.fallback
     log.push(entry)
     if (entry.changed) { lines.push(q.ask + ' ' + q.options[index]) }
   }

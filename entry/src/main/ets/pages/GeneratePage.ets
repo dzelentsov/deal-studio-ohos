@@ -30,7 +30,7 @@ import { sdkEvalRequested, runSdkEval } from '../vera/VeraSdkEval'
 import { composeEnabled, ComposeResult } from '../vera/VeraCompose'
 import { AgentRequest, AgentResult } from '../vera/agent/VeraAgent'
 import { appAgentHost } from '../vera/agent/AgentAppHost'
-import { AgentQuestion } from '../vera/agent/AgentQuestions'
+import { AgentQuestion, PersonAnswer } from '../vera/agent/AgentQuestions'
 import { QuestionCard } from '../components/QuestionCard'
 import { MetricCard, MetricTile, MetricChip, MetricLine } from '../components/MetricCard'
 import { buildScreen, RouteRequest, RouteOutcome, OUTCOME_AGENT, OUTCOME_CANCELLED } from '../vera/agent/VeraBuildRoute'
@@ -261,8 +261,8 @@ struct GeneratePage {
   @State questionText: string = ''
   @State questionOptions: string[] = []
   @State questionFallback: number = 0
-  /** Answers the open question: an index, or null for its default. */
-  private answerQuestion: ((index: number | null) => void) | null = null
+  /** Answers the open question: an index, the person's own words, or null for its default. */
+  private answerQuestion: ((answer: PersonAnswer) => void) | null = null
   @State compiledSource: string = ''
   @State refinePrompt: string = ''
   @State program: RunTotals = new RunTotals()
@@ -797,7 +797,7 @@ struct GeneratePage {
       this.previewVbc2 = vbc2
       this.previewNote = 'Sketching the screen...'
     }, (): boolean => run !== this.runId || this.cancelRequested, this.promptTemplate)
-    host.ask = (question: AgentQuestion): Promise<number | null> => this.askPerson(question)
+    host.ask = (question: AgentQuestion): Promise<PersonAnswer> => this.askPerson(question)
     let outcome: RouteOutcome = await this.metricWork(run, (): Promise<RouteOutcome> => buildScreen(route, host))
     if (run !== this.runId) { return }
     if (outcome.kind === OUTCOME_CANCELLED) {
@@ -1606,18 +1606,18 @@ struct GeneratePage {
   }
 
   /** The open question goes with its default: stopping or starting again must not leave the agent waiting. */
-  private settleQuestion(index: number | null): void {
+  private settleQuestion(given: PersonAnswer): void {
     let answer = this.answerQuestion
     this.answerQuestion = null
     this.questionText = ''
     this.questionOptions = []
-    if (answer !== null) { answer(index) }
+    if (answer !== null) { answer(given) }
   }
 
   /** Puts the agent's question on the screen; the promise settles with the person's tap. */
-  private askPerson(question: AgentQuestion): Promise<number | null> {
+  private askPerson(question: AgentQuestion): Promise<PersonAnswer> {
     this.settleQuestion(null)
-    return new Promise<number | null>((resolve: (index: number | null) => void) => {
+    return new Promise<PersonAnswer>((resolve: (answer: PersonAnswer) => void) => {
       this.questionText = question.text
       this.questionOptions = question.options
       this.questionFallback = question.fallback
@@ -2192,7 +2192,8 @@ struct GeneratePage {
           Column() {
             if (this.questionText.length > 0) {
               QuestionCard({ question: this.questionText, options: this.questionOptions, fallback: this.questionFallback,
-                onPick: (index: number): void => { this.settleQuestion(index) } })
+                onPick: (index: number): void => { this.settleQuestion(index) },
+                onTyped: (text: string): void => { this.settleQuestion(text) } })
                 .margin({ bottom: 8 })
             }
             if (this.hasResult()) {

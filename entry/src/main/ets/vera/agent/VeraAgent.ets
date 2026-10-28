@@ -13,7 +13,7 @@ import { AgentHost } from './AgentHost'
 import { BlockRequest, BlockFill } from '../SectionFill'
 import { CustomResult } from './AgentCustom'
 import { writeHole } from './AgentHole'
-import { AgentQuestion, Asked, askBlocking } from './AgentQuestions'
+import { AgentQuestion, Asked, PersonAnswer, askBlocking } from './AgentQuestions'
 import { Replaced, inputsOnlyForCustom, composePlanEnabled, provisionalProgram, sketchPlan, assembleProgram, screenPlan, partCount, customInputs, partsContract, dropProvided, ComposeResult, Composition, Sketch, SketchInput } from '../VeraCompose'
 import { ScreenPlan, PlanSlot, PlanComponent, assemblePlan, FILL_BLOCK, FILL_PART, FILL_REPORTED } from '../ScreenPlan'
 import { compileVeraSource } from '../VeraCompiler'
@@ -143,7 +143,7 @@ export async function runAgent(request: AgentRequest, host: AgentHost): Promise<
     }
   }, request.widget, async (sketch: Sketch): Promise<string> => {
     if (host.cancelled()) { return '' }
-    let settled = await askBlocking(request.prompt, sketch.questions, host.askJev, (q: AgentQuestion): Promise<number | null> => {
+    let settled = await askBlocking(request.prompt, sketch.questions, host.askJev, (q: AgentQuestion): Promise<PersonAnswer> => {
       host.status('Waiting for your answer...')
       return host.ask(q)
     }, result.asked)
