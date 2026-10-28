@@ -265,22 +265,49 @@ export function sketchFrom(plan: NeedsPlan): Sketch | null {
 const STOP_WORDS: string[] = ['the', 'and', 'for', 'with', 'that', 'this', 'when', 'from', 'your', 'you', 'are', 'its', 'has', 'have', 'will',
   'all', 'any', 'can', 'each', 'every', 'into', 'then', 'than', 'what', 'who', 'how', 'out', 'one', 'new', 'get', 'set', 'per']
 
-/** The words of a sentence that carry its meaning: lower case, three letters or more, not one of the small ones. */
+/** Spaces and punctuation, ASCII and the wide forms Chinese and Japanese write: what separates words in any script. */
+const BREAKS: RegExp = /[\s!-/:-@[-`{-~ -¿ -⁯　-〿！-／：-＠［-｀｛-･]+/
+/**
+ * Scripts written without spaces between words (Chinese, Japanese kana, Thai, Lao, Myanmar, Khmer): there a run between two breaks is a
+ * whole clause, so it is compared by its pairs of characters instead.
+ */
+const UNSPACED: RegExp = /[㐀-鿿豈-﫿぀-ヿ฀-໿က-႟ក-៿]/
+
+/** Lower case, the wide forms as the narrow ones, every run of breaks one space. */
+function plain(sentence: string): string {
+  return sentence.normalize('NFKC').toLowerCase().split(BREAKS).filter((w: string): boolean => w.length > 0).join(' ')
+}
+
+/**
+ * The words of a sentence that carry its meaning: lower case, three letters or more, not one of the small ones; in a script written
+ * without spaces, each pair of characters (a single character when that is all there is).
+ */
 function meaningWords(sentence: string): string[] {
   let found: string[] = []
-  for (let w of sentence.toLowerCase().split(/[^a-z0-9]+/)) {
-    if (w.length >= 3 && STOP_WORDS.indexOf(w) < 0 && found.indexOf(w) < 0) { found.push(w) }
+  let add = (w: string): void => { if (found.indexOf(w) < 0) { found.push(w) } }
+  for (let w of plain(sentence).split(' ')) {
+    if (w.length === 0) { continue }
+    if (UNSPACED.test(w)) {
+      if (w.length === 1) { add(w) }
+      for (let i = 0; i + 1 < w.length; i++) { add(w.substring(i, i + 2)) }
+    } else if (w.length >= 3 && STOP_WORDS.indexOf(w) < 0) {
+      add(w)
+    }
   }
   return found
 }
 
 /**
- * Whether the words a need quotes from the request are in it: at least half of the quote's meaning words are the request's own (a
- * plural or a longer form of one counts). A quote that is missing, or that is not from the request, is a need the model made up.
+ * Whether the words a need quotes from the request are in it: the quote as it stands, in any language, or at least half of its meaning
+ * words are the request's own (a plural or a longer form of one counts). A quote that is not from the request is a need the model made
+ * up; one with nothing to compare (no meaning words) cannot be judged, and stays.
  */
 export function asksFor(request: string, quote: string): boolean {
+  let q = plain(quote)
+  if (q.length === 0) { return false }
+  if (plain(request).indexOf(q) >= 0) { return true }
   let words = meaningWords(quote)
-  if (words.length === 0) { return false }
+  if (words.length === 0) { return true }
   let have = meaningWords(request)
   let same = (a: string, b: string): boolean => a === b || (a.length >= 4 && b.length >= 4 && (a.startsWith(b) || b.startsWith(a)))
   let found = words.filter((w: string): boolean => have.some((h: string): boolean => same(w, h))).length

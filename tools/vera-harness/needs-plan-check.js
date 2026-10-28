@@ -84,6 +84,20 @@ console.log('needs-plan lengths ok')
   assert.equal(np.asksFor('mood diary', 'sends a daily reminder to log the mood'), false, 'a reminder nobody named')
   assert.equal(np.asksFor('daily medicine reminders', 'reminders every day'), true, 'plural and word order')
   assert.equal(np.asksFor('packing checklist', ''), false, 'an empty quote is not the request\'s')
+  // Any language: the quote as it stands, then words, or pairs of characters in a script written without spaces. These quotes were
+  // dropped as "not in the request" on the phone, every one copied from it (the requests as typed, typos and all).
+  const trip = '旅行计划：我们一家三口要去西湖玩一天，班忙计划行程。可以追问： 粘贴攻略链接， 结合达模型+攻略链接给用户计划行程。'
+  assert.equal(np.asksFor(trip, '计划行程'), true, 'Chinese, copied')
+  assert.equal(np.asksFor(trip, '粘贴攻略链接，结合达模型+攻略链接给用户计划行程'), true, 'Chinese, copied across punctuation')
+  assert.equal(np.asksFor('宝马护理：我宝宝发烧了，37。5度。帮我城建宝宝发热护理卡片与服务', '宝宝发热护理卡片'), true, 'Chinese, inside a clause')
+  assert.equal(np.asksFor('除妖：帮我创建一张吃药卡，提醒我每天吃药', '提醒我每天吃药'), true, 'Chinese, the reminder')
+  assert.equal(np.asksFor('做一个喝水记录应用，每小时提醒我喝水', '每小时提醒喝水'), true, 'Chinese, not copied exactly')
+  assert.equal(np.asksFor('做一个喝水记录应用，每小时提醒我喝水', '每天写一条励志名言'), false, 'Chinese, made up')
+  assert.equal(np.asksFor('Таймер на 10 минут, напомни выпить воду', 'напомни выпить воду'), true, 'Russian, copied')
+  assert.equal(np.asksFor('Таймер на 10 минут, напомни выпить воду', 'показывай мотивационную цитату'), false, 'Russian, made up')
+  assert.equal(np.asksFor('水分補給を記録して、毎時間リマインドして', '毎時間リマインド'), true, 'Japanese')
+  assert.equal(np.asksFor('Remind me at 7 to take pills', 'at 7'), true, 'nothing to compare but copied')
+  assert.equal(np.asksFor('mood diary', 'at 9'), true, 'nothing to compare: cannot be judged, stays')
   const plan = np.parseNeedsPlan(JSON.stringify({title: 'T', needs: [
     {type: 'content', what: 'a short note', from: 'a short note about doctors'},
     {type: 'content', what: 'items to pack', from: 'packing checklist'},
