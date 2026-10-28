@@ -255,7 +255,8 @@ export function parseSketch(text: string): Sketch | null {
       if (MEASURES.indexOf(input.measure) < 0 || input.measure === 'clock') { input.measure = 'number' }
       if (input.measure === 'money') { input.unit = currencySign(input.unit) }
       // A length of time the sketch called a time ("kind": "time", "measure": "seconds") is a number of seconds or minutes, as it says.
-      if (input.kind === 'time' && isTime(input.measure)) { input.kind = 'count' }
+      // Minutes running over the whole day (0 to 1439) are a time of day: the plan's own rule writes 07:30 as 450 minutes.
+      if (input.kind === 'time' && isTime(input.measure) && !(input.measure === 'minutes' && input.max >= 1439)) { input.kind = 'count' }
       // A time of day is minutes since midnight, whatever measure the sketch wrote.
       if (input.kind === 'time') {
         input.measure = 'clock'

@@ -36,4 +36,15 @@ const comp = c.readComposition(body, sketch, false)
 assert.equal(comp.countdownFrom, 'totalLength')
 assert.equal(comp.countdownUnit, 'seconds')
 assert.ok(!comp.sketch.inputs.some(i => i.id === 'countdownLength'), 'no length of its own: ' + comp.sketch.inputs.map(i => i.id))
+// A time of day is minutes since midnight, as the plan's own rule says: "kind": "time", "measure": "minutes" over the whole day stays a
+// time of day (a picker showing 09:00), while minutes over a shorter range and any seconds are a length. Both plans of
+// "one-day trip to West Lake" and "remind me to take my medicine every day" wrote their start and dose times this way.
+const inputOf = input => c.parseSketch(JSON.stringify({title: 't', inputs: [input], values: [], events: [], ready: ['x'], other: []})).inputs[0]
+const startTime = inputOf({id: 'startTime', label: 'Start time', kind: 'time', measure: 'minutes', min: 0, max: 1439, value: 540})
+assert.equal(startTime.kind, 'time', 'a time of day in minutes stays a time: ' + startTime.kind)
+assert.equal(startTime.value, 540)
+const focus = inputOf({id: 'focus', label: 'Focus', kind: 'time', measure: 'minutes', min: 1, max: 90, value: 25})
+assert.equal(focus.kind, 'count', 'minutes over a short range are a length: ' + focus.kind)
+const work = inputOf({id: 'work', label: 'Work', kind: 'time', measure: 'seconds', min: 1, max: 3600, value: 30})
+assert.equal(work.kind, 'count', 'seconds are a length: ' + work.kind)
 console.log('length-feeders-check ok')
