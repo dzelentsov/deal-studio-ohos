@@ -15,8 +15,7 @@ import { VirtualMachine, deserializeVbc2, RuntimeValue, VeraNumberValue, VeraStr
 import { UiHostEnvironment, HostEffect, VeraUiNode, decodeVeraUi, formatVeraNumber, formatVeraClock } from '../vera/VeraUi'
 import { runRawIntent } from '../vera/VeraIntents'
 import { runSdkAdapter } from '../vera/VeraSdkBackend'
-import { LengthMetrics } from '@ohos.arkui.node'
-import mediaquery from '@ohos.mediaquery'
+import { LengthMetrics, mediaquery, matrix4 } from '@kit.ArkUI'
 
 import { catalogKinds } from '../vera/VeraUiCatalog'
 import { iconPath, ICON_STROKE, ICON_VIEWPORT, ICON_ORIGIN } from '../vera/VeraIcons'
@@ -28,7 +27,6 @@ import { consent } from '../vera/VeraConsentStore'
 import { LiveNode, toLive, reconcile } from './VeraLiveTree'
 import { MotionPose, motionPose, motionDuration, poseMatrix, poseFromArray, multiplyMatrices, identityMatrix, perspectiveMatrix,
   columnMajor, poseToPixels, facesViewer, samePose, animatedPose, stageDistance, faceShade, depthRanks } from '../vera/VeraMotion'
-import matrix4 from '@ohos.matrix4'
 
 /**
  * The rotation of every spinning shape on screen.
