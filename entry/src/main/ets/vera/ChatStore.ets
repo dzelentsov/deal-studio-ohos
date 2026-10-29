@@ -9,7 +9,7 @@
  * program state goes; remove() clears that too.
  */
 
-import fs from '@ohos.file.fs'
+import { fileIo as fs } from '@kit.CoreFileKit'
 import { AttemptStat, costOf } from './VeraChatStats'
 
 export class StoredMessage {
