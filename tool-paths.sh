@@ -1,109 +1,176 @@
 #!/usr/bin/env bash
-# Where the toolchain lives, without naming anybody's home directory.
-#
-# Every script here had a path baked into it from whichever machine it was last
-# edited on -- and not the same machine, so build-hap.sh pointed at one home
-# directory and sign-system.sh at another, and neither pair worked at once.
-#
-# The environment variable still wins, so nothing that already sets KIT_ROOT,
-# HDC_DIR or HAPSIGNER changes behaviour. What changed is the fallback: it looks
-# for the thing instead of asserting where it is, and says which variable to set
-# when it cannot find it, rather than failing later with "no such file".
-#
-# Every candidate below is relative to $HOME. No absolute home directory belongs
-# in a shared repository: it names one person, means nothing to anyone else, and
-# the $HOME form already covers that person -- a kit sitting directly in
-# someone's home is $HOME/ArkTS_Agent_Kit when that someone runs the script.
-#
-# One layout detail worth knowing: the kit's executables are not always in the
-# same place. An unpacked kit puts them in tools/, a pip install in .venv/bin.
-# These look for the binary, not the directory.
+# shellcheck shell=bash
+# Sourced by build-hap.sh, sign-system.sh and update-phone.sh.
+if (( BASH_VERSINFO[0] < 4 )); then
+  printf 'ERROR: bash 4+ is required (found %s).\n' "$BASH_VERSION" >&2
+  return 1
+fi
 
-# An explicitly set KIT_ROOT is an instruction, not a hint: if the kit is named
-# and the binary is not in it, say so rather than quietly using a different kit,
-# which would turn a typo into a mysterious build against the wrong toolchain.
-vera_kit_roots() {
-  if [ -n "${KIT_ROOT:-}" ]; then
-    printf '%s\n' "$KIT_ROOT"
-    return 0
-  fi
-  printf '%s\n' \
-    "$HOME/work/arkts_agent_kit" \
-    "$HOME/arkts_agent_kit" \
-    "$HOME/ArkTS_Agent_Kit"
-}
-
-# vera_kit_bin <executable>  ->  prints an absolute path, or fails with a note
 vera_kit_bin() {
-  local exe="$1" root sub
-  while IFS= read -r root; do
-    [ -n "$root" ] || continue
+  local exe="$1" sub
+  if [ -n "${KIT_ROOT:-}" ]; then
     for sub in tools .venv/bin bin; do
-      if [ -x "$root/$sub/$exe" ]; then
-        printf '%s\n' "$root/$sub/$exe"
+      if [ -x "$KIT_ROOT/$sub/$exe" ]; then
+        printf '%s\n' "$KIT_ROOT/$sub/$exe"
         return 0
       fi
     done
-  done < <(vera_kit_roots)
-  if [ -z "${KIT_ROOT:-}" ] && command -v "$exe" >/dev/null 2>&1; then
+    printf 'ERROR: KIT_ROOT is %s but %s is not in tools/, .venv/bin/ or bin/.\n' "$KIT_ROOT" "$exe" >&2
+    return 1
+  fi
+  if command -v "$exe" >/dev/null 2>&1; then
     command -v "$exe"
     return 0
   fi
-  # One line per error, so a caller that keeps only the last line still sees
-  # the word ERROR and the name of the variable to set.
-  if [ -n "${KIT_ROOT:-}" ]; then
-    echo "ERROR: KIT_ROOT is $KIT_ROOT but $exe is not in it (looked in tools/, .venv/bin/, bin/)." >&2
-  else
-    echo "ERROR: cannot find $exe. Set KIT_ROOT to the ArkTS Agent Kit, or put $exe on PATH." >&2
-  fi
+  printf 'ERROR: cannot find %s. Add it to PATH or set KIT_ROOT.\n' "$exe" >&2
   return 1
 }
 
-# The directory holding hdc, for scripts that add it to PATH.
-vera_hdc_dir() {
-  local d
-  if [ -n "${HDC_DIR:-}" ]; then
-    [ -x "$HDC_DIR/hdc" ] && { printf '%s\n' "$HDC_DIR"; return 0; }
-    echo "ERROR: HDC_DIR is set to $HDC_DIR but there is no hdc in it." >&2
+vera_require_cmd() {
+  command -v "$1" >/dev/null 2>&1 && return 0
+  printf 'ERROR: %s is required but not found on PATH.\n' "$1" >&2
+  return 1
+}
+
+# Prints the bundle name from AppScope/app.json5 after checking that the system
+# signing profile template belongs to it. Usage: vera_app_bundle "$SCRIPT_DIR"
+vera_app_bundle() {
+  python3 - "$1/AppScope/app.json5" "$1/signing/UnsgnedReleasedProfileTemplate.json" <<'PY'
+import json, re, sys
+from pathlib import Path
+match = re.search(r'"bundleName"\s*:\s*"([^"]+)"', Path(sys.argv[1]).read_text())
+if not match:
+    sys.exit('ERROR: bundleName not found in AppScope/app.json5')
+bundle = match.group(1)
+profile = json.loads(Path(sys.argv[2]).read_text())['bundle-info']
+if profile['bundle-name'] != bundle or profile['app-feature'] != 'hos_system_app':
+    sys.exit('ERROR: system signing profile does not match the app')
+print(bundle)
+PY
+}
+
+vera_hvigorw() {
+  local wrapper="${HVIGORW:-}"
+  if [ -z "$wrapper" ]; then
+    printf 'ERROR: HVIGORW is required. Export it with the full path to the Hvigor 7.26.0.static wrapper; PATH is not used.\n' >&2
     return 1
   fi
-  for d in "$HOME/Desktop/hdc" "$HOME/hdc"; do
-    [ -x "$d/hdc" ] && { printf '%s\n' "$d"; return 0; }
-  done
-  if command -v hdc >/dev/null 2>&1; then
-    dirname "$(command -v hdc)"
+  if [[ "$wrapper" != /* ]]; then
+    printf 'ERROR: HVIGORW must be an absolute path to the Hvigor wrapper.\n' >&2
+    return 1
+  fi
+  if [ -f "$wrapper" ] && [ -r "$wrapper" ]; then
+    printf '%s\n' "$wrapper"
     return 0
   fi
-  echo "ERROR: cannot find hdc. Set HDC_DIR to the directory holding it." >&2
+  printf 'ERROR: cannot read hvigorw at %s. Set HVIGORW to the Hvigor wrapper.\n' "$wrapper" >&2
   return 1
 }
 
-# The hapsigner directory, the one with dist/ inside it.
-vera_hapsigner() {
-  local d
-  if [ -n "${HAPSIGNER:-}" ]; then
-    [ -d "$HAPSIGNER/dist" ] && { printf '%s\n' "$HAPSIGNER"; return 0; }
-    echo "ERROR: HAPSIGNER is set to $HAPSIGNER but it has no dist/." >&2
-    return 1
-  fi
-  for d in "$HOME/agent-kit-sdk/hapsigner" "$HOME/hapsigner"; do
-    [ -d "$d/dist" ] && { printf '%s\n' "$d"; return 0; }
-  done
-  echo "ERROR: cannot find hapsigner. Set HAPSIGNER to the directory holding dist/." >&2
-  return 1
-}
-
-# The OpenHarmony toolchains, if they can be found. Not fatal: hdc is often
-# already on PATH, and only some of these scripts need the rest of the SDK.
-vera_add_toolchains_to_path() {
-  local d
-  for d in ${OHOS_TOOLCHAINS:+"$OHOS_TOOLCHAINS"} \
-           "$HOME/agent-kit-sdk/ohos_sdk"/*/toolchains \
-           "$HOME/agentsdk/ohos_sdk"/*/toolchains; do
-    if [ -d "$d" ]; then
-      export PATH="$d:$PATH"
-      return 0
+vera_sdk_home() {
+  local name sdk
+  for name in OHOS_BASE_SDK_HOME DEVECO_SDK_HOME; do
+    sdk="${!name:-}"
+    if [ -z "$sdk" ]; then
+      printf 'ERROR: %s is required. Export it with the SDK root.\n' "$name" >&2
+      return 1
+    fi
+    if [ ! -d "$sdk" ]; then
+      printf 'ERROR: %s is %s but that directory does not exist.\n' "$name" "$sdk" >&2
+      return 1
     fi
   done
+  printf '%s\n' "$OHOS_BASE_SDK_HOME"
+}
+
+vera_hdc_dir() {
+  if [ -n "${HDC_DIR:-}" ]; then
+    [ -x "$HDC_DIR/hdc" ] && { printf '%s\n' "$HDC_DIR"; return 0; }
+    printf 'ERROR: HDC_DIR is %s but there is no executable hdc in it.\n' "$HDC_DIR" >&2
+    return 1
+  fi
+  if type -P hdc >/dev/null 2>&1; then
+    dirname "$(type -P hdc)"
+    return 0
+  fi
+  printf 'ERROR: cannot find hdc. Add its toolchains directory to PATH or set HDC_DIR.\n' >&2
+  return 1
+}
+
+# Puts hdc on PATH and defines an `hdc` function that targets HDC_DEVICE when it
+# is set (otherwise hdc picks the only connected device itself). Scripts that call
+# plain `hdc` run `vera_use_hdc || exit 1` first.
+vera_use_hdc() {
+  local dir
+  dir=$(vera_hdc_dir) || return 1
+  export PATH="$dir:$PATH"
+  # hdc() below is called by the scripts that run vera_use_hdc; shellcheck cannot see that.
+  # shellcheck disable=SC2317
+  hdc() {
+    if [ -n "${HDC_DEVICE:-}" ]; then
+      command hdc -t "$HDC_DEVICE" "$@"
+    else
+      command hdc "$@"
+    fi
+  }
+}
+
+vera_signing_device() {
+  local targets actual_udid
+  HDC_DIR=$(vera_hdc_dir) || return 1
+  targets=$("$HDC_DIR/hdc" list targets) || return 1
+  HDC_DEVICE=$(printf '%s\n' "$targets" | python3 -c '
+import os, sys
+devices = [s.strip() for s in sys.stdin if s.strip() and s.strip() != "[Empty]"]
+selected = os.environ.get("HDC_DEVICE", "")
+if selected:
+    if selected not in devices:
+        sys.exit("ERROR: HDC_DEVICE is not connected")
+elif len(devices) == 1:
+    selected = devices[0]
+else:
+    sys.exit("ERROR: connect exactly one phone or set HDC_DEVICE")
+print(selected)
+') || return 1
+  actual_udid=$("$HDC_DIR/hdc" -t "$HDC_DEVICE" shell bm get --udid) || return 1
+  actual_udid=$(printf '%s\n' "$actual_udid" | python3 -c '
+import re, sys
+matches = re.findall(r"(?m)^[ \t]*([0-9A-Fa-f]{64})[ \t\r]*$", sys.stdin.read())
+if len(matches) != 1:
+    sys.exit("ERROR: cannot read a unique device UDID from hdc")
+print(matches[0])
+') || return 1
+  if [[ -n "${UDID:-}" && "${UDID,,}" != "${actual_udid,,}" ]]; then
+    printf 'ERROR: UDID does not match the connected HDC_DEVICE.\n' >&2
+    return 1
+  fi
+  UDID="$actual_udid"
+  export HDC_DIR HDC_DEVICE UDID
+  printf 'Signing device: %s\nUDID: %s...%s\n' "$HDC_DEVICE" "${UDID:0:4}" "${UDID: -4}"
+}
+
+vera_hapsigner() {
+  local f
+  if [ -z "${HAPSIGNER:-}" ]; then
+    printf 'ERROR: HAPSIGNER is required. Set it to the directory containing dist/hap-sign-tool.jar.\n' >&2
+    return 1
+  fi
+  for f in hap-sign-tool.jar OpenHarmony.p12 OpenHarmonyProfileRelease.pem OpenHarmonyApplication.pem; do
+    if [ ! -f "$HAPSIGNER/dist/$f" ]; then
+      printf 'ERROR: HAPSIGNER is %s but dist/%s is missing.\n' "$HAPSIGNER" "$f" >&2
+      return 1
+    fi
+  done
+  printf '%s\n' "$HAPSIGNER"
+}
+
+vera_add_toolchains_to_path() {
+  if [ -n "${OHOS_TOOLCHAINS:-}" ]; then
+    if [ ! -d "$OHOS_TOOLCHAINS" ]; then
+      printf 'ERROR: OHOS_TOOLCHAINS is %s but that directory does not exist.\n' "$OHOS_TOOLCHAINS" >&2
+      return 1
+    fi
+    export PATH="$OHOS_TOOLCHAINS:$PATH"
+  fi
   return 0
 }

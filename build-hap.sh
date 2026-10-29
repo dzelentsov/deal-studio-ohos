@@ -11,40 +11,115 @@ esac
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 . "$SCRIPT_DIR/tool-paths.sh"
-HVIGOR=$(vera_kit_bin arkui-hvigor)
+HVIGORW=$(vera_hvigorw)
+OHOS_BASE_SDK_HOME=$(vera_sdk_home)
+export OHOS_BASE_SDK_HOME DEVECO_SDK_HOME
 if [[ "$UNSIGNED_ONLY" == false ]]; then
-  HDC_PATH=$(vera_hdc_dir)
-  export PATH="$HDC_PATH:$PATH"
+  HAPSIGNER=$(vera_hapsigner)
+  export HAPSIGNER
+
+  vera_require_cmd java
+  vera_require_cmd python3
+
+  vera_signing_device
 fi
-UDID=${UDID:-}
-HAP_OUT_DIR="${HAP_OUT_DIR:-/tmp/vera-probe-dyn-hap}"
+export HAP_OUT_DIR="${HAP_OUT_DIR:-/tmp/vera-probe-dyn-hap}"
 HAP_NAME="vera-probe-dyn-unsigned.hap"
 
-echo "=== Build HAP (arkui-hvigor) ==="
+if [[ ! -f "$SCRIPT_DIR/entry/src/main/cpp/llama.cpp/CMakeLists.txt" ]]; then
+  printf 'WARNING: llama.cpp is missing under entry/src/main/cpp; this build will be a stub without model support.\n' >&2
+fi
+
+echo "=== Build HAP ==="
+printf 'Hvigor wrapper: %s\n' "$HVIGORW"
 HVIGOR_EXIT=0
-HVIGOR_OUTPUT=$("$HVIGOR" --directory /tmp/ --json "$SCRIPT_DIR" 2>/dev/null) || HVIGOR_EXIT=$?
-STATUS=$(echo "$HVIGOR_OUTPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status','?'))" 2>/dev/null || echo "?")
-DIAGS=$(echo "$HVIGOR_OUTPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('summary',{}).get('diagnostic_count',0))" 2>/dev/null || echo "?")
+(
+  set -o pipefail
+  cd -- "$SCRIPT_DIR" || exit
 
-echo "  Status: $STATUS"
-echo "  Diagnostics: $DIAGS"
+  exec 3>&1                                       # the real terminal is on fd 3
+  : > /tmp/hvigor-out.log                         # truncate before running (needed for -a)
+  : > /tmp/hvigor-err.log                         # truncate before running (needed for -a)
 
-if [[ "$STATUS" != "ok" || "$HVIGOR_EXIT" -ne 0 ]]; then
-  printf 'ERROR: hvigor failed (exit %s, status %s).\n' "$HVIGOR_EXIT" "$STATUS" >&2
-  if [[ "$DIAGS" != "0" ]]; then
-    echo "$HVIGOR_OUTPUT" | python3 -c "
-import sys,json
-d=json.load(sys.stdin)
-for r in d.get('diagnostics',[]):
-    print(f\"  {r.get('code','?')} L{r.get('line','?')}: {r.get('message','?')}\")
-" 2>/dev/null
-  fi
-  exit 1
+  bash "$HVIGORW" clean --mode module -p module=entry -p product=default createHapTask --analyze=normal --parallel --incremental --no-daemon \
+    2> >(tee -a /tmp/hvigor-err.log \
+    | awk '
+        BEGIN {
+          filter = "is[ \t]+system[ \t]+api|system[ \t]+capacity[ \t]+of[ \t]+this[ \t]+api|to[ \t]+use[ \t]+this[ \t]+api,[ \t]+you[ \t]+need[ \t]+to[ \t]+apply[ \t]+for[ \t]+the[ \t]+permissions:|can[ \t]+only[ \t]+be[ \t]+used[ \t]+for[ \t]+testing[ \t]+directories"
+          ansi   = "\033\\[[0-9;?]*[A-Za-z]"
+          reset  = "\033[0m"
+          pending = ""
+          suppress_blanks = 0
+        }
+
+        function norm(s) {
+          gsub(ansi, "", s)
+          return tolower(s)
+        }
+
+        {
+          c = norm($0)                                            # IMPORTANT: normalize first
+
+          hit      = (c ~ filter)
+          is_blank = (c ~ /^[ \t\r]*$/)
+
+          # 1) after a filtered WARN, swallow blank lines and ohos.permission.*
+          if (suppress_blanks) {
+            if (is_blank || c ~ /^[ \t]*ohos\.permission\./) { next }
+            suppress_blanks = 0
+          }
+
+          # 2) hold the header and decide what to do with the pair
+          if (pending != "") {
+            if (hit) {
+              pending = ""; suppress_blanks = 1
+              printf "%s", reset; fflush()
+              next
+            }
+            print pending; fflush()
+            pending = ""
+          }
+
+          # 3) the current line is a WARN header
+          if (c ~ /^warn:.*file:/ || c ~ /^>[ \t]*hvigor[ \t]+warn:.*file:/) {
+            if (hit) {
+              suppress_blanks = 1
+              printf "%s", reset; fflush()
+              next
+            }
+            pending = $0
+            next
+          }
+
+          # 4) a standalone line containing the filter text
+          if (hit) {
+            suppress_blanks = 1
+            printf "%s", reset; fflush()
+            next
+          }
+
+          print; fflush()
+        }
+
+        END {
+          if (pending != "") { print pending; fflush() }
+        }
+      ' >&3) \
+  | tee /tmp/hvigor-out.log
+
+  status=$?
+  wait                                            # wait for the background tee/awk processes to finish writing
+  exit $status
+) || HVIGOR_EXIT=$?
+
+if [[ "$HVIGOR_EXIT" -ne 0 ]]; then
+  printf 'ERROR: hvigor failed (exit %s).\n' "$HVIGOR_EXIT" >&2
+  exit "$HVIGOR_EXIT"
 fi
 
 echo
 echo "=== Copy HAP ==="
-HAP_SRC="$SCRIPT_DIR/entry/build/default/outputs/default/entry-default-unsigned.hap"
+HAP_SRC="$SCRIPT_DIR/entry/build/default/outputs/default/$HAP_NAME"
 if [[ ! -f "$HAP_SRC" ]]; then
   echo "ERROR: HAP not found at $HAP_SRC" >&2
   exit 1
@@ -61,20 +136,8 @@ fi
 
 echo
 echo "=== Sign ==="
-if [[ -z "$UDID" ]]; then
-  UDID=$(hdc shell bm get --udid 2>/dev/null | tr -d '\r' | tail -1)
-fi
-if [[ -z "$UDID" ]]; then
-  echo "No UDID and no device; leaving the HAP unsigned."
-  echo "HAP: $HAP_OUT_DIR/$HAP_NAME"
-  exit 0
-fi
-echo "  UDID: $UDID"
-# arkui-sign writes its output to the CURRENT directory, not next to its
-# input, so run it from the output directory or the HAP lands in your repo.
-( cd "$HAP_OUT_DIR" && rm -f vera-probe-dyn-signed.hap \
-  && "$(vera_kit_bin arkui-sign)" --mode debug --udid "$UDID" "$HAP_OUT_DIR/$HAP_NAME" )
+"$SCRIPT_DIR/sign-system.sh"
 
 echo
 echo "=== Done ==="
-echo "HAP: $HAP_OUT_DIR/vera-probe-dyn-signed.hap"
+echo "HAP: $HAP_OUT_DIR/vera-probe-dyn-system-signed.hap"
