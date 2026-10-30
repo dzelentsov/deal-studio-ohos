@@ -14,6 +14,7 @@ import { ChatTurn, ParsedReply, MiniApp, parseReply, chatReply, buildMiniApp, ch
 import { AttemptStat, ReplyStats, costOf, formatUsd, formatMs, speedOf } from '../vera/VeraChatStats'
 import { chats, StoredChat, StoredMessage } from '../vera/ChatStore'
 import { store } from '../vera/ProjectStore'
+import { AppRouteParams } from '../vera/AppNavigation'
 import { compileVeraSource } from '../vera/VeraCompiler'
 import { appAgentHost } from '../vera/agent/AgentAppHost'
 import { AgentQuestion, PersonAnswer } from '../vera/agent/AgentQuestions'
@@ -412,9 +413,13 @@ struct MessageBubble {
   }
 }
 
-@Entry
 @Component
-struct ChatPage {
+export struct ChatPage {
+  params: AppRouteParams = new AppRouteParams()
+  private disposed: boolean = false
+
+  @Consume('navPathStack') pathStack: NavPathStack
+
   @State messages: ChatMessage[] = []
   @State draft: string = ''
   @State busy: boolean = false
@@ -456,18 +461,24 @@ struct ChatPage {
     chats.init(dir)
     initTrace(dir)
     this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.RESIZE)
-    let params = this.getUIContext().getRouter().getParams() as Record<string, string>
-    if (params !== null && params !== undefined && (params['chatId'] || '').length > 0) {
-      this.openChat(params['chatId'])
+    if (this.params.chatId.length > 0) {
+      this.openChat(this.params.chatId)
     }
     this.loadResources().catch((_e: Error): void => {})
   }
 
   aboutToDisappear(): void {
+    this.disposed = true
+    for (let msg of this.messages) {
+      let answer = msg.answerQuestion
+      msg.answerQuestion = null
+      msg.question = ''
+      if (answer !== null) { answer(null) }
+    }
     this.persist()
   }
 
-  onPageShow(): void {
+  private destinationShown(): void {
     // The model may have been changed on the Generate page while this page was in
     // the background; re-read it so the idle status line shows what a reply will use.
     this.selectedModel = settings.getModel()
@@ -594,6 +605,7 @@ struct ChatPage {
           loadCatalogFile(context.filesDir)
           let skill = await loadRawfileText(context.resourceManager, 'vera-skill.txt')
           let widget = await loadRawfileText(context.resourceManager, 'vera-widget.txt')
+          if (this.disposed) { return }
           if (skill.trim().length === 0 || widget.trim().length === 0) {
             throw new Error('Widget prompt resources are empty.')
           }
@@ -601,10 +613,12 @@ struct ChatPage {
             .replace('{{UI_CATALOG}}', describeCatalogForPrompt())
             .replace('{{UI_TOOL_NOTE}}\n', '') + widget
           await capabilities
+          if (this.disposed) { return }
           // The model-support note (stub-build warning) is shown by idleLine()
           // alongside the provider/model, not parked in status where it would
           // hide the ready line on a stub build.
         } catch (e) {
+          if (this.disposed) { return }
           this.status = 'Failed to load resources: ' + (e as Error).message
           throw e as Error
         }
@@ -614,10 +628,11 @@ struct ChatPage {
   }
 
   private scrollDown(force: boolean = false): void {
+    if (this.disposed) { return }
     let now = Date.now()
     if (!force && now - this.lastScrollAt < SCROLL_EVERY_MS) { return }
     this.lastScrollAt = now
-    setTimeout(() => { this.scroller.scrollEdge(Edge.Bottom) }, 60)
+    setTimeout(() => { if (!this.disposed) { this.scroller.scrollEdge(Edge.Bottom) } }, 60)
   }
 
   private history(): ChatTurn[] {
@@ -678,7 +693,7 @@ struct ChatPage {
 
   private async send(): Promise<void> {
     let text = this.draft.trim()
-    if (text.length === 0 || this.busy) { return }
+    if (this.disposed || text.length === 0 || this.busy) { return }
     let references = this.referenceSnapshots()
     this.draft = ''
     this.busy = true
@@ -715,8 +730,10 @@ struct ChatPage {
     try {
       let capsStartedAt = Date.now()
       await ensureCapabilities(this.hostContext())
+      if (this.disposed) { return }
       logStep('ensure-capabilities', capsStartedAt)
       let raw = await chatReply(turns, (soFar: string): void => {
+        if (this.disposed) { return }
         if (!sawText) { sawText = true; logMark('chat-first-text') }
         if (this.status === 'Thinking...') { this.status = '' }
         let parsed = parseReply(soFar)
@@ -730,11 +747,14 @@ struct ChatPage {
           this.startWidget(reply, parsed, references, context)
         }
       }, (status: string): void => {
+        if (this.disposed) { return }
         this.status = status.length > 0 ? status : 'Thinking...'
       }, stats, (verified: string): void => {
+        if (this.disposed) { return }
         context.verifiedSearchResults.push(verified)
         reply.searchResults.push(verified)
       })
+      if (this.disposed) { return }
       logMark('chat-reply-done')
       console.info('VERA-CHAT reply: ' + raw)
       let parsed = parseReply(raw, true)
@@ -748,6 +768,7 @@ struct ChatPage {
         this.startWidget(reply, parsed, references, context)
       }
     } catch (e) {
+      if (this.disposed) { return }
       this.status = (e as Error).message
       if (reply.appState === APP_DESCRIBING) {
         reply.appState = APP_FAILED
@@ -809,12 +830,13 @@ struct ChatPage {
   private queueBuild(msg: ChatMessage, context: WidgetBuildContext): void {
     this.buildQueue = this.buildQueue.then(async (): Promise<void> => {
       // The rest of the reply invalidated the marker while this waited.
-      if (msg.appState === APP_FAILED) { return }
+      if (this.disposed || msg.appState === APP_FAILED) { return }
       let startedAt = Date.now()
       logMark('widget-build-start')
       let sawPreview = false
       try {
         await this.loadResources()
+        if (this.disposed) { return }
         logStep('load-resources', startedAt)
         // The route (agent/VeraBuildRoute.ets): the agent, from the marker's request. What it does not build is reported in the
         // bubble, not generated; only a refine of an existing widget, which the route does not take, goes to the model.
@@ -822,16 +844,16 @@ struct ChatPage {
         route.agent = chatAgentRequest(context)
         context.composeTried = true
         let host = appAgentHost((s: string): void => {
-          if (msg.buildStatus !== s) { msg.buildStatus = s }
+          if (!this.disposed && msg.buildStatus !== s) { msg.buildStatus = s }
         }, (vbc2: string): void => {
-          if (msg.appState !== APP_BUILDING) { return }
+          if (this.disposed || msg.appState !== APP_BUILDING) { return }
           if (!sawPreview) { sawPreview = true; logMark('widget-preview') }
           msg.previewVbc2 = vbc2
           this.scrollDown(true)
-        }, (): boolean => false, this.skillPrompt)
+        }, (): boolean => this.disposed, this.skillPrompt)
         // A blocking question goes in the bubble of the widget it is for; an invalidated widget takes the default.
         host.ask = (question: AgentQuestion): Promise<PersonAnswer> => new Promise<PersonAnswer>((resolve: (answer: PersonAnswer) => void) => {
-          if (msg.appState !== APP_BUILDING) { resolve(null); return }
+          if (this.disposed || msg.appState !== APP_BUILDING) { resolve(null); return }
           msg.questionOptions = question.options
           msg.questionFallback = question.fallback
           msg.answerQuestion = resolve
@@ -839,6 +861,7 @@ struct ChatPage {
           this.scrollDown(true)
         })
         let outcome: RouteOutcome = await buildScreen(route, host)
+        if (this.disposed) { return }
         msg.question = ''
         msg.answerQuestion = null
         let composed = new MiniApp()
@@ -869,13 +892,14 @@ struct ChatPage {
           return
         }
         let app: MiniApp = await buildMiniApp(this.skillPrompt, context, (s: string): void => {
-          if (msg.buildStatus !== s) { msg.buildStatus = s }
+          if (!this.disposed && msg.buildStatus !== s) { msg.buildStatus = s }
         }, '', (_s: string): void => {}, (vbc2: string): void => {
-          if (msg.appState !== APP_BUILDING) { return }
+          if (this.disposed || msg.appState !== APP_BUILDING) { return }
           if (!sawPreview) { sawPreview = true; logMark('widget-preview') }
           msg.previewVbc2 = vbc2
           this.scrollDown(true)
         })
+        if (this.disposed) { return }
         msg.attempts = app.stats
         if (msg.appState === APP_FAILED) {
           // Invalidated while it was being built: keep the numbers, not the widget.
@@ -891,6 +915,7 @@ struct ChatPage {
           msg.appState = APP_FAILED
         }
       } catch (e) {
+        if (this.disposed) { return }
         msg.error = (e as Error).message
         msg.appState = APP_FAILED
       }
@@ -904,7 +929,7 @@ struct ChatPage {
   }
 
   build() {
-    Navigation() {
+    NavDestination() {
       Column() {
         // The same numbers the Generate screen shows for a program, for the
         // whole chat; each reply carries its own underneath when this is on.
@@ -969,6 +994,6 @@ struct ChatPage {
       .backgroundColor(app.background)
     }
     .title('Chat')
-    .titleMode(NavigationTitleMode.Mini)
+    .onShown(() => { this.destinationShown() })
   }
 }
