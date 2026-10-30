@@ -2,15 +2,15 @@ import { chats, ChatSummary } from '../vera/ChatStore'
 import { formatUsd } from '../vera/VeraChatStats'
 import { app, DangerButton } from '../components/AppStyle'
 import { SymbolGlyphModifier } from '@kit.ArkUI'
-
-class ChatNavParams {
-  chatId: string = ''
-}
+import { AppRouteParams } from '../vera/AppNavigation'
 
 /** The saved chats, newest first, with a way to start another. */
-@Entry
 @Component
-struct ChatListPage {
+export struct ChatListPage {
+  params: AppRouteParams = new AppRouteParams()
+
+  @Consume('navPathStack') pathStack: NavPathStack
+
   @State list: ChatSummary[] = []
 
   aboutToAppear(): void {
@@ -21,7 +21,7 @@ struct ChatListPage {
   }
 
   // A chat is saved while it is open, so coming back from one shows its new title and count.
-  onPageShow(): void {
+  destinationShown(): void {
     this.reload()
   }
 
@@ -30,10 +30,9 @@ struct ChatListPage {
   }
 
   private open(id: string): void {
-    let nav = new ChatNavParams()
+    let nav = new AppRouteParams()
     nav.chatId = id
-    this.getUIContext().getRouter().pushUrl({ url: 'pages/ChatPage', params: nav })
-      .catch((e: Error): void => { console.error('Navigate to chat failed: ' + e.message) })
+    this.pathStack.pushPath({ name: 'chat', param: nav })
   }
 
   private describe(c: ChatSummary): string {
@@ -44,7 +43,7 @@ struct ChatListPage {
   }
 
   build() {
-    Navigation() {
+    NavDestination() {
       Column() {
         if (this.list.length === 0) {
           Column() {
@@ -71,7 +70,7 @@ struct ChatListPage {
               }
               .swipeAction({
                 end: {
-                  builder: () => { this.deleteAction(c.id) }
+                  builder: () => { this.deleteButton(c.id) }
                 }
               })
             }, (c: ChatSummary) => c.id)
@@ -84,19 +83,18 @@ struct ChatListPage {
       .height('100%')
     }
     .title('Chats')
-    .titleMode(NavigationTitleMode.Mini)
     .backgroundColor(app.background)
+    .onShown(() => { this.destinationShown() })
     .toolbarConfiguration([{
       value: 'New chat',
       symbolIcon: new SymbolGlyphModifier($r('sys.symbol.plus')),
       status: ToolbarItemStatus.NORMAL,
-      action: () => { this.getUIContext().getRouter().pushUrl({ url: 'pages/ChatPage' })
-        .catch((e: Error): void => { console.error('Navigate to chat failed: ' + e.message) }) }
+      action: () => { this.open('') }
     }])
   }
 
-  @Builder
-  deleteAction(id: string) {
+  @LocalBuilder
+  deleteButton(id: string) {
     Row() {
       Button('Delete')
         .attributeModifier(new DangerButton())

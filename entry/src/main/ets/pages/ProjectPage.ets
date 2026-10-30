@@ -5,21 +5,14 @@ import { requestHeadline, changeNote, versionCountText } from '../vera/ProjectTe
 import { projectOperations, ProjectOperationStatus, ProjectShortcutState } from '../vera/ProjectOperations'
 import { common } from '@kit.AbilityKit'
 import { app, PrimaryButton, TonalButton, QuietButton, DangerButton } from '../components/AppStyle'
+import { AppRouteParams, returnToLibrary } from '../vera/AppNavigation'
 
-class RunVersionParams {
-  projectId: string = ''
-  versionId: string = ''
-  vbc2: string = ''
-}
-
-class GenerateNavParams {
-  projectId: string = ''
-  baseVersionId: string = ''
-}
-
-@Entry
 @Component
-struct ProjectPage {
+export struct ProjectPage {
+  params: AppRouteParams = new AppRouteParams()
+
+  @Consume('navPathStack') pathStack: NavPathStack
+
   @State project: Project | null = null
   @State versions: Version[] = []
   @State projectId: string = ''
@@ -27,7 +20,7 @@ struct ProjectPage {
   @State shortcutOperation: string = ''
   @State shortcutState: ProjectShortcutState = ProjectShortcutState.Unknown
   private shortcutRefreshGeneration: number = 0
-  private pageVisible: boolean = true
+  private pageVisible: boolean = false
   private returningToIndex: boolean = false
   @State viewedSource: string = ''
   @State viewedVersionNumber: number = 0
@@ -40,23 +33,23 @@ struct ProjectPage {
   @State renameText: string = ''
 
   aboutToAppear(): void {
-    this.pageVisible = true
-    let params = this.getUIContext().getRouter().getParams() as Record<string, string>
-    if (params !== null && params !== undefined) {
-      this.projectId = params['projectId'] || ''
-    }
+    this.projectId = this.params.projectId
   }
 
-  onPageShow(): void {
+  destinationShown(): void {
     this.pageVisible = true
     this.returningToIndex = false
     this.reload()
   }
 
-  onPageHide(): void {
+  destinationHidden(): void {
     this.pageVisible = false
     this.shortcutRefreshGeneration++
     this.shortcutState = ProjectShortcutState.Unknown
+  }
+
+  aboutToDisappear(): void {
+    this.destinationHidden()
   }
 
   private reload(): void {
@@ -74,9 +67,11 @@ struct ProjectPage {
 
   private returnToIndex(): void {
     if (!this.pageVisible || this.returningToIndex) { return }
+    const top = this.pathStack.size() - 1
+    if (top < 0 || this.pathStack.getParamByIndex(top) !== this.params) { return }
     try {
       this.returningToIndex = true
-      this.getUIContext().getRouter().back({ url: 'pages/Index' })
+      returnToLibrary(this.pathStack)
     } catch (e) {
       this.returningToIndex = false
       console.error('Return to projects failed: ' + (e as Error).message)
@@ -104,9 +99,22 @@ struct ProjectPage {
   }
 
   build() {
-    // The overlays are siblings of the page, not children of its content: their dimming then covers the title bar too.
-    Stack() {
-    Navigation() {
+    NavDestination() {
+      Stack() {
+        this.pageContent()
+        this.pageOverlays()
+      }
+      .width('100%')
+      .height('100%')
+    }
+    .title(this.project !== null ? this.project!.name : 'Project')
+    .backgroundColor(app.background)
+    .onShown(() => { this.destinationShown() })
+    .onHidden(() => { this.destinationHidden() })
+  }
+
+  @LocalBuilder
+  pageContent() {
       Column() {
         if (this.project !== null) {
           Row() {
@@ -241,26 +249,28 @@ struct ProjectPage {
         }
 
       }.width('100%').height('100%')
-    }
-    .title(this.project !== null ? this.project!.name : 'Project')
-    .titleMode(NavigationTitleMode.Mini)
-    .backgroundColor(app.background)
+  }
 
-    if (this.viewedSource.length > 0) {
-      this.sourceOverlay()
-    }
-    if (this.viewedMetricsVersion !== null) {
-      this.metricsOverlay()
-    }
-    if (this.renaming) {
-      this.renameOverlay()
-    }
+  @LocalBuilder
+  pageOverlays() {
+    Stack() {
+      if (this.viewedSource.length > 0) {
+        this.sourceOverlay()
+      }
+      if (this.viewedMetricsVersion !== null) {
+        this.metricsOverlay()
+      }
+      if (this.renaming) {
+        this.renameOverlay()
+      }
     }
     .width('100%')
     .height('100%')
+    .hitTestBehavior(this.viewedSource.length > 0 || this.viewedMetricsVersion !== null || this.renaming ?
+      HitTestMode.Default : HitTestMode.Transparent)
   }
 
-  @Builder
+  @LocalBuilder
   deleteVersionAction(v: Version) {
     Row() {
       Button('Delete')
@@ -343,20 +353,18 @@ struct ProjectPage {
 
   private runVersion(v: Version): void {
     if (v.vbc2.length === 0) { return }
-    let p = new RunVersionParams()
+    let p = new AppRouteParams()
     p.projectId = v.projectId
     p.versionId = v.id
     p.vbc2 = v.vbc2
-    this.getUIContext().getRouter().pushUrl({ url: 'pages/RunnerPage', params: p })
-      .catch((e: Error): void => { console.error('Navigate to runner failed: ' + e.message) })
+    this.pathStack.pushPath({ name: 'runner', param: p })
   }
 
   private openGenerate(baseVersionId: string): void {
-    let p = new GenerateNavParams()
+    let p = new AppRouteParams()
     p.projectId = this.projectId
     p.baseVersionId = baseVersionId
-    this.getUIContext().getRouter().pushUrl({ url: 'pages/GeneratePage', params: p })
-      .catch((e: Error): void => { console.error('Navigate to generation failed: ' + e.message) })
+    this.pathStack.pushPath({ name: 'generate', param: p })
   }
 
   private viewSource(v: Version, versionNumber: number): void {
@@ -379,7 +387,7 @@ struct ProjectPage {
     return value < 1000 ? value.toString() + ' ms' : (value / 1000).toFixed(1) + ' s'
   }
 
-  @Builder
+  @LocalBuilder
   metricCell(label: string, value: string, note: string) {
     Column() {
       Column({ space: 2 }) {
@@ -398,7 +406,7 @@ struct ProjectPage {
     .borderRadius(8)
   }
 
-  @Builder
+  @LocalBuilder
   metricSection(title: string, badge: string, color: string) {
     Column({ space: 6 }) {
       Row({ space: 8 }) {
@@ -416,7 +424,7 @@ struct ProjectPage {
     .padding({ top: 6 })
   }
 
-  @Builder
+  @LocalBuilder
   metricsDashboard(metrics: VersionMetrics) {
     Column({ space: 10 }) {
       Column({ space: 4 }) {
@@ -471,7 +479,7 @@ struct ProjectPage {
     .alignItems(HorizontalAlign.Start)
   }
 
-  @Builder
+  @LocalBuilder
   metricsOverlay() {
     if (this.viewedMetricsVersion !== null) {
       Column() {
@@ -568,7 +576,7 @@ struct ProjectPage {
     }
   }
 
-  @Builder
+  @LocalBuilder
   sourceOverlay() {
     if (this.viewedSource.length > 0) {
       Column() {
@@ -628,7 +636,7 @@ struct ProjectPage {
     }
   }
 
-  @Builder
+  @LocalBuilder
   renameOverlay() {
     Column() {
       Column() {

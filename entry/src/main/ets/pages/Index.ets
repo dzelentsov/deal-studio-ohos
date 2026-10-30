@@ -7,12 +7,9 @@ import { refreshForms } from '../vera/FormUpdater'
 import { projectIconResource } from '../vera/ProjectIcons'
 import { common } from '@kit.AbilityKit'
 import { app, PrimaryButton, QuietButton, DangerButton } from '../components/AppStyle'
+import { AppRouteParams } from '../vera/AppNavigation'
 
 const ICONS: string[] = ['📱', '🎮', '📊', '🧮', '🎯', '📝', '🔧', '🎨', '🌍', '⚡']
-
-class ProjectNavParams {
-  projectId: string = ''
-}
 
 /** A project and what its row shows of it. */
 class ProjectRow {
@@ -20,9 +17,13 @@ class ProjectRow {
   summary: ProjectSummary = new ProjectSummary()
 }
 
-@Entry
 @Component
-struct Index {
+export struct Index {
+  params: AppRouteParams = new AppRouteParams()
+  private backgroundPending: boolean = false
+
+  @Consume('navPathStack') pathStack: NavPathStack
+
   @State projects: ProjectRow[] = []
   @State showCreate: boolean = false
   @State deletionPending: boolean = false
@@ -37,7 +38,7 @@ struct Index {
     this.reload()
   }
 
-  onPageShow(): void {
+  destinationShown(): void {
     this.reload()
   }
 
@@ -55,8 +56,7 @@ struct Index {
   }
 
   private openChats(): void {
-    this.getUIContext().getRouter().pushUrl({ url: 'pages/ChatListPage' })
-      .catch((e: Error): void => { console.error('Navigate to chats failed: ' + e.message) })
+    this.pathStack.pushPath({ name: 'chatList', param: new AppRouteParams() })
   }
 
   private openCreate(): void {
@@ -65,57 +65,89 @@ struct Index {
     this.selectedIcon = '📱'
   }
 
-  build() {
-    // The dialog is a sibling of the page, not a child of its content: its dimming then covers the title and the toolbar too.
-    Stack() {
-      Navigation() {
-        if (this.projects.length === 0) {
-          Column() {
-            Text('No projects yet').fontSize(18).fontColor(app.inkMuted).margin({ top: 120 })
-            Text('Tap New Project to create your first VERA app').fontSize(14).fontColor(app.inkDisabled).margin({ top: 8 })
-          }.width('100%').alignItems(HorizontalAlign.Center)
-        } else {
-          List({ space: 12 }) {
-            ForEach(this.projects, (row: ProjectRow) => {
-              ListItem() {
-                this.projectRow(row)
-              }
-              .swipeAction({
-                end: {
-                  builder: () => { this.deleteAction(row.project.id) }
-                }
-              })
-            }, (row: ProjectRow) => row.project.id)
-          }
-          .width('100%')
-          .padding({ left: 16, right: 16, top: 8 })
-        }
-      }
-      .title('VERA')
-      .titleMode(NavigationTitleMode.Full)
-      .backgroundColor(app.background)
-      .toolbarConfiguration([{
-        value: 'Chat',
-        symbolIcon: new SymbolGlyphModifier($r('sys.symbol.ellipsis_message')),
-        status: ToolbarItemStatus.NORMAL,
-        action: () => { this.openChats() }
-      }, {
-        value: 'New Project',
-        symbolIcon: new SymbolGlyphModifier($r('sys.symbol.plus')),
-        status: ToolbarItemStatus.NORMAL,
-        action: () => { this.openCreate() }
-      }])
+  private async backgroundAbility(): Promise<void> {
+    if (this.backgroundPending) { return }
+    this.backgroundPending = true
+    try {
+      const context = this.getUIContext().getHostContext() as common.UIAbilityContext
+      if (context === undefined) { return }
+      await context.moveAbilityToBackground()
+    } catch (e) {
+      console.error('Move ability to background failed: ' + (e as Error).message)
+    } finally {
+      this.backgroundPending = false
+    }
+  }
 
+  build() {
+    NavDestination() {
+      if (this.projects.length === 0) {
+        Column() {
+          Text('No projects yet').fontSize(18).fontColor(app.inkMuted).margin({ top: 120 })
+          Text('Tap New Project to create your first VERA app').fontSize(14).fontColor(app.inkDisabled).margin({ top: 8 })
+        }.width('100%').alignItems(HorizontalAlign.Center)
+      } else {
+        List({ space: 12 }) {
+          ForEach(this.projects, (row: ProjectRow) => {
+            ListItem() {
+              this.projectRow(row)
+            }
+            .swipeAction({
+              end: {
+                builder: () => { this.deleteAction(row.project.id) }
+              }
+            })
+          }, (row: ProjectRow) => row.project.id)
+        }
+        .width('100%')
+        .padding({ left: 16, right: 16, top: 8 })
+      }
+    }
+    .title('VERA')
+    .backgroundColor(app.background)
+    .hideBackButton(true)
+    .onShown(() => { this.destinationShown() })
+    .onBackPressed(() => {
+      this.backgroundAbility()
+      return true
+    })
+    .menus([{
+      value: 'Chat',
+      symbolIcon: new SymbolGlyphModifier($r('sys.symbol.ellipsis_message')),
+      action: () => { this.openChats() }
+    }, {
+      value: 'New Project',
+      symbolIcon: new SymbolGlyphModifier($r('sys.symbol.plus')),
+      action: () => { this.openCreate() }
+    }])
+    .toolbarConfiguration([{
+      value: 'Chat',
+      symbolIcon: new SymbolGlyphModifier($r('sys.symbol.ellipsis_message')),
+      status: ToolbarItemStatus.NORMAL,
+      action: () => { this.openChats() }
+    }, {
+      value: 'New Project',
+      symbolIcon: new SymbolGlyphModifier($r('sys.symbol.plus')),
+      status: ToolbarItemStatus.NORMAL,
+      action: () => { this.openCreate() }
+    }])
+    .overlay(() => { this.createOverlay() })
+  }
+
+  @LocalBuilder
+  createOverlay() {
+    Stack() {
       if (this.showCreate) {
         this.createDialog()
       }
     }
     .width('100%')
     .height('100%')
+    .hitTestBehavior(this.showCreate ? HitTestMode.Default : HitTestMode.Transparent)
   }
 
   /** One project: what it is (the request it began as), how much work is in it, and when it was last worked on. */
-  @Builder
+  @LocalBuilder
   projectRow(row: ProjectRow) {
     Row() {
       Image(projectIconResource(row.project.icon))
@@ -141,16 +173,15 @@ struct Index {
     .borderRadius(12)
     .shadow({ radius: 2, color: '#10000000', offsetY: 1 })
     .onClick(() => {
-      let nav = new ProjectNavParams()
+      let nav = new AppRouteParams()
       nav.projectId = row.project.id
-      this.getUIContext().getRouter().pushUrl({ url: 'pages/ProjectPage', params: nav })
-        .catch((e: Error): void => { console.error('Navigate to project failed: ' + e.message) })
+      this.pathStack.pushPath({ name: 'project', param: nav })
     })
     // A swipe is not a thing anyone is told about: the press that opens a menu is.
-    .bindContextMenu(this.rowMenu(row.project.id), ResponseType.LongPress)
+    .bindContextMenu(() => { this.rowMenu(row.project.id) }, ResponseType.LongPress)
   }
 
-  @Builder
+  @LocalBuilder
   rowMenu(id: string) {
     Menu() {
       MenuItem({ content: 'Delete project', symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.trash')) })
@@ -158,7 +189,7 @@ struct Index {
     }
   }
 
-  @Builder
+  @LocalBuilder
   createDialog() {
     Column() {
       Column() {
@@ -213,7 +244,7 @@ struct Index {
     .onClick(() => { this.showCreate = false })
   }
 
-  @Builder
+  @LocalBuilder
   deleteAction(id: string) {
     Row() {
       Button('Delete')
@@ -268,9 +299,8 @@ struct Index {
     this.showCreate = false
     this.reload()
     refreshForms()
-    let nav = new ProjectNavParams()
+    let nav = new AppRouteParams()
     nav.projectId = project.id
-    this.getUIContext().getRouter().pushUrl({ url: 'pages/ProjectPage', params: nav })
-      .catch((e: Error): void => { console.error('Navigate to project failed: ' + e.message) })
+    this.pathStack.pushPath({ name: 'project', param: nav })
   }
 }
