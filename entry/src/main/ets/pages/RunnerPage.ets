@@ -2,10 +2,14 @@ import { VeraPreview } from '../components/VeraPreview'
 import { store } from '../vera/ProjectStore'
 import { consent } from '../vera/VeraConsentStore'
 import { common } from '@kit.AbilityKit'
+import { AppRouteParams } from '../vera/AppNavigation'
 
-@Entry
 @Component
-struct RunnerPage {
+export struct RunnerPage {
+  params: AppRouteParams = new AppRouteParams()
+
+  @Consume('navPathStack') pathStack: NavPathStack
+
   @State vbc2: string = ''
   @State error: string = ''
   // projectId and versionId were already being passed here and ignored; they are
@@ -20,15 +24,14 @@ struct RunnerPage {
   private closing: boolean = false
 
   aboutToAppear(): void {
-    let params = this.getUIContext().getRouter().getParams() as Record<string, string>
-    if (params === null || params === undefined) { this.error = 'No parameters'; return }
-    this.shortcutMode = params['shortcutMode'] === 'true'
-    if (this.shortcutMode && params['launchError']) { this.error = params['launchError']; return }
-    let vbc2 = params['vbc2'] || ''
+    let params = this.params
+    this.shortcutMode = params.shortcutMode === 'true'
+    if (this.shortcutMode && params.launchError) { this.error = params.launchError; return }
+    let vbc2 = params.vbc2
     if (vbc2.length === 0) { this.error = 'No VBC2 bytecode'; return }
     this.vbc2 = vbc2
-    let projectId = params['projectId'] || ''
-    let versionId = params['versionId'] || ''
+    let projectId = params.projectId
+    let versionId = params.versionId
     if (projectId.length > 0 && versionId.length > 0) {
       this.persistKey = projectId + '/' + versionId
       let context = this.getUIContext().getHostContext()
@@ -42,10 +45,7 @@ struct RunnerPage {
     }
   }
 
-  // The page-level hook for the hardware/system back gesture. If the running
-  // program currently has a ui.BackHandler, hand it to VeraPreview and
-  // swallow the gesture (true); otherwise let the system do its own thing (false).
-  onBackPress(): boolean {
+  private handleBack(): boolean {
     if (this.hasBackHandler) { this.backPressSignal += 1; return true }
     if (this.shortcutMode) { this.closeShortcut(); return true }
     return false
@@ -65,7 +65,7 @@ struct RunnerPage {
   }
 
   build() {
-    Navigation() {
+    NavDestination() {
       Column() {
         if (this.error.length > 0) {
           Text(this.error)
@@ -85,8 +85,8 @@ struct RunnerPage {
       }.width('100%').height('100%')
     }
     .title('App')
-    .titleMode(NavigationTitleMode.Mini)
     .hideTitleBar(this.shortcutMode)
     .hideBackButton(this.shortcutMode)
+    .onBackPressed((): boolean => this.handleBack())
   }
 }

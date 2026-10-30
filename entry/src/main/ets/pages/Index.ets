@@ -4,16 +4,17 @@ import { consent } from '../vera/VeraConsentStore'
 import { refreshForms } from '../vera/FormUpdater'
 import { projectIconResource } from '../vera/ProjectIcons'
 import { common } from '@kit.AbilityKit'
+import { AppRouteParams } from '../vera/AppNavigation'
 
 const ICONS: string[] = ['📱', '🎮', '📊', '🧮', '🎯', '📝', '🔧', '🎨', '🌍', '⚡']
 
-class ProjectNavParams {
-  projectId: string = ''
-}
-
-@Entry
 @Component
-struct Index {
+export struct Index {
+  params: AppRouteParams = new AppRouteParams()
+  private backgroundPending: boolean = false
+
+  @Consume('navPathStack') pathStack: NavPathStack
+
   @State projects: Project[] = []
   @State showCreate: boolean = false
   @State deletionPending: boolean = false
@@ -28,7 +29,7 @@ struct Index {
     this.reload()
   }
 
-  onPageShow(): void {
+  destinationShown(): void {
     this.reload()
   }
 
@@ -36,8 +37,22 @@ struct Index {
     this.projects = store.listProjects()
   }
 
+  private async backgroundAbility(): Promise<void> {
+    if (this.backgroundPending) { return }
+    this.backgroundPending = true
+    try {
+      const context = this.getUIContext().getHostContext() as common.UIAbilityContext
+      if (context === undefined) { return }
+      await context.moveAbilityToBackground()
+    } catch (e) {
+      console.error('Move ability to background failed: ' + (e as Error).message)
+    } finally {
+      this.backgroundPending = false
+    }
+  }
+
   build() {
-    Navigation() {
+    NavDestination() {
       if (this.projects.length === 0 && !this.showCreate) {
         Column() {
           Text('No projects yet').fontSize(18).fontColor('#999999').margin({ top: 120 })
@@ -66,10 +81,9 @@ struct Index {
               .borderRadius(12)
               .shadow({ radius: 2, color: '#10000000', offsetY: 1 })
               .onClick(() => {
-                let nav = new ProjectNavParams()
+                let nav = new AppRouteParams()
                 nav.projectId = p.id
-                this.getUIContext().getRouter().pushUrl({ url: 'pages/ProjectPage', params: nav })
-                  .catch((e: Error): void => { console.error('Navigate to project failed: ' + e.message) })
+                this.pathStack.pushPath({ name: 'project', param: nav })
               })
             }
             .swipeAction({
@@ -139,12 +153,16 @@ struct Index {
       }
     }
     .title('VERA')
-    .titleMode(NavigationTitleMode.Full)
+    .hideBackButton(true)
+    .onShown(() => { this.destinationShown() })
+    .onBackPressed(() => {
+      this.backgroundAbility()
+      return true
+    })
     .menus([{
       value: 'Chat',
       icon: 'resources/base/media/startIcon.png',
-      action: () => { this.getUIContext().getRouter().pushUrl({ url: 'pages/ChatListPage' })
-        .catch((e: Error): void => { console.error('Navigate to chats failed: ' + e.message) }) }
+      action: () => { this.pathStack.pushPath({ name: 'chatList', param: new AppRouteParams() }) }
     }, {
       value: '',
       icon: 'resources/base/media/startIcon.png',
@@ -153,8 +171,7 @@ struct Index {
     .toolbarConfiguration([{
       value: 'Chat',
       status: ToolbarItemStatus.NORMAL,
-      action: () => { this.getUIContext().getRouter().pushUrl({ url: 'pages/ChatListPage' })
-        .catch((e: Error): void => { console.error('Navigate to chats failed: ' + e.message) }) }
+      action: () => { this.pathStack.pushPath({ name: 'chatList', param: new AppRouteParams() }) }
     }, {
       value: 'New Project',
       status: ToolbarItemStatus.NORMAL,
@@ -162,7 +179,7 @@ struct Index {
     }])
   }
 
-  @Builder
+  @LocalBuilder
   deleteAction(id: string) {
     Row() {
       Button('Delete')
@@ -218,9 +235,8 @@ struct Index {
     this.showCreate = false
     this.reload()
     refreshForms()
-    let nav = new ProjectNavParams()
+    let nav = new AppRouteParams()
     nav.projectId = project.id
-    this.getUIContext().getRouter().pushUrl({ url: 'pages/ProjectPage', params: nav })
-      .catch((e: Error): void => { console.error('Navigate to project failed: ' + e.message) })
+    this.pathStack.pushPath({ name: 'project', param: nav })
   }
 }

@@ -4,6 +4,7 @@ import { fileIo as fs } from '@kit.CoreFileKit'
 import { http } from '@kit.NetworkKit'
 import { request } from '@kit.BasicServicesKit'
 import { Version, VersionMetrics, store } from '../vera/ProjectStore'
+import { AppRouteParams } from '../vera/AppNavigation'
 import { refreshForms } from '../vera/FormUpdater'
 import { engine, LlamaEngine, GenerateRequest, GenerateResult, loadRawfileText } from '../vera/LlamaEngine'
 import { compileVeraSource, CompileError } from '../vera/VeraCompiler'
@@ -208,9 +209,13 @@ function decodeServerResponse(body: string): ServerDecodedResponse {
   return result
 }
 
-@Entry
 @Component
-struct GeneratePage {
+export struct GeneratePage {
+  params: AppRouteParams = new AppRouteParams()
+  private disposed: boolean = false
+
+  @Consume('navPathStack') pathStack: NavPathStack
+
   @State projectId: string = ''
   @State baseVersionId: string = ''
   @State prompt: string = ''
@@ -482,11 +487,8 @@ struct GeneratePage {
   }
 
   aboutToAppear(): void {
-    let params = this.getUIContext().getRouter().getParams() as Record<string, string>
-    if (params !== null && params !== undefined) {
-      this.projectId = params['projectId'] || ''
-      this.baseVersionId = params['baseVersionId'] || ''
-    }
+    this.projectId = this.params.projectId
+    this.baseVersionId = this.params.baseVersionId
     let context = this.hostContext()
     store.init(context.filesDir)
     let versions = store.listVersions(this.projectId)
@@ -514,9 +516,17 @@ struct GeneratePage {
     this.loadResources()
   }
 
+  aboutToDisappear(): void {
+    this.disposed = true
+    this.finishMetrics(this.runId)
+    this.cancelRequested = true
+    this.runId++
+    this.settleQuestion(null)
+  }
+
   // The key can arrive from a launch parameter while this page sits in the
   // foreground, so re-read it whenever the page comes back into view.
-  onPageShow(): void {
+  private destinationShown(): void {
     if (this.mode === MODE_DEEPSEEK && !this.generating) {
       this.checkDeepSeek()
     }
@@ -540,6 +550,7 @@ struct GeneratePage {
           extra.problems.join('; '))
       }
       let skill = await loadRawfileText(mgr, 'vera-skill.txt')
+      if (this.disposed) { return }
       // The UI catalogue is the same for every request, so it is spliced in
       // once. The intent catalogue is not spliced at
       // all any more: find_intent_function (DeepSeekEngine.ets,
@@ -553,9 +564,12 @@ struct GeneratePage {
       ensureCapabilities(context)
       this.ensureEmbeddingsReady()
       this.systemPrompt = this.promptTemplate
-      this.grammar = await loadRawfileText(mgr, 'vera.gbnf')
+      let grammar = await loadRawfileText(mgr, 'vera.gbnf')
+      if (this.disposed) { return }
+      this.grammar = grammar
       this.status = 'Resources loaded'
     } catch (e) {
+      if (this.disposed) { return }
       this.status = 'Failed to load resources: ' + (e as Error).message
     }
     this.checkProvider()
@@ -600,6 +614,7 @@ struct GeneratePage {
         connectTimeout: 5000,
         readTimeout: 5000
       })
+      if (this.disposed) { return }
       if (resp.responseCode === 200) {
         let body = resp.result as string
         let health = JSON.parse(body) as Record<string, Object>
@@ -608,6 +623,7 @@ struct GeneratePage {
         this.status = 'Server error: HTTP ' + resp.responseCode
       }
     } catch (e) {
+      if (this.disposed) { return }
       this.status = 'Server unreachable: ' + (e as Error).message
     } finally {
       client.destroy()
@@ -622,6 +638,7 @@ struct GeneratePage {
       // model is fetched from the vera-server /models endpoint instead.
       await this.downloadModel(modelPath)
     }
+    if (this.disposed) { return }
     this.modelReady = LlamaEngine.modelExists(filesDir)
     if (!this.modelReady) {
       this.status = 'Model not found'
@@ -656,7 +673,7 @@ struct GeneratePage {
             filePath: modelPath
           })
           task.on('progress', (received: number, total: number): void => {
-            if (total > 0) {
+            if (!this.disposed && total > 0) {
               this.status = 'Downloading model ' + Math.floor(received * 100 / total).toString() + '%'
             }
           })
@@ -664,6 +681,7 @@ struct GeneratePage {
             task.on('complete', (): void => { resolve() })
             task.on('fail', (err: number): void => { reject(new Error('download failed, code ' + err.toString())) })
           })
+          if (this.disposed) { return }
           this.status = 'Model downloaded'
           return
         }
@@ -671,6 +689,7 @@ struct GeneratePage {
       }
       throw new Error('SystemCapability.Request.FileTransferAgent is not supported')
     } catch (e) {
+      if (this.disposed) { return }
       this.status = 'Model download failed: ' + (e as Error).message
     }
   }
@@ -1616,6 +1635,7 @@ struct GeneratePage {
 
   /** Puts the agent's question on the screen; the promise settles with the person's tap. */
   private askPerson(question: AgentQuestion): Promise<PersonAnswer> {
+    if (this.disposed || this.cancelRequested) { return Promise.resolve(null) }
     this.settleQuestion(null)
     return new Promise<PersonAnswer>((resolve: (answer: PersonAnswer) => void) => {
       this.questionText = question.text
@@ -1641,7 +1661,7 @@ struct GeneratePage {
   }
 
   private doSave(): void {
-    if (this.generating || this.compiledSource.length === 0 || !this.hasResult()) { return }
+    if (this.disposed || this.generating || this.compiledSource.length === 0 || !this.hasResult()) { return }
     let note = this.acceptedRequest
     if (note.length > 100) { note = note.substring(0, 100) + '...' }
     store.createVersion(this.projectId, this.compiledSource, this.compiledVbc2, note,
@@ -1649,7 +1669,10 @@ struct GeneratePage {
       this.acceptedMetrics)
     this.status = 'Saved with compiled bytecode'
     refreshForms()
-    this.getUIContext().getRouter().back()
+    let top = this.pathStack.size() - 1
+    if (!this.disposed && top >= 0 && this.pathStack.getParamByIndex(top) === this.params) {
+      this.pathStack.pop()
+    }
   }
 
   /** The saved version's origin: the kinds of the composed screen it began as, "+model" when the model finished or rewrote it. */
@@ -1797,7 +1820,7 @@ struct GeneratePage {
    * Where the time of the run went: the app's total, how it divides between the model, Jev, the search and the phone, and then
    * every stage in the order it happened, each with its share drawn as a bar. The person's own waiting is listed, never counted.
    */
-  @Builder
+  @LocalBuilder
   stagesPanel() {
     MetricCard({ title: 'Where the time went', value: this.formatMs(appMs(this.stages)) }) {
       if (yourMs(this.stages) > 0) {
@@ -1817,7 +1840,7 @@ struct GeneratePage {
     }
   }
 
-  @Builder
+  @LocalBuilder
   stageRow(st: Stage, total: number) {
     Column({ space: 3 }) {
       Row({ space: 6 }) {
@@ -1848,7 +1871,7 @@ struct GeneratePage {
    * the cost over all of them; then each call on a line of its own. The program's own attempts and the small calls (the plan,
    * the sections' text and functions, a section the model writes) count together.
    */
-  @Builder
+  @LocalBuilder
   tokensPanel() {
     MetricCard({ title: 'Model calls', value: this.mode === MODE_DEEPSEEK ? '~' + this.formatUsd(this.allCost()) : '' }) {
       Row({ space: 8 }) {
@@ -1876,7 +1899,7 @@ struct GeneratePage {
    * The lookups of the run: how many and how long they took on the head line; a tap opens each with what it asked for and what
    * came back. A run that made none says so, so an empty card is a fact and not a card that failed to load.
    */
-  @Builder
+  @LocalBuilder
   toolsPanel() {
     MetricCard({
       title: 'Tool calls',
@@ -1909,7 +1932,7 @@ struct GeneratePage {
    * Who answered: one line per service the run called (Jev, Exa, DeepSeek), red when it answered nothing, amber when some calls
    * failed. What a slow or fallen-back run owes to a service that was not there reads here, with what it said.
    */
-  @Builder
+  @LocalBuilder
   servicesPanel() {
     MetricCard({ title: 'Services', value: this.servicesSummary(), valueColor: this.servicesTone() }) {
       ForEach(this.services, (n: ServiceNote) => {
@@ -1932,7 +1955,7 @@ struct GeneratePage {
    * The program the model wrote itself (a run the agent did not serve, or a refine): how long it took, what the compiler cost,
    * each attempt, and the runs before it.
    */
-  @Builder
+  @LocalBuilder
   attemptsPanel() {
     MetricCard({ title: 'Model writes the program', value: this.formatMs(this.runLlmMs()) }) {
       Row({ space: 8 }) {
@@ -1993,7 +2016,7 @@ struct GeneratePage {
   }
 
   build() {
-    Navigation() {
+    NavDestination() {
       Column() {
         if (this.baseError.length > 0) {
           Text(this.baseError)
@@ -2319,6 +2342,6 @@ struct GeneratePage {
       .height('100%')
     }
     .title(this.baseVersionId.length > 0 ? 'Refine · Version ' + this.nextVersionNumber.toString() : 'Generate')
-    .titleMode(NavigationTitleMode.Mini)
+    .onShown(() => { this.destinationShown() })
   }
 }

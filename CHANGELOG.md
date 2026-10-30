@@ -1,5 +1,11 @@
 # Changelog
 
+## Navigation and kit imports
+
+- Replaced app page-router navigation with a single `AppShell`, shared `Navigation`/`NavPathStack`, and `NavDestination` screens. External launches replace the stack while preserving isolated shortcut launches, widget launch behavior, and mini-app Back handling.
+- Bound navigation readiness to the active window stage and shared storage; hidden or removed screens ignore stale asynchronous updates.
+- Migrated application imports from `@ohos.*` to named `@kit` exports, preserving aliases. Updated SDK backend generation and host mocks, added explicit socket result types, and switched remaining Generate animations to scoped UI APIs.
+
 ## Shortcut processing
 
 ### Desktop shortcuts and launch behavior
