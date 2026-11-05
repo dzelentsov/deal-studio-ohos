@@ -114,10 +114,10 @@ export default class UsbNetAbility extends VpnExtensionAbility {
 
   /** Writes the native status when its state changes, and the counters at most every COUNTER_WRITE_MS. */
   private report(): void {
-    let status = usbnet.usbnetStatus()
+    let status: string = usbnet.usbnetStatus()
     if (status === this.lastStatus) { return }
-    let comma = status.indexOf(',')
-    let state = comma >= 0 ? status.substring(0, comma) : status
+    let comma: number = status.indexOf(',')
+    let state: string = comma >= 0 ? status.substring(0, comma) : status
     let now = Date.now()
     if (state === this.lastState && now - this.lastWriteAt < COUNTER_WRITE_MS) { return }
     writeUsbNetStatus(this.context.filesDir, status)
