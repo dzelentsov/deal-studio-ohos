@@ -184,7 +184,7 @@ if (!baseline) {
     const mocks={UiHostEnvironment:U.UiHostEnvironment,VirtualMachine:Machine,deserializeVbc2:V.deserializeVbc2,VeraStringValue:V.VeraStringValue,runRawIntent:(...args)=>call('intent',...args),runSdkAdapter:(...args)=>call('sdk',...args),catalogKinds:()=>{events.push(['catalogue',probe.disposed]);return []},consent:{remember:(...args)=>events.push(['remember',...args])},armReveal:value=>events.push(['reveal',value]),console:{info(){},error(){},warn(){}}}
     const Probe=new Function(...Object.keys(mocks),compiled.outputText+'; const VeraPreview=Probe; return Probe')(...Object.values(mocks))
     probe=new Probe()
-    Object.assign(probe,{pending:null,programId:7,revision:0,previewOnly:false,liveRoot:null,hasRoot:false,error:'',vbc2:'',destinationHidden:false,pageHidden:false,darkListener:null,liveSurfaces:[],stopAllTimers(){events.push(['stop',this.disposed,this.effectGeneration])},restoreState(){return null},seeded(value){return value},notifyStateSnapshot(){events.push(['snapshot'])},renderView(){events.push(['render'])},persistState(){events.push(['persist'])},watchDarkMode(){events.push(['dark',this.disposed])},needsConsent:effect=>!!effect.ask,consentTitle:effect=>effect.rawTarget,consentTarget:effect=>effect.rawTarget,consentKey:effect=>effect.rawTarget,stamp:()=>probe.vbc2})
+    Object.assign(probe,{pending:null,programId:7,revision:0,previewOnly:false,liveRoot:null,hasRoot:false,error:'',vbc2:'',destinationHidden:false,pageHidden:false,darkListener:null,liveSurfaces:[],stopAllTimers(){events.push(['stop',this.disposed,this.effectGeneration])},restoreState(){return null},seeded(value){return value},notifyStateSnapshot(){events.push(['snapshot'])},renderView(){events.push(['render'])},persistState(){events.push(['persist'])},watchDarkMode(){events.push(['dark',this.disposed])},needsConsent:effect=>!!effect.ask,consentTitle:effect=>effect.rawTarget,consentTarget:effect=>effect.rawTarget,consentKey:effect=>effect.rawTarget,stamp:()=>probe.vbc2,cancelFields(){},reconcileFields(){}})
     const bytecode=C.compileVeraSource(fs.readFileSync(path.join(__dirname,'examples/visual-counter.vera'),'utf8')).vbc2
     function load() { probe.vbc2=bytecode;probe.load() }
     function observeDispatch() { probe.dispatch=(action,value)=>{assert(value instanceof V.VeraStringValue);delivered.push([action,value.value])} }
@@ -371,7 +371,7 @@ if (!baseline) {
      const Probe=new Function(...Object.keys(mocks),compiled.outputText+'; const VeraPreview=Probe; return Probe')(...Object.values(mocks))
      probe=new Probe()
      Object.assign(probe,{destinationHidden:false,previewOnly:false,programId:0,revision:0,liveRoot:null,hasRoot:false,error:'',darkListener:null,pending:null,
-      stopAllTimers(){events.push(['cleanup',this.disposed,this.pageHidden]);this.stopSurfaceLoop()},watchDarkMode(){events.push(['dark',this.disposed,this.pageHidden])},restoreState(){return null},seeded:value=>value,notifyStateSnapshot(){events.push(['snapshot'])},persistState(){events.push(['persist'])},paintSurfaces(){events.push(['paint'])},drainEffects(){events.push(['drain'])},countFrame(){events.push(['count'])},reconcileTheme(){},reconcileTimers(){},reconcileSpin(){},reconcileMotion(){},reconcileBackHandler(){}})
+      stopAllTimers(){events.push(['cleanup',this.disposed,this.pageHidden]);this.stopSurfaceLoop()},watchDarkMode(){events.push(['dark',this.disposed,this.pageHidden])},restoreState(){return null},seeded:value=>value,notifyStateSnapshot(){events.push(['snapshot'])},persistState(){events.push(['persist'])},paintSurfaces(){events.push(['paint'])},drainEffects(){events.push(['drain'])},countFrame(){events.push(['count'])},reconcileTheme(){},reconcileTimers(){},reconcileSpin(){},reconcileMotion(){},reconcileBackHandler(){},cancelFields(){},reconcileFields(){}})
      probe.vbc2=C.compileVeraSource(`
 @jsonable class AppState { n: number; }
 function init(): AppState { return {n: 0}; }
@@ -503,7 +503,872 @@ function view(state: AppState): ui.View { return ui.Column("default", [ui.Surfac
      probe.disposed=false;probe.destinationShown();assert.equal(probe.destinationHidden,false);assert(events.length>0)
      if(page==='Chat')assert.equal(probe.selectedModel,'fixture');else assert.deepEqual(events,['check'])
     })
-    function tickerProbe() {
+      let fieldBytecode, syncBytecode
+      function fieldProbe(sync=false) {
+      const renderer=fs.readFileSync(path.join(sourceRoot,'components/VeraPreview.ets'),'utf8')
+       const fields=['fieldEdits','fieldActions','surfaceInputs','resumingFieldActions','disposed','effectGeneration','heldEffects','vm','host','currentState','surfaces','surfaceSync','surfaceTimer','lastViewAt','timers','timerConfigs','timerLastFire','ticking','backHandlerAction'].map(name=>{
+        const field=renderer.match(new RegExp('^  private '+name+':[^\\n]+(?:\\n    [^\\n]+)*','m'));assert(field,name)
+        return field[0].replace('  private ','')
+       }).join('\n')
+       const names=['fieldCurrent','containsField','cancelField','cancelFields','reconcileFields','changeField','commitField','flushFields','flushUserFields','finishField','invalidateEffects','load','renderView','handleAction','handleBoolAction','handleStringAction','dispatchFieldAction','resumeFieldActions','dispatch','surfaceTouch','surfaceMove','stateKeys','stamp','persistState','reconcileBackHandler','findBackHandlerAction','startTimer','stopTimer','runEffect']
+       const body=names.map(name=>declaration(renderer,'  private '+name+'(').replace('  private ','')).concat(['aboutToAppear','aboutToDisappear','onBackPressSignal'].map(name=>declaration(renderer,'  '+name+'('))).join('\n')
+       const sliderSource=renderer.slice(renderer.indexOf("} else if (node.kind === 'slider') {"),renderer.indexOf("} else if (node.kind === 'select') {"))
+       const callback='sliderChange(node: LiveNode) { return '+declaration(sliderSource,'.onChange(').slice('.onChange('.length)+' }'
+       const declarations=['class FieldEdit','class FieldAction','class SurfaceInput','class TimerConfig'].map(prefix=>declaration(renderer,prefix)).join('\n')
+       const compiled=ts.transpileModule(declarations+'\n'+renderer.match(/^const SURFACE_VIEW_MS:[^\n]+/m)[0]+'\nclass Probe { static RENDERED=[]; '+fields+'\n'+body+'\n'+callback+' }',{compilerOptions:{target:ts.ScriptTarget.ES2020},reportDiagnostics:true})
+      assert.equal((compiled.diagnostics||[]).filter(d=>d.category===ts.DiagnosticCategory.Error).length,0,'field probe syntax')
+      global.ObservedV2=c=>c;global.Trace=()=>{}
+      const L=loadSource(path.join(sourceRoot,'components/VeraLiveTree.ets'))
+      let now=0, nextHandle=0
+       const scheduled=new Map(), history=new Map(), intervals=new Map(), calls=[], writes=[], saves=[], replies=[]
+       const TouchType={Down:0,Up:1,Move:2,Cancel:3}, SliderChangeMode={Begin:0,Moving:1,End:2,Click:3}
+       const platform=()=>new Promise((resolve,reject)=>replies.push({resolve,reject}))
+       const mocks={...V,...loadVera('VeraGfx'),TouchType,SliderChangeMode,store:{saveState(project,version,stamp,encoded){
+        assert.equal(project,'fixture');assert.equal(version,'version');assert.equal(stamp,probe.stamp())
+        const state=V.decodeRuntimeValue(JSON.parse(encoded))
+        assert.deepEqual(V.encodeRuntimeValue(state),V.encodeRuntimeValue(probe.currentState))
+        saves.push(Object.fromEntries([...state.fields].map(([key,value])=>[key,value.value])))
+       }},runRawIntent:platform,runSdkAdapter:platform,UiHostEnvironment:U.UiHostEnvironment,decodeVeraUi:U.decodeVeraUi,toLive:L.toLive,reconcile:L.reconcile,armReveal:L.armReveal,catalogKinds:()=>[],Date:{now:()=>now},console:{info(){},warn(){},error(){}},setInterval(callback,interval){
+        const handle=++nextHandle;intervals.set(handle,{callback,interval});return handle
+       },clearInterval(handle){intervals.delete(handle)},setTimeout(callback,delay){
+       assert.equal(delay,400)
+       const handle=++nextHandle, timer={callback,at:now+delay}
+       scheduled.set(handle,timer);history.set(handle,timer);return handle
+      },clearTimeout(handle){scheduled.delete(handle)}}
+      const Probe=new Function(...Object.keys(mocks),compiled.outputText+'; const VeraPreview=Probe; return Probe')(...Object.values(mocks)), probe=new Probe()
+       Object.assign(probe,{previewOnly:false,programId:0,revision:0,liveRoot:null,hasRoot:false,error:'',pending:null,darkListener:null,liveSurfaces:[],destinationHidden:false,pageHidden:false,persistKey:'fixture/version',
+        stopAllTimers(){for(const id of [...this.timers.keys()])this.stopTimer(id)},watchDarkMode(){},restoreState(){return null},seeded:value=>value,notifyStateSnapshot(){},drainEffects(){},reconcileTheme(){},reconcileTimers(){},reconcileSpin(){},reconcileMotion(){},onBackHandlerChanged(){},reconcileSurfaces(){},paintSurfaces(){}})
+      if(!fieldBytecode)fieldBytecode=C.compileVeraSource(`
+import * as ui from "std/ui"
+@jsonable class AppState { first: string; second: string; note: string; saved: string; }
+function init(): AppState { return {first: "base", second: "other", note: "initial", saved: ""}; }
+function setFirst(state: AppState, value: string): AppState { return {first: value, second: state.second, note: state.note, saved: state.saved}; }
+function setSecond(state: AppState, value: string): AppState { return {first: state.first, second: value, note: state.note, saved: state.saved}; }
+function normalize(state: AppState, value: string): AppState { return {first: "normalized", second: state.second, note: state.note, saved: state.saved}; }
+function save(state: AppState, value: number): AppState { return {first: state.first, second: state.second, note: state.note, saved: state.first + "/" + state.second}; }
+function toggle(state: AppState, value: boolean): AppState { return {first: state.first, second: state.second, note: state.note, saved: state.first + "/" + state.second}; }
+function view(state: AppState): ui.View { let action: string = "setFirst"; if (state.note === "normalize") { action = "normalize"; } return ui.Column("default", [ui.TextField("default", "First", state.first, action), ui.TextField("default", "Second", state.second, "setSecond"), ui.Text("body", state.note)]); }
+`).vbc2
+       if(sync&&!syncBytecode) {
+        const shape={first:'string',second:'string',note:'string',saved:'string',position:'number',log:'string',x:'number',y:'number',id:'number',phase:'string'}
+        const record=overrides=>'{'+Object.keys(shape).map(key=>key+': '+(overrides[key]||'state.'+key)).join(', ')+'}'
+        const handler=(name,type,overrides)=>`function ${name}(state: AppState, value: ${type}): AppState { return ${record(overrides)}; }`
+        syncBytecode=C.compileVeraSource(`
+import * as ui from "std/ui"
+import * as gfx from "std/gfx"
+@jsonable class AppState { ${Object.entries(shape).map(([key,type])=>key+': '+type+';').join(' ')} }
+function init(): AppState { return {first: "base", second: "other", note: "initial", saved: "", position: 0, log: "", x: 0, y: 0, id: 0, phase: ""}; }
+${handler('setFirst','string',{first:'value'})}
+${handler('setSecond','string',{second:'value'})}
+${handler('slide','number',{position:'value',saved:'state.first + "/" + state.second',log:'state.log + "s" + ui.numberToString(value) + ";"'})}
+${handler('slideOther','number',{position:'value',log:'state.log + "o" + ui.numberToString(value) + ";"'})}
+${handler('save','number',{saved:'state.first + "/" + state.second',log:'state.log + "save;"'})}
+${handler('back','number',{saved:'state.first + "/" + state.second',log:'state.log + "back;"'})}
+${handler('tick','number',{saved:'state.first + "/" + state.second',log:'state.log + "tick;"'})}
+${handler('answer1','string',{saved:'state.first + "/" + state.second',log:'state.log + value + ";"'})}
+${handler('pointer','gfx.Pointer',{saved:'state.first + "/" + state.second',log:'state.log + value.phase + ui.numberToString(value.id) + ";"',x:'value.x',y:'value.y',id:'value.id',phase:'value.phase'})}
+function draw(state: AppState): gfx.Shape[] { return []; }
+function view(state: AppState): ui.View { return ui.Column("default", [ui.TextField("default", "First", state.first, "setFirst"), ui.TextField("default", "Second", state.second, "setSecond"), ui.Text("body", state.note), ui.Slider("default", "Slider", state.position, 0, 100, "slide"), ui.Slider("default", "Other", state.position, 0, 100, "slideOther"), ui.Surface("default", 100, 100, "draw", "", "pointer"), ui.BackHandler("back")]); }
+`).vbc2
+       }
+       probe.vbc2=sync?syncBytecode:fieldBytecode
+       const load=probe.load
+      probe.load=function() {
+       load.call(this);assert.equal(this.error,'');assert(this.vm instanceof V.VirtualMachine)
+       const execute=this.vm.execute.bind(this.vm)
+       this.vm.execute=(action,args=[])=>{
+         if(action!=='view'&&action!=='init')calls.push({action,value:args[1] instanceof V.VeraObjectValue?args[1].fields:args[1].value,at:now})
+        return execute(action,args)
+       }
+      }
+      probe.load()
+      const first=probe.liveRoot.children[0], second=probe.liveRoot.children[1]
+      for(const node of [first,second]) {
+       let value=node.fieldValue
+       Object.defineProperty(node,'fieldValue',{get:()=>value,set(next){writes.push([node,next]);value=next},configurable:true})
+      }
+      function advance(ms) {
+       const end=now+ms
+       while(true) {
+        const entry=[...scheduled].filter(([,timer])=>timer.at<=end).sort((a,b)=>a[1].at-b[1].at||a[0]-b[0])[0]
+        if(!entry)break
+        const [handle,timer]=entry
+        now=timer.at;scheduled.delete(handle);timer.callback()
+       }
+       now=end
+      }
+      function frame(overrides=[{},{}]) {
+       const children=overrides.map((override,index)=>Object.assign(new U.VeraUiNode(),{kind:'field',value:index===0?'base':'other',action:index===0?'setFirst':'setSecond',enabled:true},override))
+       L.reconcile(probe.liveRoot,Object.assign(new U.VeraUiNode(),{kind:'column',children}))
+       probe.reconcileFields()
+      }
+       const slider=probe.liveRoot.children[3], otherSlider=probe.liveRoot.children[4], surface=probe.liveRoot.children[5]
+       if(sync)probe.surfaces.set(surface,{width:400,height:200})
+       return {probe,first,second,slider,otherSlider,surface,scheduled,history,intervals,replies,calls,writes,saves,advance,frame,
+        slide(value,mode='Moving',node=slider){probe.sliderChange(node)(value,SliderChangeMode[mode])},
+        touch(phase,touches=[{id:1,x:150,y:50}],node=surface){probe.surfaceTouch(node,{type:TouchType[phase],changedTouches:touches})},
+        reconcile(node,overrides){const next=Object.assign(new U.VeraUiNode(),node,overrides);L.reconcile(node,next);probe.reconcileFields()},
+        change(node,value,composing=false,generation=node.fieldGeneration){probe.changeField(node,generation,value,composing)},finish(node,generation=node.fieldGeneration){probe.finishField(node,generation)},fire(handle){assert(history.has(handle));history.get(handle).callback()},state(name){return probe.currentState.fields.get(name).value}}
+     }
+      test('native slider: extracted callback flushes both latest drafts before VM and persists only drag end', () => {
+       const f=fieldProbe(true), {probe,first,second,slider}=f, generation=slider.fieldGeneration
+       f.change(first,'old');f.change(first,'latest');f.change(second,'second');const timers=[...f.history.keys()]
+       f.advance(19);f.slide(10.6,'Begin')
+       assert.deepEqual(f.calls,[{action:'setFirst',value:'latest',at:19},{action:'setSecond',value:'second',at:19},{action:'slide',value:11,at:19}])
+       assert.equal(f.state('saved'),'latest/second');assert.equal(f.state('position'),11);assert.equal(f.saves.length,2)
+       assert.deepEqual(f.saves.map(state=>[state.first,state.second,state.position]),[['latest','other',0],['latest','second',0]])
+       f.slide(20.4);f.slide(21.7,'Click');assert.equal(f.saves.length,2)
+       f.slide(30.6,'End');assert.equal(f.saves.length,3);assert.equal(f.saves.at(-1).position,31);assert.equal(f.saves.at(-1).saved,'latest/second')
+       assert.equal(slider.fieldGeneration,generation);assert.equal(probe.fieldEdits.size,0);assert.equal(f.scheduled.size,0)
+       for(const timer of timers)f.fire(timer)
+       f.advance(1000);assert.equal(f.calls.length,6);assert.equal(f.saves.length,3);assert.equal(probe.error,'')
+      })
+      test('native slider: extracted callback with no action never flushes drafts or writes state', () => {
+       const f=fieldProbe(true)
+       f.change(f.first,'pending');f.reconcile(f.slider,{action:''});f.slide(40,'End')
+       assert.deepEqual(f.calls,[]);assert.deepEqual(f.saves,[]);assert.equal(f.scheduled.size,1)
+       f.advance(400);assert.deepEqual(f.calls.map(call=>call.action),['setFirst']);assert.equal(f.saves.length,1)
+      })
+      for(const ended of [false,true]) test('native slider: IME coalesces adjacent events and '+(ended?'retains final persistence':'keeps moving events unsaved until end'), () => {
+       const f=fieldProbe(true), {probe,first,slider}=f
+       f.change(first,'composition',true)
+       f.slide(1,'Begin');f.slide(2);f.slide(3);if(ended)f.slide(4.6,'End')
+       assert.deepEqual(f.calls,[]);assert.deepEqual(f.saves,[]);assert.equal(probe.fieldActions.length,1)
+       const queued=probe.fieldActions[0]
+       assert.equal(queued.node,slider);assert.equal(queued.nodeGeneration,slider.fieldGeneration);assert.equal(queued.generation,probe.effectGeneration)
+       assert.equal(queued.persist,ended);assert.equal(queued.payload.value,ended?5:3)
+       f.advance(37);f.change(first,'final')
+       assert.deepEqual(f.calls,[{action:'setFirst',value:'final',at:37},{action:'slide',value:ended?5:3,at:37}])
+       assert.equal(f.state('saved'),'final/other');assert.equal(f.saves.length,ended?2:1)
+       assert.equal(f.saves[0].first,'final');assert.equal(f.saves[0].position,0)
+       if(!ended)f.slide(9,'End')
+       assert.equal(f.saves.length,2);assert.equal(f.saves[1].position,ended?5:9);assert.equal(f.saves[1].saved,'final/other')
+       f.finish(first);probe.resumeFieldActions();f.advance(1000)
+       assert.equal(f.calls.length,ended?2:3);assert.equal(f.saves.length,2);assert.deepEqual(probe.fieldActions,[]);assert.equal(probe.error,'')
+      })
+      test('native slider: IME preserves intervening actions, other sliders and completed drag boundaries', () => {
+       const f=fieldProbe(true), {probe,first,otherSlider}=f
+       f.change(first,'composition',true)
+       f.slide(1,'Begin');f.slide(2);probe.handleAction('save',7);f.slide(3);f.slide(4)
+       f.slide(5,'Moving',otherSlider);f.slide(6);f.slide(7,'End');f.slide(8,'Begin');f.slide(9,'End')
+       assert.deepEqual(probe.fieldActions.map(next=>[next.action,next.payload.value,next.persist]),[['slide',2,false],['save',7,true],['slide',4,false],['slideOther',5,false],['slide',7,true],['slide',9,true]])
+       assert.deepEqual(f.calls,[]);assert.deepEqual(f.saves,[])
+       f.change(first,'final')
+       assert.deepEqual(f.calls.map(call=>[call.action,call.value]),[['setFirst','final'],['slide',2],['save',7],['slide',4],['slideOther',5],['slide',7],['slide',9]])
+       assert.equal(f.state('log'),'s2;save;s4;o5;s7;s9;')
+       assert.deepEqual(f.saves.map(state=>[state.first,state.position,state.log]),[['final',0,''],['final',2,'s2;save;'],['final',7,'s2;save;s4;o5;s7;'],['final',9,'s2;save;s4;o5;s7;s9;']])
+       assert.deepEqual(probe.fieldActions,[]);assert.equal(probe.error,'')
+      })
+      for(const transition of ['kind','action','enabled','node-generation','remove','effect-generation','load','preview-load','disappear','reappear']) test('native slider: queued events reject '+transition+' without stale persistence', () => {
+       const f=fieldProbe(true), {probe,first,slider}=f, generation=first.fieldGeneration
+       f.change(first,'composition',true);f.slide(2);f.slide(3,'End')
+       assert.equal(probe.fieldActions.length,1)
+       if(['kind','action','enabled'].includes(transition))f.reconcile(slider,{[transition]:{kind:'text',action:'slideOther',enabled:false}[transition]})
+       else if(transition==='node-generation')slider.fieldGeneration++
+       else if(transition==='remove')probe.liveRoot.children=probe.liveRoot.children.filter(node=>node!==slider)
+       else if(transition==='effect-generation')probe.effectGeneration++
+       else if(transition==='load')probe.load()
+       else if(transition==='preview-load') { probe.previewOnly=true;probe.load();probe.previewOnly=false }
+       else { probe.aboutToDisappear();if(transition==='reappear')probe.aboutToAppear() }
+       f.change(first,'final',false,generation);probe.resumeFieldActions();f.advance(400)
+       assert(!f.calls.some(call=>call.action==='slide'));assert(!f.saves.some(state=>state.position!==0))
+       assert.deepEqual(probe.fieldActions,[]);assert.equal(probe.resumingFieldActions,false);assert.equal(probe.error,'')
+       assert.equal(f.saves.length,['load','preview-load','disappear','reappear'].includes(transition)?0:1)
+      })
+      for(const transition of ['kind','action','enabled','generation','remove']) test('native slider: revalidates '+transition+' after flushing draft', () => {
+       const f=fieldProbe(true), {probe,slider}=f, dispatch=probe.dispatch
+       f.change(f.first,'latest')
+       probe.dispatch=function(action,value,persist=true) {
+        dispatch.call(this,action,value,persist)
+        if(action!=='setFirst')return
+        if(transition==='generation')slider.fieldGeneration++
+        else if(transition==='remove')this.liveRoot.children=this.liveRoot.children.filter(node=>node!==slider)
+        else f.reconcile(slider,{[transition]:{kind:'text',action:'slideOther',enabled:false}[transition]})
+       }
+       f.slide(8,'End')
+       assert.deepEqual(f.calls.map(call=>call.action),['setFirst']);assert.equal(f.saves.length,1);assert.equal(f.saves[0].first,'latest');assert.equal(f.saves[0].position,0)
+       assert.deepEqual(probe.fieldActions,[]);assert.equal(probe.error,'')
+      })
+      for(const input of ['slider','back','surface']) test('native '+input+': load during field flush aborts captured user input', () => {
+       const f=fieldProbe(true), {probe}=f, dispatch=probe.dispatch
+       f.change(f.first,'latest');const timer=probe.fieldEdits.get(f.first).timer, generation=probe.effectGeneration
+       probe.dispatch=function(action,value,persist=true) { dispatch.call(this,action,value,persist);if(action==='setFirst')this.load() }
+       if(input==='slider')f.slide(7,'End');else if(input==='back')probe.onBackPressSignal();else f.touch('Down')
+       assert.equal(probe.effectGeneration,generation+1);assert.deepEqual(f.calls.map(call=>call.action),['setFirst'])
+       assert.equal(f.saves.length,1);assert.equal(f.saves[0].first,'latest');assert.equal(f.saves[0].log,'');assert.equal(f.state('first'),'base')
+       f.fire(timer);f.touch('Move');f.touch('Up');assert.equal(f.calls.length,1);assert.equal(f.saves.length,1);assert.equal(probe.surfaceInputs.size,0);assert.equal(probe.error,'')
+      })
+      test('native back: real signal flushes pending drafts before handler and persists updated state', () => {
+       const f=fieldProbe(true), {probe}=f
+       f.change(f.first,'latest');f.change(f.second,'second');probe.onBackPressSignal()
+       assert.deepEqual(f.calls.map(call=>[call.action,call.value]),[['setFirst','latest'],['setSecond','second'],['back',0]])
+       assert.equal(f.state('saved'),'latest/second');assert.equal(f.saves.length,3);assert.equal(f.saves.at(-1).log,'back;');assert.equal(f.saves.at(-1).saved,'latest/second')
+       f.advance(1000);assert.equal(f.calls.length,3);assert.equal(f.saves.length,3);assert.equal(probe.error,'')
+      })
+      test('native back: IME defers repeated signals in order with other user actions', () => {
+       const f=fieldProbe(true), {probe}=f
+       f.change(f.first,'composition',true);probe.onBackPressSignal();probe.handleAction('save',1);probe.onBackPressSignal()
+       assert.deepEqual(f.calls,[]);assert.deepEqual(f.saves,[]);assert.deepEqual(probe.fieldActions.map(next=>next.action),['back','save','back'])
+       f.change(f.first,'final')
+       assert.deepEqual(f.calls.map(call=>call.action),['setFirst','back','save','back']);assert.equal(f.state('log'),'back;save;back;')
+       assert.deepEqual(f.saves.map(state=>state.log),['','back;','back;save;','back;save;back;']);assert(f.saves.every(state=>state.first==='final'))
+       assert.deepEqual(probe.fieldActions,[]);assert.equal(probe.error,'')
+      })
+      for(const gate of ['absent','disposed','previewOnly']) test('native back: '+gate+' signal does not flush or persist', () => {
+       const f=fieldProbe(true), {probe}=f
+       f.change(f.first,'pending')
+       if(gate==='absent')probe.backHandlerAction='';else probe[gate]=true
+       probe.onBackPressSignal()
+       assert.deepEqual(f.calls,[]);assert.deepEqual(f.saves,[]);assert.equal(probe.fieldEdits.size,1);assert.equal(f.scheduled.size,1);assert.deepEqual(probe.fieldActions,[])
+      })
+      for(const transition of ['remove-field','invalidateEffects','load','disappear']) test('native back: deferred signal canceled by '+transition, () => {
+       const f=fieldProbe(true), {probe}=f, generation=f.first.fieldGeneration
+       f.change(f.first,'composition',true);probe.onBackPressSignal()
+       if(transition==='remove-field') { probe.liveRoot.children=probe.liveRoot.children.slice(1);probe.reconcileFields() }
+       else if(transition==='disappear')probe.aboutToDisappear();else probe[transition]()
+       f.change(f.first,'late',false,generation);probe.resumeFieldActions();f.advance(1000)
+       assert.deepEqual(f.calls,[]);assert.deepEqual(f.saves,[]);assert.deepEqual(probe.fieldActions,[]);assert.equal(probe.error,'')
+      })
+      test('native surface: down flushes both drafts before pointer VM and persists their latest values', () => {
+       const f=fieldProbe(true), {probe}=f
+       f.change(f.first,'latest');f.change(f.second,'second');const timers=[...f.history.keys()]
+       f.touch('Down')
+       assert.deepEqual(f.calls.map(call=>call.action),['setFirst','setSecond','pointer']);assert.equal(f.state('saved'),'latest/second')
+       assert.equal(f.state('phase'),'down');assert.equal(f.state('x'),25);assert.equal(f.state('y'),25);assert.equal(f.state('id'),1)
+       assert.equal(f.saves.length,3);assert.equal(f.saves.at(-1).saved,'latest/second');assert.equal(f.saves.at(-1).log,'down1;')
+       assert.equal(probe.surfaceInputs.get(f.surface).size,1)
+       for(const timer of timers)f.fire(timer)
+       f.advance(1000);assert.equal(f.calls.length,3);assert.equal(f.saves.length,3);assert.equal(probe.error,'')
+      })
+      for(const end of ['Up','Cancel']) test('native surface: IME-rejected down never leaks move/'+end.toLowerCase()+' after final text', () => {
+       const f=fieldProbe(true), {probe}=f
+       f.change(f.first,'composition',true);f.touch('Down');f.touch('Move');f.touch(end)
+       assert.deepEqual(f.calls,[]);assert.deepEqual(f.saves,[]);assert.equal(probe.surfaceInputs.size,0);assert.deepEqual(probe.fieldActions,[])
+       f.change(f.first,'final');f.touch('Move');f.touch(end)
+       assert.deepEqual(f.calls,[]);assert.equal(f.scheduled.size,1)
+       f.advance(400);f.touch('Move');f.touch(end)
+       assert.deepEqual(f.calls.map(call=>call.action),['setFirst']);assert.equal(f.saves.length,1);assert.equal(f.saves[0].log,'')
+       f.touch('Down');f.touch('Move');f.touch(end)
+       assert.equal(f.state('log'),'down1;move1;'+end.toLowerCase()+'1;');assert.equal(f.saves.length,3);assert.equal(f.saves.at(-1).first,'final');assert.equal(probe.surfaceInputs.size,0);assert.equal(probe.error,'')
+      })
+      test('native surface: rejected repeated down forgets that finger without disturbing another active finger', () => {
+       const f=fieldProbe(true), {probe}=f, one={id:1,x:150,y:50}, two={id:2,x:200,y:100}
+       f.touch('Down',[one,two]);assert.equal(probe.surfaceInputs.get(f.surface).size,2)
+       f.change(f.first,'composition',true);f.touch('Down',[one]);f.touch('Move',[one]);f.touch('Up',[one])
+       assert.equal(f.calls.length,2);assert.equal(f.saves.length,2);assert.equal(probe.surfaceInputs.get(f.surface).size,1)
+       f.touch('Move',[two]);f.touch('Up',[two])
+       assert.equal(f.state('log'),'down1;down2;move2;up2;');assert.equal(f.saves.length,3);assert.equal(f.saves.at(-1).first,'base');assert.equal(probe.fieldEdits.size,1)
+       f.change(f.first,'final');f.advance(400);assert.equal(f.saves.at(-1).first,'final');assert.equal(probe.surfaceInputs.size,0);assert.equal(probe.error,'')
+      })
+      test('native surface: valid multitouch phases map coordinates and persist down/up/cancel, not moves', () => {
+       const f=fieldProbe(true), {probe}=f, one={id:1,x:150,y:50}, two={id:2,x:300,y:150}, unknown={id:9,x:0,y:0}
+       f.touch('Move',[one]);f.touch('Up',[one]);f.touch('Cancel',[one]);assert.deepEqual(f.calls,[]);assert.deepEqual(f.saves,[])
+       f.touch('Down',[one,two]);assert.equal(probe.surfaceInputs.get(f.surface).size,2);assert.equal(f.saves.length,2)
+       f.touch('Move',[one,two,unknown]);assert.equal(f.saves.length,2);assert.equal(f.state('x'),100);assert.equal(f.state('y'),75)
+       f.touch('Up',[one]);assert.equal(probe.surfaceInputs.get(f.surface).size,1);assert.equal(f.saves.length,3)
+       f.touch('Move',[one,two]);assert.equal(f.saves.length,3);f.touch('Cancel',[two,unknown]);assert.equal(f.saves.length,4)
+       assert.equal(f.state('log'),'down1;down2;move1;move2;up1;move2;cancel2;');assert.equal(probe.surfaceInputs.size,0)
+       const pointers=f.calls.map(call=>call.value)
+       assert(pointers.every(value=>value instanceof Map));assert.deepEqual(pointers.map(value=>value.get('id').value),[1,2,1,2,1,2,2])
+       f.touch('Move',[one,two]);f.touch('Up',[one,two]);assert.equal(f.calls.length,7);assert.equal(f.saves.length,4);assert.equal(probe.error,'')
+      })
+      test('native surface: continuing move/up do not flush edits begun after valid down', () => {
+       const f=fieldProbe(true), {probe}=f
+       f.touch('Down');f.change(f.first,'pending');const edit=probe.fieldEdits.get(f.first), timer=edit.timer
+       f.touch('Move');f.touch('Up')
+       assert.deepEqual(f.calls.map(call=>call.action),['pointer','pointer','pointer']);assert.equal(probe.fieldEdits.get(f.first),edit);assert.equal(edit.timer,timer);assert.equal(f.scheduled.size,1)
+       assert.equal(f.saves.length,2);assert(f.saves.every(state=>state.first==='base'));assert.equal(f.state('saved'),'base/other')
+       f.advance(400);assert.equal(f.saves.length,3);assert.equal(f.saves.at(-1).first,'pending');assert.equal(probe.error,'')
+      })
+      test('native surface: mixed IME down flushes only ready fields and never queues a partial gesture', () => {
+       const f=fieldProbe(true), {probe}=f
+       f.change(f.first,'composition',true);f.change(f.second,'ready');f.touch('Down')
+       assert.deepEqual(f.calls.map(call=>call.action),['setSecond']);assert.equal(f.saves.length,1);assert.equal(f.saves[0].second,'ready');assert.equal(f.saves[0].first,'base')
+       assert.equal(probe.surfaceInputs.size,0);assert.deepEqual(probe.fieldActions,[]);assert.equal(probe.fieldEdits.size,1)
+       f.finish(f.first);f.change(f.first,'final');f.touch('Move');f.touch('Up')
+       assert.deepEqual(f.calls.map(call=>call.action),['setSecond','setFirst']);assert.equal(f.saves.length,2);assert.equal(f.saves.at(-1).first,'final');assert.equal(f.saves.at(-1).log,'')
+       f.touch('Down');assert.equal(f.saves.length,3);assert.equal(f.saves.at(-1).saved,'final/ready');assert.equal(probe.error,'')
+      })
+      test('native surface: disappearance persists last unsaved move through real persistence and clears gesture', () => {
+       const f=fieldProbe(true), {probe,surface}=f
+       probe.liveSurfaces=[surface];f.touch('Down');f.touch('Move',[{id:1,x:280,y:180}])
+       assert.equal(f.saves.length,1);assert.equal(f.saves[0].phase,'down');assert.equal(f.state('phase'),'move')
+       probe.aboutToDisappear()
+       assert.equal(f.saves.length,2);assert.equal(f.saves[1].phase,'move');assert.equal(f.saves[1].x,90);assert.equal(f.saves[1].y,90)
+       assert.equal(probe.surfaceInputs.size,0);f.touch('Up');assert.equal(f.calls.length,2);assert.equal(f.saves.length,2);assert.equal(probe.error,'')
+      })
+      for(const transition of ['node-generation','value','kind','remove','unmeasured','effect-generation','invalidateEffects','load','preview-load','disappear','reappear']) test('native surface: '+transition+' rejects stale gesture continuation', () => {
+       const f=fieldProbe(true), {probe,surface}=f
+       f.touch('Down');assert.equal(f.calls.length,1);assert.equal(f.saves.length,1)
+       if(transition==='node-generation')surface.fieldGeneration++
+       else if(transition==='value') { f.reconcile(surface,{value:'answer1'});f.reconcile(surface,{value:'pointer'}) }
+       else if(transition==='kind') { f.reconcile(surface,{kind:'text'});f.reconcile(surface,{kind:'surface'}) }
+       else if(transition==='remove')probe.liveRoot.children=probe.liveRoot.children.filter(node=>node!==surface)
+       else if(transition==='unmeasured')probe.surfaces.get(surface).width=0
+       else if(transition==='effect-generation')probe.effectGeneration++
+       else if(transition==='preview-load') { probe.previewOnly=true;probe.load();probe.previewOnly=false }
+       else if(transition==='disappear'||transition==='reappear') { probe.aboutToDisappear();if(transition==='reappear')probe.aboutToAppear() }
+       else probe[transition]()
+       f.touch('Move');f.touch('Up');f.touch('Cancel')
+       assert.equal(f.calls.length,1);assert.equal(f.saves.length,1);assert.equal(probe.surfaceInputs.size,0);assert.equal(probe.error,'')
+      })
+      for(const gate of ['disposed','previewOnly','noaction','removed','unmeasured']) test('native surface: '+gate+' down cannot begin a gesture or persist', () => {
+       const f=fieldProbe(true), {probe,surface}=f
+       if(gate==='noaction')f.reconcile(surface,{value:''})
+       else if(gate==='removed')probe.liveRoot.children=probe.liveRoot.children.filter(node=>node!==surface)
+       else if(gate==='unmeasured')probe.surfaces.get(surface).height=0
+       else probe[gate]=true
+       f.touch('Down');f.touch('Move');f.touch('Up')
+       assert.deepEqual(f.calls,[]);assert.deepEqual(f.saves,[]);assert.equal(probe.surfaceInputs.size,0);assert.equal(probe.error,'')
+      })
+      for(const transition of ['node-generation','value','kind','remove']) test('native surface: down revalidates '+transition+' after field flush', () => {
+       const f=fieldProbe(true), {probe,surface}=f, dispatch=probe.dispatch
+       f.change(f.first,'latest')
+       probe.dispatch=function(action,value,persist=true) {
+        dispatch.call(this,action,value,persist)
+        if(action!=='setFirst')return
+        if(transition==='node-generation')surface.fieldGeneration++
+        else if(transition==='remove')this.liveRoot.children=this.liveRoot.children.filter(node=>node!==surface)
+        else f.reconcile(surface,{[transition]:transition==='kind'?'text':'answer1'})
+       }
+       f.touch('Down');f.touch('Move');f.touch('Up')
+       assert.deepEqual(f.calls.map(call=>call.action),['setFirst']);assert.equal(f.saves.length,1);assert.equal(f.saves[0].first,'latest');assert.equal(probe.surfaceInputs.size,0);assert.equal(probe.error,'')
+      })
+      for(const composing of [false,true]) {
+       test('native timer: real callback never flushes '+(composing?'composing':'pending')+' user fields', () => {
+        const f=fieldProbe(true), {probe}=f
+        f.change(f.first,'draft',composing);const edit=probe.fieldEdits.get(f.first), timer=edit.timer
+        probe.startTimer('fixture',{interval:1000,action:'tick'});f.intervals.get(probe.timers.get('fixture')).callback()
+        assert.deepEqual(f.calls.map(call=>call.action),['tick']);assert.equal(probe.fieldEdits.get(f.first),edit);assert.equal(edit.timer,timer)
+        assert.equal(f.saves.length,1);assert.equal(f.saves[0].first,'base');assert.equal(f.saves[0].saved,'base/other');assert.equal(f.scheduled.size,composing?0:1)
+        probe.stopTimer('fixture');f.change(f.first,'final');f.advance(400)
+        assert.deepEqual(f.calls.map(call=>call.action),['tick','setFirst']);assert.equal(f.saves.length,2);assert.equal(f.saves.at(-1).first,'final');assert.equal(probe.error,'')
+       })
+       await testAsync('native async: real effect reply never flushes '+(composing?'composing':'pending')+' user fields', async () => {
+        const f=fieldProbe(true), {probe}=f
+        f.change(f.first,'draft',composing);const edit=probe.fieldEdits.get(f.first), timer=edit.timer
+        probe.runEffect(hostEffect());assert.equal(f.replies.length,1);await settleEffect(f.replies[0],false,'reply')
+        assert.deepEqual(f.calls.map(call=>call.action),['answer1']);assert.equal(probe.fieldEdits.get(f.first),edit);assert.equal(edit.timer,timer)
+        assert.equal(f.saves.length,1);assert.equal(f.saves[0].first,'base');assert.equal(f.saves[0].saved,'base/other');assert.equal(f.scheduled.size,composing?0:1)
+        f.change(f.first,'final');f.advance(400)
+        assert.deepEqual(f.calls.map(call=>call.action),['answer1','setFirst']);assert.equal(f.saves.length,2);assert.equal(f.saves.at(-1).first,'final');assert.equal(probe.error,'')
+       })
+      }
+      test('native fields: rapid input waits 400ms after latest, commits once without keystroke traces', () => {
+      const f=fieldProbe(), {probe,first}=f, generation=first.fieldGeneration
+      f.change(first,'a');f.advance(200);f.change(first,'ab');f.advance(199);f.change(first,'latest')
+      assert.equal(first.fieldValue,'base');assert.equal(first.value,'base');assert.equal(first.fieldGeneration,generation);assert.deepEqual(f.writes,[])
+      assert.equal(probe.fieldEdits.size,1);assert.equal(probe.fieldEdits.get(first).base,'base');assert.equal(probe.fieldEdits.get(first).value,'latest')
+      f.advance(399);assert.deepEqual(f.calls,[]);assert.equal(f.scheduled.size,1)
+      f.advance(1);assert.deepEqual(f.calls,[{action:'setFirst',value:'latest',at:799}]);assert.equal(f.state('first'),'latest');assert.equal(first.fieldValue,'latest')
+      assert.equal(probe.fieldEdits.size,0);assert.equal(f.scheduled.size,0);assert.equal(first.fieldGeneration,generation);assert.equal(probe.error,'')
+      f.advance(1000);assert.equal(f.calls.length,1)
+     })
+     test('native fields: rescheduled and replaced edits reject captured stale one-shot callbacks', () => {
+      const f=fieldProbe(), {probe,first}=f
+      f.change(first,'old');const old=probe.fieldEdits.get(first).timer
+      f.advance(100);f.change(first,'new');const current=probe.fieldEdits.get(first).timer
+      assert.notEqual(old,current);assert(!f.scheduled.has(old));f.fire(old)
+      assert.deepEqual(f.calls,[]);assert.equal(probe.fieldEdits.get(first).timer,current);assert(f.scheduled.has(current))
+      f.advance(400);assert.deepEqual(f.calls,[{action:'setFirst',value:'new',at:500}])
+      f.change(first,'replacement');const replacement=probe.fieldEdits.get(first)
+      f.fire(old);f.fire(current);assert.equal(probe.fieldEdits.get(first),replacement);assert.equal(f.calls.length,1)
+      f.advance(400);assert.equal(f.calls.length,2);assert.equal(f.state('first'),'replacement')
+     })
+     for(const order of ['submit-blur','blur-submit']) test('native fields: immediate '+order+' commits once and cancels debounce', () => {
+      const f=fieldProbe(), {probe,first}=f
+      f.change(first,'finished');const timer=probe.fieldEdits.get(first).timer
+      f.advance(17);f.finish(first);f.finish(first);f.fire(timer);f.advance(1000)
+      assert.deepEqual(f.calls,[{action:'setFirst',value:'finished',at:17}]);assert.equal(f.state('first'),'finished');assert.equal(first.fieldValue,'finished')
+      assert.equal(probe.fieldEdits.size,0);assert.equal(f.scheduled.size,0)
+     })
+      for(const event of ['submit','blur']) test('native fields: plain '+event+' during IME requests final change with no debounce or form action', () => {
+       const f=fieldProbe(), {probe,first}=f, generation=first.fieldGeneration
+       f.change(first,'n');const timer=probe.fieldEdits.get(first).timer
+       f.advance(17);f.change(first,'ni',true)
+       const edit=probe.fieldEdits.get(first)
+       assert.equal(edit.commitRequested,false);f.finish(first)
+       assert.equal(probe.fieldEdits.get(first),edit);assert.equal(edit.commitRequested,true);assert.equal(edit.composing,true)
+       f.fire(timer);f.advance(1000)
+       assert.deepEqual(f.calls,[]);assert.deepEqual(f.writes,[]);assert.equal(first.fieldValue,'base');assert.equal(f.scheduled.size,0);assert.deepEqual(probe.fieldActions,[])
+       f.change(first,'你好')
+       assert.deepEqual(f.calls,[{action:'setFirst',value:'你好',at:1017}]);assert.equal(f.state('first'),'你好');assert.equal(first.fieldValue,'你好');assert.equal(first.fieldGeneration,generation)
+       assert.equal(probe.fieldEdits.size,0);assert.equal(f.scheduled.size,0);assert.equal(f.history.size,1);assert.deepEqual(probe.fieldActions,[])
+       f.finish(first);f.fire(timer);f.advance(1000)
+       assert.equal(f.calls.length,1);assert.equal(probe.error,'')
+      })
+      test('native fields: repeated IME finish and intermediate composition retain requested commit and dispatch once', () => {
+       const f=fieldProbe(), {probe,first}=f
+       f.change(first,'n');const timer=probe.fieldEdits.get(first).timer
+       f.change(first,'ni',true);const edit=probe.fieldEdits.get(first)
+       f.finish(first);f.finish(first)
+       for(const value of ['你','你好','你好世']) {
+        f.advance(23);f.change(first,value,true)
+        assert.equal(probe.fieldEdits.get(first),edit);assert.equal(edit.value,value);assert.equal(edit.composing,true);assert.equal(edit.commitRequested,true)
+        f.finish(first);f.finish(first);f.fire(timer)
+        assert.deepEqual(f.calls,[]);assert.deepEqual(f.writes,[]);assert.equal(f.scheduled.size,0);assert.deepEqual(probe.fieldActions,[])
+       }
+       f.change(first,'你好世界')
+       assert.deepEqual(f.calls,[{action:'setFirst',value:'你好世界',at:69}]);assert.equal(f.state('first'),'你好世界');assert.equal(probe.fieldEdits.size,0);assert.equal(f.scheduled.size,0);assert.equal(f.history.size,1)
+       f.finish(first);f.finish(first);f.fire(timer);f.advance(1000);assert.equal(f.calls.length,1)
+       f.change(first,'next');const fresh=probe.fieldEdits.get(first)
+       assert.notEqual(fresh,edit);assert.equal(fresh.commitRequested,false);assert(f.scheduled.has(fresh.timer))
+       f.fire(timer);f.advance(399);assert.equal(f.calls.length,1);assert.equal(probe.fieldEdits.get(first),fresh)
+       f.advance(1);assert.deepEqual(f.calls[1],{action:'setFirst',value:'next',at:1469});assert.equal(probe.error,'')
+      })
+      test('native fields: requested IME finish leaves another field debounce deadline intact', () => {
+       const f=fieldProbe(), {probe,first,second}=f
+       f.change(first,'n');const stale=probe.fieldEdits.get(first).timer
+       f.advance(50);f.change(second,'independent');const edit=probe.fieldEdits.get(second), timer=edit.timer
+       f.advance(25);f.change(first,'ni',true);f.finish(first)
+       assert.equal(probe.fieldEdits.get(first).commitRequested,true)
+       f.advance(75);f.change(first,'你好')
+       assert.deepEqual(f.calls,[{action:'setFirst',value:'你好',at:150}]);assert.equal(probe.fieldEdits.get(second),edit);assert.equal(edit.commitRequested,false);assert.equal(edit.base,'other');assert.equal(edit.timer,timer)
+       assert.equal(f.scheduled.get(timer).at,450);assert.equal(f.scheduled.size,1)
+       f.fire(stale);f.advance(299);assert.equal(f.calls.length,1)
+       f.advance(1);assert.deepEqual(f.calls[1],{action:'setSecond',value:'independent',at:450});assert.equal(f.state('second'),'independent')
+       f.fire(stale);f.fire(timer);f.advance(1000);assert.equal(f.calls.length,2);assert.equal(probe.fieldEdits.size,0);assert.equal(f.scheduled.size,0);assert.equal(probe.error,'')
+      })
+      for(const otherComposing of [false,true]) test('native fields: requested finish resumes existing queued form actions'+(otherComposing?' after both composing fields finalize':''), () => {
+       const f=fieldProbe(), {probe,first,second}=f
+       f.change(first,'ni',true)
+       if(otherComposing)f.change(second,'shi',true)
+       probe.handleAction('save',6);probe.handleBoolAction('toggle',false)
+       const queued=[...probe.fieldActions]
+       assert.deepEqual(f.calls,[]);assert.deepEqual(queued.map(next=>[next.action,next.payload.value]),[['save',6],['toggle',false]])
+       f.finish(first);assert.equal(probe.fieldEdits.get(first).commitRequested,true)
+       f.advance(31);f.change(first,'你好')
+       const expected=[{action:'setFirst',value:'你好',at:31}]
+       if(otherComposing) {
+        assert.deepEqual(f.calls,expected);assert.deepEqual(probe.fieldActions,queued);assert.equal(f.state('saved'),'');assert.equal(probe.fieldEdits.size,1);assert.equal(probe.resumingFieldActions,false)
+        assert.equal(probe.fieldEdits.get(second).commitRequested,false);f.finish(second)
+        assert.equal(probe.fieldEdits.get(second).commitRequested,true)
+        f.advance(19);f.change(second,'世界');expected.push({action:'setSecond',value:'世界',at:50})
+       }
+       const at=otherComposing?50:31
+       expected.push({action:'save',value:6,at},{action:'toggle',value:false,at})
+       assert.deepEqual(f.calls,expected);assert.equal(f.state('saved'),otherComposing?'你好/世界':'你好/other');assert.deepEqual(probe.fieldActions,[]);assert.equal(probe.resumingFieldActions,false)
+       assert.equal(probe.fieldEdits.size,0);assert.equal(f.scheduled.size,0);assert.equal(f.history.size,0)
+       f.finish(first);f.finish(second);probe.resumeFieldActions();f.advance(1000);assert.deepEqual(f.calls,expected);assert.equal(probe.error,'')
+      })
+      for(const transition of ['external','kind','action','enabled','remove','cancelField','cancelFields','invalidateEffects','load','preview-load','reappear']) test('native fields: '+transition+' discards requested finish and stale callbacks cannot flag fresh composing edit', () => {
+       const f=fieldProbe(), {probe,first}=f, generation=first.fieldGeneration
+       f.change(first,'old');const timer=probe.fieldEdits.get(first).timer
+       f.change(first,'old composition',true);f.finish(first)
+       const old=probe.fieldEdits.get(first)
+       assert.equal(old.commitRequested,true);assert.equal(old.composing,true);assert.deepEqual(probe.fieldActions,[])
+       f.advance(13)
+       if(transition==='external') { probe.currentState.fields.set('first',new V.VeraStringValue('external'));probe.renderView() }
+       else if(['kind','action','enabled'].includes(transition)) { f.frame([{[transition]:{kind:'text',action:'normalize',enabled:false}[transition]},{}]);f.frame() }
+       else if(transition==='remove') { f.frame([]);f.frame() }
+       else if(transition==='cancelField')probe.cancelField(first)
+       else if(transition==='preview-load') { probe.previewOnly=true;probe.load();probe.previewOnly=false }
+       else if(transition==='reappear') { probe.aboutToDisappear();probe.aboutToAppear() }
+       else probe[transition]()
+       assert.equal(probe.fieldEdits.size,0);assert.equal(f.scheduled.size,0);assert.deepEqual(probe.fieldActions,[])
+       f.fire(timer);assert.deepEqual(f.calls,[])
+       const fresh=probe.liveRoot.children[0]
+       if(transition!=='cancelField') {
+        f.change(first,'late',false,generation);f.finish(first,generation)
+        assert.equal(probe.fieldEdits.size,0)
+       }
+       f.change(fresh,'fresh composition',true);const edit=probe.fieldEdits.get(fresh)
+       assert.notEqual(edit,old);assert.equal(edit.commitRequested,false)
+       if(transition!=='cancelField')f.finish(first,generation)
+       f.fire(timer);f.change(fresh,'fresh intermediate',true)
+       assert.equal(probe.fieldEdits.get(fresh),edit);assert.equal(edit.commitRequested,false);assert.equal(edit.composing,true);assert.deepEqual(f.calls,[]);assert.equal(f.scheduled.size,0)
+       f.change(fresh,'fresh final');const current=edit.timer
+       assert.equal(edit.commitRequested,false);assert(f.scheduled.has(current));assert.equal(f.scheduled.get(current).at,413)
+       f.fire(timer);f.advance(399);assert.deepEqual(f.calls,[]);assert.equal(probe.fieldEdits.get(fresh),edit)
+       f.advance(1);assert.deepEqual(f.calls,[{action:'setFirst',value:'fresh final',at:413}]);assert.equal(f.state('first'),'fresh final');assert.equal(f.state('saved'),'')
+       f.fire(timer);f.fire(current);f.advance(1000);assert.equal(f.calls.length,1);assert.equal(probe.fieldEdits.size,0);assert.deepEqual(probe.fieldActions,[]);assert.equal(f.scheduled.size,0);assert.equal(probe.error,'')
+      })
+      for(const invalid of ['base','generation']) test('native fields: finish validates current '+invalid+' before requesting a composing commit', () => {
+       const f=fieldProbe(), {probe,first}=f
+       f.change(first,'composition',true);const edit=probe.fieldEdits.get(first), generation=first.fieldGeneration
+       assert.equal(edit.commitRequested,false)
+       if(invalid==='base')first.value='external';else first.fieldGeneration++
+       f.finish(first,generation)
+       assert.equal(edit.commitRequested,false);assert.equal(probe.fieldEdits.size,0);assert.equal(f.scheduled.size,0);assert.deepEqual(f.calls,[])
+       probe.renderView();f.change(first,'fresh')
+       assert.equal(probe.fieldEdits.get(first).commitRequested,false);f.advance(399);assert.deepEqual(f.calls,[])
+       f.advance(1);assert.deepEqual(f.calls,[{action:'setFirst',value:'fresh',at:400}]);assert.equal(probe.error,'')
+      })
+     for(const mode of ['empty','equal','noaction']) test('native fields: '+mode+' input has correct dispatch and display', () => {
+      const f=fieldProbe(), {probe,first}=f
+      if(mode==='noaction')f.frame([{action:''},{}])
+      const value=mode==='empty'?'':mode==='equal'?'base':'ignored'
+      f.change(first,value);f.advance(400);f.finish(first)
+      assert.deepEqual(f.calls,mode==='empty'?[{action:'setFirst',value:'',at:400}]:[])
+      assert.equal(f.state('first'),mode==='empty'?'':'base');assert.equal(first.fieldValue,mode==='empty'?'':'base')
+      assert.equal(probe.fieldEdits.size,0);assert.equal(f.scheduled.size,0)
+     })
+      test('native fields: IME defers Save until final noncomposing change flushes immediately once', () => {
+       const f=fieldProbe(), {probe,first}=f, generation=first.fieldGeneration
+       f.change(first,'n');const timer=probe.fieldEdits.get(first).timer
+       f.advance(100);f.change(first,'ni',true);f.fire(timer);f.advance(1000)
+       f.finish(first);probe.flushFields();assert.deepEqual(f.calls,[]);assert.equal(f.scheduled.size,0)
+       assert.equal(probe.fieldEdits.get(first).composing,true);assert.equal(first.fieldValue,'base');assert.deepEqual(f.writes,[])
+       probe.handleAction('save',0);assert.deepEqual(f.calls,[]);assert.equal(f.state('saved'),'');assert.equal(probe.fieldActions.length,1)
+       f.change(first,'你好',true);f.advance(400);f.finish(first);probe.resumeFieldActions()
+       assert.deepEqual(f.calls,[]);assert.equal(probe.fieldActions.length,1);assert.equal(f.scheduled.size,0)
+       f.change(first,'你好')
+       assert.deepEqual(f.calls,[{action:'setFirst',value:'你好',at:1500},{action:'save',value:0,at:1500}]);assert.equal(f.state('saved'),'你好/other')
+       assert.equal(first.fieldValue,'你好');assert.equal(first.fieldGeneration,generation);assert.equal(probe.fieldEdits.size,0);assert.deepEqual(probe.fieldActions,[]);assert.equal(probe.resumingFieldActions,false);assert.equal(f.scheduled.size,0)
+       f.finish(first);probe.resumeFieldActions();f.fire(timer);f.advance(1000)
+       assert.equal(f.calls.length,2);assert.equal(probe.error,'')
+      })
+      for(const [method,action,value,Payload] of [['handleAction','save',7,V.VeraNumberValue],['handleBoolAction','toggle',false,V.VeraBooleanValue]]) test('native fields: '+method+' preserves typed deferred payload and flushes other edits', () => {
+       const f=fieldProbe(), {probe,first,second}=f
+       f.change(first,'composing',true);f.change(second,'latest')
+       const timer=probe.fieldEdits.get(second).timer
+       f.advance(23);probe[method](action,value)
+       assert.deepEqual(f.calls,[{action:'setSecond',value:'latest',at:23}]);assert.equal(f.state('saved'),'');assert.equal(probe.fieldActions.length,1)
+       const queued=probe.fieldActions[0]
+       assert.equal(queued.action,action);assert(queued.payload instanceof Payload);assert.equal(queued.payload.value,value);assert.equal(queued.generation,probe.effectGeneration)
+       assert.equal(probe.resumingFieldActions,false);assert.equal(f.scheduled.size,0)
+       f.advance(800);f.finish(first);assert.equal(f.calls.length,1)
+       f.change(first,'final')
+       assert.deepEqual(f.calls,[{action:'setSecond',value:'latest',at:23},{action:'setFirst',value:'final',at:823},{action,value,at:823}]);assert.equal(f.state('saved'),'final/latest')
+       assert.deepEqual(probe.fieldActions,[]);assert.equal(probe.fieldEdits.size,0);assert.equal(f.scheduled.size,0);assert.equal(probe.resumingFieldActions,false)
+       f.finish(first);f.fire(timer);probe.resumeFieldActions();f.advance(1000);assert.equal(f.calls.length,3);assert.equal(probe.error,'')
+      })
+      test('native fields: multiple composing fields hold queued numeric and boolean actions in order until both finalize', () => {
+       const f=fieldProbe(), {probe,first,second}=f
+       f.change(first,'one',true);f.change(second,'two',true)
+       probe.handleAction('save',9);probe.handleBoolAction('toggle',true)
+       assert.deepEqual(f.calls,[]);assert.deepEqual(probe.fieldActions.map(next=>[next.action,next.payload.value]),[['save',9],['toggle',true]])
+       f.advance(40);f.change(first,'first final')
+       assert.deepEqual(f.calls,[{action:'setFirst',value:'first final',at:40}]);assert.equal(f.state('saved'),'');assert.equal(probe.fieldActions.length,2)
+       assert.equal(probe.fieldEdits.size,1);assert.equal(probe.fieldEdits.get(second).composing,true);assert.equal(f.scheduled.size,0);assert.equal(probe.resumingFieldActions,false)
+       f.finish(second);probe.resumeFieldActions();f.advance(1000);assert.equal(f.calls.length,1)
+       f.change(second,'second final')
+       assert.deepEqual(f.calls,[{action:'setFirst',value:'first final',at:40},{action:'setSecond',value:'second final',at:1040},{action:'save',value:9,at:1040},{action:'toggle',value:true,at:1040}])
+       assert.equal(f.state('saved'),'first final/second final');assert.deepEqual(probe.fieldActions,[]);assert.equal(probe.fieldEdits.size,0);assert.equal(f.scheduled.size,0);assert.equal(probe.resumingFieldActions,false)
+       f.finish(first);f.finish(second);probe.resumeFieldActions();f.advance(1000);assert.equal(f.calls.length,4);assert.equal(probe.error,'')
+      })
+     test('native fields: independent fields retain their own debounce and pending base across dispatch', () => {
+      const f=fieldProbe(), {probe,first,second}=f
+      f.change(first,'one');f.advance(100);f.change(second,'two')
+      const secondEdit=probe.fieldEdits.get(second), timer=secondEdit.timer
+      f.advance(300);assert.deepEqual(f.calls,[{action:'setFirst',value:'one',at:400}])
+      assert.equal(probe.fieldEdits.get(second),secondEdit);assert.equal(secondEdit.base,'other');assert.equal(secondEdit.timer,timer);assert(f.scheduled.has(timer))
+      f.advance(99);assert.equal(f.calls.length,1);f.advance(1)
+      assert.deepEqual(f.calls[1],{action:'setSecond',value:'two',at:500});assert.equal(f.state('first'),'one');assert.equal(f.state('second'),'two');assert.equal(probe.fieldEdits.size,0)
+     })
+     test('native fields: unrelated real render/reconcile preserves edit, native text, identity and deadline', () => {
+      const f=fieldProbe(), {probe,first}=f, generation=first.fieldGeneration
+      f.change(first,'pending');const edit=probe.fieldEdits.get(first), timer=edit.timer
+      for(let i=0;i<3;i++) {
+       f.advance(100);probe.currentState.fields.set('note',new V.VeraStringValue('frame'+i));probe.renderView()
+       assert.equal(probe.liveRoot.children[0],first);assert.equal(first.fieldGeneration,generation);assert.equal(probe.fieldEdits.get(first),edit);assert.equal(edit.timer,timer);assert.equal(first.fieldValue,'base')
+      }
+      assert.deepEqual(f.writes,[]);f.advance(99);assert.deepEqual(f.calls,[]);f.advance(1)
+      assert.deepEqual(f.calls,[{action:'setFirst',value:'pending',at:400}]);assert.equal(probe.error,'')
+     })
+      const fieldSemanticAttrs={keyboardType:'email',required:true,minLength:2,maxLength:24,pattern:'^[a-z]+$',email:true}
+      for(const [attr,value] of Object.entries(fieldSemanticAttrs)) {
+       test('native fields: '+attr+' change cancels debounce and rejects stale timer/onChange/finish', () => {
+        const f=fieldProbe(), {probe,first}=f, generation=first.fieldGeneration
+        assert.equal(first[attr],new U.VeraUiNode()[attr]);assert.notEqual(first[attr],value)
+        f.change(first,'stale');const old=probe.fieldEdits.get(first), timer=old.timer
+        f.advance(100);f.frame([{[attr]:value},{}])
+        assert.equal(probe.liveRoot.children[0],first);assert.equal(first[attr],value);assert.equal(first.fieldGeneration,generation+1)
+        assert.equal(probe.fieldEdits.size,0);assert.equal(f.scheduled.size,0);assert(!f.scheduled.has(timer))
+        f.fire(timer);f.change(first,'late',false,generation);f.change(first,'late composition',true,generation);f.finish(first,generation)
+        assert.equal(probe.fieldEdits.size,0);assert.deepEqual(f.calls,[]);assert.deepEqual(f.writes,[])
+        f.change(first,'fresh');const edit=probe.fieldEdits.get(first), current=edit.timer
+        assert.notEqual(edit,old);assert.equal(edit.generation,generation+1);assert.equal(f.scheduled.get(current).at,500)
+        f.fire(timer);f.change(first,'late',false,generation);f.finish(first,generation)
+        assert.equal(probe.fieldEdits.get(first),edit);assert.equal(edit.value,'fresh');assert.equal(edit.timer,current);assert.equal(edit.commitRequested,false)
+        assert.equal(f.scheduled.size,1);assert.equal(f.scheduled.get(current).at,500)
+        f.advance(399);assert.deepEqual(f.calls,[]);f.advance(1)
+        assert.deepEqual(f.calls,[{action:'setFirst',value:'fresh',at:500}]);assert.equal(f.state('first'),'fresh')
+        f.fire(timer);f.fire(current);f.advance(1000)
+        assert.equal(f.calls.length,1);assert.equal(probe.fieldEdits.size,0);assert.equal(f.scheduled.size,0);assert.equal(probe.error,'')
+       })
+       test('native fields: '+attr+' change cancels composing requested commit and queued form actions', () => {
+        const f=fieldProbe(), {probe,first,second}=f, generation=first.fieldGeneration
+        assert.notEqual(first[attr],value)
+        f.change(first,'old');const timer=probe.fieldEdits.get(first).timer
+        f.change(first,'old composition',true);f.finish(first);const old=probe.fieldEdits.get(first)
+        f.change(second,'independent composition',true);const other=probe.fieldEdits.get(second), otherGeneration=second.fieldGeneration
+        probe.handleAction('save',5);probe.handleBoolAction('toggle',false)
+        assert.equal(old.composing,true);assert.equal(old.commitRequested,true)
+        assert.deepEqual(probe.fieldActions.map(next=>[next.action,next.payload.value]),[['save',5],['toggle',false]])
+        assert.deepEqual(f.calls,[]);assert.equal(f.scheduled.size,0)
+        f.advance(13);f.frame([{[attr]:value},{}])
+        assert.equal(first[attr],value);assert.equal(first.fieldGeneration,generation+1);assert.equal(probe.liveRoot.children[0],first)
+        assert(!probe.fieldEdits.has(first));assert.equal(probe.fieldEdits.get(second),other);assert.equal(second.fieldGeneration,otherGeneration)
+        assert.deepEqual(probe.fieldActions,[]);assert.equal(probe.resumingFieldActions,false)
+        f.fire(timer);f.change(first,'late final',false,generation);f.finish(first,generation);probe.resumeFieldActions()
+        assert(!probe.fieldEdits.has(first));assert.deepEqual(f.calls,[]);assert.equal(f.scheduled.size,0)
+        f.change(first,'fresh composition',true);const edit=probe.fieldEdits.get(first)
+        assert.notEqual(edit,old);assert.equal(edit.commitRequested,false)
+        f.finish(first,generation);f.change(first,'late composition',true,generation);f.fire(timer)
+        assert.equal(probe.fieldEdits.get(first),edit);assert.equal(edit.value,'fresh composition');assert.equal(edit.composing,true);assert.equal(edit.commitRequested,false)
+        f.change(first,'fresh final');f.change(second,'independent final')
+        assert.deepEqual(f.calls,[]);assert.equal(f.scheduled.size,2);assert.deepEqual(probe.fieldActions,[])
+        f.advance(399);assert.deepEqual(f.calls,[]);f.advance(1)
+        assert.deepEqual(f.calls,[{action:'setFirst',value:'fresh final',at:413},{action:'setSecond',value:'independent final',at:413}])
+        f.fire(timer);probe.resumeFieldActions();f.advance(1000)
+        assert.equal(f.calls.length,2);assert.equal(f.state('saved'),'');assert.equal(probe.fieldEdits.size,0);assert.deepEqual(probe.fieldActions,[]);assert.equal(f.scheduled.size,0);assert.equal(probe.error,'')
+       })
+       test('native fields: '+attr+' roundtrip cannot revive callbacks from either old generation', () => {
+        const f=fieldProbe(), {probe,first}=f, generation=first.fieldGeneration, original=first[attr]
+        assert.notEqual(original,value)
+        f.change(first,'old');const timer=probe.fieldEdits.get(first).timer
+        f.frame([{[attr]:value},{}]);const intermediate=first.fieldGeneration
+        assert.equal(intermediate,generation+1);assert.equal(first[attr],value)
+        f.change(first,'intermediate');const intermediateTimer=probe.fieldEdits.get(first).timer
+        f.frame()
+        assert.equal(first[attr],original);assert.equal(first.fieldGeneration,generation+2);assert.equal(probe.liveRoot.children[0],first)
+        assert.equal(probe.fieldEdits.size,0);assert.equal(f.scheduled.size,0)
+        for(const stale of [generation,intermediate]) { f.change(first,'late',false,stale);f.finish(first,stale) }
+        f.fire(timer);f.fire(intermediateTimer);assert.equal(probe.fieldEdits.size,0);assert.deepEqual(f.calls,[])
+        f.change(first,'fresh composition',true);const edit=probe.fieldEdits.get(first)
+        for(const stale of [generation,intermediate]) { f.change(first,'late composition',true,stale);f.finish(first,stale) }
+        f.fire(timer);f.fire(intermediateTimer)
+        assert.equal(probe.fieldEdits.get(first),edit);assert.equal(edit.value,'fresh composition');assert.equal(edit.commitRequested,false);assert.equal(edit.composing,true)
+        f.advance(23);f.change(first,'fresh');const current=edit.timer
+        for(const stale of [generation,intermediate]) { f.change(first,'late',false,stale);f.finish(first,stale) }
+        f.fire(timer);f.fire(intermediateTimer)
+        assert.equal(probe.fieldEdits.get(first),edit);assert.equal(edit.value,'fresh');assert.equal(edit.timer,current);assert.equal(f.scheduled.get(current).at,423)
+        f.advance(399);assert.deepEqual(f.calls,[]);f.advance(1)
+        assert.deepEqual(f.calls,[{action:'setFirst',value:'fresh',at:423}]);assert.equal(f.state('first'),'fresh');assert.equal(first.fieldGeneration,generation+2)
+        f.fire(timer);f.fire(intermediateTimer);f.fire(current);f.advance(1000)
+        assert.equal(f.calls.length,1);assert.equal(probe.fieldEdits.size,0);assert.equal(f.scheduled.size,0);assert.equal(probe.error,'')
+       })
+       test('native fields: unchanged '+attr+' at default and nondefault preserves pending and composing edits', () => {
+        for(const unchanged of [new U.VeraUiNode()[attr],value]) {
+         const f=fieldProbe(), {probe,first}=f
+         f.frame([{[attr]:unchanged},{}]);const generation=first.fieldGeneration
+         assert.equal(first[attr],unchanged)
+         f.change(first,'pending');const edit=probe.fieldEdits.get(first), timer=edit.timer
+         for(let i=0;i<3;i++) {
+          f.advance(100);f.frame([{[attr]:unchanged},{}])
+          assert.equal(probe.liveRoot.children[0],first);assert.equal(first.fieldGeneration,generation);assert.equal(probe.fieldEdits.get(first),edit)
+          assert.equal(edit.value,'pending');assert.equal(edit.base,'base');assert.equal(edit.timer,timer);assert.equal(f.scheduled.size,1);assert.equal(f.scheduled.get(timer).at,400)
+         }
+         assert.deepEqual(f.calls,[]);assert.deepEqual(f.writes,[]);f.advance(99);assert.deepEqual(f.calls,[]);f.advance(1)
+         assert.deepEqual(f.calls,[{action:'setFirst',value:'pending',at:400}]);assert.equal(f.state('first'),'pending');assert.equal(probe.fieldEdits.size,0)
+         const g=fieldProbe(), node=g.first, p=g.probe
+         g.frame([{[attr]:unchanged},{}]);const composingGeneration=node.fieldGeneration
+         g.change(node,'composition',true);g.finish(node);p.handleAction('save',7);p.handleBoolAction('toggle',true)
+         const composing=p.fieldEdits.get(node), queued=[...p.fieldActions]
+         g.advance(100);g.frame([{[attr]:unchanged},{}])
+         assert.equal(node.fieldGeneration,composingGeneration);assert.equal(p.fieldEdits.get(node),composing);assert.equal(composing.composing,true);assert.equal(composing.commitRequested,true)
+         assert.deepEqual(p.fieldActions,queued);assert.equal(queued.length,2);assert.equal(g.scheduled.size,0);assert.deepEqual(g.calls,[])
+         g.change(node,'final')
+         assert.deepEqual(g.calls,[{action:'setFirst',value:'final',at:100},{action:'save',value:7,at:100},{action:'toggle',value:true,at:100}])
+         assert.equal(g.state('saved'),'final/other');assert.equal(p.fieldEdits.size,0);assert.deepEqual(p.fieldActions,[]);assert.equal(g.scheduled.size,0);assert.equal(p.error,'')
+        }
+       })
+      }
+      for(const [attr,value] of Object.entries({label:'Updated label',style:'outlined',requiredMessage:'Required now',minLengthMessage:'Too short now',maxLengthMessage:'Too long now',patternMessage:'Invalid pattern now',emailMessage:'Invalid email now'})) test('native fields: cosmetic '+attr+' change preserves generation, pending edit and deadline', () => {
+       const f=fieldProbe(), {probe,first}=f, generation=first.fieldGeneration
+       assert.notEqual(first[attr],value)
+       f.change(first,'pending');const edit=probe.fieldEdits.get(first), timer=edit.timer
+       for(let i=0;i<3;i++) {
+        f.advance(100);f.frame([{[attr]:value+i},{}])
+        assert.equal(first[attr],value+i);assert.equal(probe.liveRoot.children[0],first);assert.equal(first.fieldGeneration,generation)
+        assert.equal(probe.fieldEdits.get(first),edit);assert.equal(edit.value,'pending');assert.equal(edit.base,'base');assert.equal(edit.composing,false);assert.equal(edit.commitRequested,false)
+        assert.equal(edit.timer,timer);assert.equal(f.scheduled.size,1);assert.equal(f.scheduled.get(timer).at,400);assert.equal(first.fieldValue,'base')
+       }
+       assert.deepEqual(f.writes,[]);f.advance(99);assert.deepEqual(f.calls,[]);f.advance(1)
+       assert.deepEqual(f.calls,[{action:'setFirst',value:'pending',at:400}]);assert.equal(f.state('first'),'pending');assert.equal(first.fieldGeneration,generation)
+       f.fire(timer);f.advance(1000);assert.equal(f.calls.length,1);assert.equal(probe.fieldEdits.size,0);assert.equal(f.scheduled.size,0);assert.equal(probe.error,'')
+      })
+      for(const transition of ['external','kind','action','enabled','remove']) test('native fields: '+transition+' reconciliation cancels pending and rejects old callbacks', () => {
+      const f=fieldProbe(), {probe,first}=f, generation=first.fieldGeneration
+      f.change(first,'stale');const timer=probe.fieldEdits.get(first).timer
+      f.advance(100)
+      if(transition==='external') { probe.currentState.fields.set('first',new V.VeraStringValue('external'));probe.renderView() }
+      else if(transition==='remove')f.frame([])
+      else f.frame([{[transition]:{kind:'text',action:'normalize',enabled:false}[transition]},{}])
+      assert.equal(probe.fieldEdits.size,0);assert.equal(f.scheduled.size,0);assert(!f.scheduled.has(timer))
+       assert.equal(first.fieldGeneration,generation+(transition==='remove'?0:1))
+       if(transition==='external') { assert.equal(first.value,'external');assert.equal(first.fieldValue,'external') }
+       f.change(first,'late',false,generation);f.finish(first,generation)
+       assert.equal(probe.fieldEdits.size,0)
+      f.fire(timer);f.advance(1000);assert.deepEqual(f.calls,[]);assert.equal(probe.error,'')
+     })
+      test('native fields: external update without pending edit bumps generation and rejects stale native callbacks', () => {
+       const f=fieldProbe(), {probe,first}=f, generation=first.fieldGeneration
+       assert.equal(probe.fieldEdits.size,0)
+       probe.currentState.fields.set('first',new V.VeraStringValue('external'));probe.renderView()
+       assert.equal(probe.liveRoot.children[0],first);assert.equal(first.fieldGeneration,generation+1);assert.equal(first.value,'external');assert.equal(first.fieldValue,'external')
+       f.change(first,'stale',false,generation);f.finish(first,generation);f.advance(1000)
+       assert.deepEqual(f.calls,[]);assert.equal(probe.fieldEdits.size,0);assert.equal(f.scheduled.size,0);assert.equal(f.state('first'),'external')
+       f.change(first,'fresh');const edit=probe.fieldEdits.get(first), timer=edit.timer
+       f.change(first,'late',false,generation);f.finish(first,generation)
+       assert.equal(probe.fieldEdits.get(first),edit);assert.equal(edit.timer,timer);assert(f.scheduled.has(timer))
+       f.advance(400);assert.deepEqual(f.calls,[{action:'setFirst',value:'fresh',at:1400}]);assert.equal(f.state('first'),'fresh');assert.equal(first.fieldGeneration,generation+1);assert.equal(probe.error,'')
+      })
+      for(const transition of ['external','kind','action','enabled','remove']) test('native fields: '+transition+' invalidation of a composing field cancels queued actions', () => {
+       const f=fieldProbe(), {probe,first,second}=f, generation=first.fieldGeneration
+       f.change(first,'old');const timer=probe.fieldEdits.get(first).timer
+       f.change(first,'composing',true);f.change(second,'other composing',true)
+       probe.handleAction('save',5);probe.handleBoolAction('toggle',false)
+       assert.deepEqual(f.calls,[]);assert.equal(probe.fieldActions.length,2);assert.equal(f.scheduled.size,0)
+       if(transition==='external') { probe.currentState.fields.set('first',new V.VeraStringValue('external'));probe.renderView() }
+       else if(transition==='remove')f.frame([])
+       else f.frame([{[transition]:{kind:'text',action:'normalize',enabled:false}[transition]},{}])
+       assert.equal(first.fieldGeneration,generation+(transition==='remove'?0:1));assert.deepEqual(probe.fieldActions,[]);assert.equal(probe.resumingFieldActions,false)
+       f.change(first,'stale',false,generation);f.finish(first,generation);f.fire(timer);probe.resumeFieldActions()
+       assert.deepEqual(f.calls,[]);assert.equal(f.scheduled.size,0)
+       if(transition!=='remove') {
+        f.change(second,'fresh second');assert.deepEqual(f.calls,[]);assert.equal(f.scheduled.size,1)
+        f.advance(400);assert.deepEqual(f.calls,[{action:'setSecond',value:'fresh second',at:400}]);assert.equal(f.state('second'),'fresh second')
+       }
+       f.advance(1000);assert.equal(f.state('saved'),'');assert.deepEqual(probe.fieldActions,[]);assert.equal(probe.fieldEdits.size,0);assert.equal(f.scheduled.size,0);assert.equal(probe.error,'')
+      })
+      test('native fields: kind/action/enabled round trips cannot revive callbacks from the old generation', () => {
+      for(const key of ['kind','action','enabled']) {
+       const f=fieldProbe(), {probe,first}=f, generation=first.fieldGeneration
+       f.change(first,'old');const timer=probe.fieldEdits.get(first).timer
+       f.frame([{[key]:{kind:'text',action:'normalize',enabled:false}[key]},{}]);f.frame()
+       assert.equal(first.fieldGeneration,generation+2);assert.equal(probe.liveRoot.children[0],first)
+       f.change(first,'stale',false,generation);f.finish(first,generation);assert.equal(probe.fieldEdits.size,0)
+       f.change(first,'fresh');const edit=probe.fieldEdits.get(first)
+       f.fire(timer);assert.equal(probe.fieldEdits.get(first),edit);assert.deepEqual(f.calls,[])
+       f.advance(400);assert.equal(f.state('first'),'fresh');assert.equal(f.calls.length,1)
+      }
+     })
+     test('native fields: stale-generation submit/blur cannot cancel a fresh edit on the retained node', () => {
+      const f=fieldProbe(), {probe,first}=f, generation=first.fieldGeneration
+      f.change(first,'old');const oldTimer=probe.fieldEdits.get(first).timer
+      f.frame([{action:'normalize'},{}]);f.frame()
+      f.change(first,'fresh');const edit=probe.fieldEdits.get(first), timer=edit.timer
+      f.finish(first,generation);f.change(first,'stale',false,generation);f.fire(oldTimer)
+      assert.equal(probe.fieldEdits.get(first),edit,'old-generation finish must leave the current edit intact');assert.equal(edit.timer,timer);assert(f.scheduled.has(timer))
+      f.advance(400);assert.deepEqual(f.calls,[{action:'setFirst',value:'fresh',at:400}]);assert.equal(f.state('first'),'fresh')
+     })
+     for(const gate of ['previewOnly','disposed','removed']) test('native fields: '+gate+' rejects new input and finish', () => {
+      const f=fieldProbe(), {probe,first}=f
+      if(gate==='removed')probe.liveRoot=null;else probe[gate]=true
+      f.change(first,'ignored');f.finish(first);f.advance(1000)
+      assert.deepEqual(f.calls,[]);assert.deepEqual(f.writes,[]);assert.equal(probe.fieldEdits.size,0);assert.equal(f.scheduled.size,0)
+     })
+     for(const transition of ['load','disappear','reappear']) test('native fields: real '+transition+' invalidates all edits including callbacks after appear', () => {
+      const f=fieldProbe(), {probe,first,second}=f, generation=probe.effectGeneration
+      f.change(first,'old');f.change(second,'older');const timers=[...probe.fieldEdits.values()].map(edit=>edit.timer)
+      if(transition==='load')probe.load();else {
+       probe.aboutToDisappear();assert.equal(probe.disposed,true);assert.equal(probe.fieldEdits.size,0);assert.equal(f.scheduled.size,0)
+       if(transition==='reappear')probe.aboutToAppear()
+      }
+      assert(probe.effectGeneration>generation);assert.equal(probe.fieldEdits.size,0);assert.equal(f.scheduled.size,0)
+      for(const timer of timers)f.fire(timer)
+      f.finish(first);f.change(first,'late');f.advance(1000);assert.deepEqual(f.calls,[])
+      if(transition!=='disappear') {
+       const fresh=probe.liveRoot.children[0]
+       f.change(fresh,'new');const edit=probe.fieldEdits.get(fresh)
+       for(const timer of timers)f.fire(timer)
+       assert.equal(probe.fieldEdits.get(fresh),edit);f.advance(400);assert.equal(f.state('first'),'new');assert.equal(f.calls.length,1)
+      }
+      assert.equal(probe.error,'')
+     })
+      for(const transition of ['cancelField','cancelFields','invalidateEffects','load','disappear','reappear']) test('native fields: queued actions are canceled by '+transition+' and never revived by fresh input', () => {
+       const f=fieldProbe(), {probe,first,second}=f, generation=first.fieldGeneration, effectGeneration=probe.effectGeneration
+       f.change(first,'old');const timer=probe.fieldEdits.get(first).timer
+       f.change(first,'composing',true);f.change(second,'also composing',true)
+       probe.handleAction('save',3);probe.handleBoolAction('toggle',true)
+       assert.deepEqual(f.calls,[]);assert.equal(probe.fieldActions.length,2)
+       if(transition==='cancelField') {
+        probe.cancelField(first);assert.deepEqual(probe.fieldActions,[]);assert.equal(probe.fieldEdits.size,1)
+        probe.cancelField(second)
+       }
+       else if(transition==='disappear'||transition==='reappear') {
+        probe.aboutToDisappear()
+        if(transition==='reappear')probe.aboutToAppear()
+       } else probe[transition]()
+       assert.deepEqual(probe.fieldActions,[]);assert.equal(probe.fieldEdits.size,0);assert.equal(f.scheduled.size,0);assert.equal(probe.resumingFieldActions,false)
+       assert.equal(probe.effectGeneration>effectGeneration,!['cancelField','cancelFields'].includes(transition))
+       if(transition!=='cancelField') {
+        f.change(first,'stale',false,generation);f.finish(first,generation)
+        assert.equal(probe.fieldEdits.size,0)
+       }
+       f.fire(timer);probe.resumeFieldActions();f.advance(1000)
+       assert.deepEqual(f.calls,[]);assert.equal(f.state('saved'),'')
+       if(transition!=='disappear') {
+        const fresh=probe.liveRoot.children[0]
+        f.change(fresh,'fresh');assert.equal(f.scheduled.size,1);assert.deepEqual(f.calls,[])
+        f.advance(400);assert.deepEqual(f.calls,[{action:'setFirst',value:'fresh',at:1400}]);assert.equal(f.state('saved'),'')
+        probe.handleAction('save',8)
+        assert.deepEqual(f.calls.at(-1),{action:'save',value:8,at:1400});assert.equal(f.state('saved'),'fresh/other')
+       }
+       f.fire(timer);probe.resumeFieldActions();f.advance(1000)
+       assert.equal(f.calls.length,transition==='disappear'?0:2);assert.deepEqual(probe.fieldActions,[]);assert.equal(probe.fieldEdits.size,0);assert.equal(f.scheduled.size,0);assert.equal(probe.error,'')
+      })
+      for(const method of ['handleAction','handleBoolAction']) test('native fields: '+method+' flushes latest independent edits before action reads state', () => {
+      const f=fieldProbe(), {probe,first,second}=f
+      f.change(first,'one');f.change(first,'latest');f.change(second,'two')
+      const timers=[...f.history.keys()]
+      f.advance(20);probe[method](method==='handleAction'?'save':'toggle',method==='handleAction'?7:true)
+      assert.deepEqual(f.calls,[{action:'setFirst',value:'latest',at:20},{action:'setSecond',value:'two',at:20},{action:method==='handleAction'?'save':'toggle',value:method==='handleAction'?7:true,at:20}])
+      assert.equal(f.state('saved'),'latest/two');assert.equal(probe.fieldEdits.size,0);assert.equal(f.scheduled.size,0)
+      for(const timer of timers)f.fire(timer)
+      f.advance(1000);assert.equal(f.calls.length,3);assert.equal(probe.error,'')
+     })
+     for(const method of ['handleAction','handleBoolAction']) test('native fields: '+method+' aborts outer action if flushing changes program generation', () => {
+      const f=fieldProbe(), {probe,first}=f, dispatch=probe.dispatch
+      f.change(first,'new program')
+       probe.dispatch=function(action,value,persist=true) { dispatch.call(this,action,value,persist);this.load() }
+      probe[method](method==='handleAction'?'save':'toggle',method==='handleAction'?0:true)
+      assert.deepEqual(f.calls.map(call=>call.action),['setFirst']);assert.equal(f.state('saved'),'');assert.equal(probe.fieldEdits.size,0);assert.equal(f.scheduled.size,0)
+     })
+      test('native fields: normal accepted commits retain native generation across debounce, finish and action flush', () => {
+       const f=fieldProbe(), {probe,first}=f, generation=first.fieldGeneration
+       f.change(first,'debounced',false,generation);f.advance(400)
+       assert.equal(first.fieldGeneration,generation);assert.equal(first.fieldValue,'debounced')
+       f.change(first,'finished',false,generation);f.finish(first,generation)
+       assert.equal(first.fieldGeneration,generation);assert.equal(first.fieldValue,'finished')
+       f.change(first,'flushed',false,generation);probe.handleAction('save',2)
+       assert.deepEqual(f.calls,[{action:'setFirst',value:'debounced',at:400},{action:'setFirst',value:'finished',at:400},{action:'setFirst',value:'flushed',at:400},{action:'save',value:2,at:400}])
+       assert.equal(probe.liveRoot.children[0],first);assert.equal(first.fieldGeneration,generation);assert.equal(first.fieldValue,'flushed');assert.equal(f.state('saved'),'flushed/other')
+       for(const timer of f.history.keys())f.fire(timer)
+       f.finish(first,generation);f.advance(1000);assert.equal(f.calls.length,4);assert.equal(probe.fieldEdits.size,0);assert.deepEqual(probe.fieldActions,[]);assert.equal(f.scheduled.size,0);assert.equal(probe.error,'')
+      })
+      test('native fields: real handler normalization retains node identity but bumps native generation once', () => {
+       const f=fieldProbe(), {probe,first}=f
+       probe.currentState.fields.set('note',new V.VeraStringValue('normalize'));probe.renderView();const generation=first.fieldGeneration
+       f.change(first,'raw value');assert.equal(first.fieldValue,'base');assert.deepEqual(f.writes,[])
+       f.finish(first)
+       assert.deepEqual(f.calls,[{action:'normalize',value:'raw value',at:0}]);assert.equal(f.state('first'),'normalized');assert.equal(first.value,'normalized');assert.equal(first.fieldValue,'normalized')
+       assert.equal(probe.liveRoot.children[0],first);assert.equal(first.fieldGeneration,generation+1);assert.equal(probe.fieldEdits.size,0);assert.equal(f.scheduled.size,0);assert.equal(probe.error,'')
+       f.change(first,'stale',false,generation);f.finish(first,generation);probe.renderView()
+       for(const timer of f.history.keys())f.fire(timer)
+       f.advance(1000);assert.equal(f.calls.length,1);assert.equal(first.fieldGeneration,generation+1);assert.equal(probe.fieldEdits.size,0);assert.equal(f.scheduled.size,0)
+      })
+     test('native fields: source wires generation identity, native composition and finish without global epoch or keystroke trace', () => {
+      const renderer=fs.readFileSync(path.join(sourceRoot,'components/VeraPreview.ets'),'utf8'), live=fs.readFileSync(path.join(sourceRoot,'components/VeraLiveTree.ets'),'utf8')
+      const clean=source=>source.replace(/\/\*[\s\S]*?\*\//g,'').replace(/\/\/[^\n]*/g,'')
+      assert(!/\bfieldEpoch\b|\bfieldDraft\b/.test(clean(renderer)+'\n'+clean(live)),'field builder must not use global fieldEpoch or traced fieldDraft')
+      assert.match(live,/@Trace\s+fieldValue:\s*string\s*=\s*''/);assert.match(live,/@Trace\s+fieldGeneration:\s*number\s*=\s*0/)
+      assert.match(renderer,/private fieldEdits:\s*Map<LiveNode,\s*FieldEdit>/)
+      const change=declaration(renderer,'  private changeField(')
+      assert(!/\bnode\.\w+\s*(?:=(?!=)|\+\+|--|\+=|-=)/.test(change),'changeField must not write traced node state')
+      const field=renderer.slice(renderer.indexOf("} else if (node.kind === 'field') {"),renderer.indexOf("} else if (node.kind === 'toggle' || node.kind === 'checkbox') {"))
+      assert(field.length>0,'field builder')
+      assert.match(field,/ForEach\(\[node\.fieldGeneration\],\s*\(generation:\s*number\)\s*=>/)
+      assert.match(field,/TextInput\(\{[^\n]*\btext:\s*node\.fieldValue\s*\}/)
+      const onChange=declaration(field,'.onChange(')
+      assert.match(onChange,/this\.changeField\(node,\s*generation,\s*v,\s*previewText\s*!==\s*undefined\s*&&\s*previewText\.value\.length\s*>\s*0\)/)
+      assert(!/\bnode\.\w+\s*=(?!=)/.test(onChange),'onChange must not write traced node state')
+      assert.match(declaration(field,'.onSubmit('),/this\.finishField\(node,\s*generation\)/)
+      assert.match(declaration(field,'.onEditChange('),/if\s*\(!editing\)\s*\{\s*this\.finishField\(node,\s*generation\)/)
+      assert.match(field,/\},\s*\(generation:\s*number\)\s*=>\s*generation\.toString\(\)\)/)
+      const render=declaration(renderer,'  private renderView(')
+      assert(render.indexOf('this.reconcileFields()')>render.indexOf('reconcile(this.liveRoot!, root!)'))
+      assert.match(declaration(renderer,'  private invalidateEffects('),/this\.cancelFields\(\)/)
+       for(const [name,Payload] of [['handleAction','VeraNumberValue'],['handleBoolAction','VeraBooleanValue']]) {
+        const method=declaration(renderer,'  private '+name+'(')
+        assert.match(method,new RegExp('this\\.dispatchFieldAction\\(action, new '+Payload+'\\(value\\)\\)'))
+       }
+       const resume=declaration(renderer,'  private resumeFieldActions(')
+       assert(resume.indexOf('this.flushFields()')>=0&&resume.indexOf('this.flushFields()')<resume.indexOf('this.dispatch('),'deferred action flush precedes dispatch')
+     })
+     function tickerProbe() {
     const renderer=fs.readFileSync(path.join(sourceRoot,'components/VeraPreview.ets'),'utf8')
     const timerConfig=declaration(renderer,'class TimerConfig')
     const fields=['timers','timerConfigs','timerLastFire','ticking'].map(name=>{

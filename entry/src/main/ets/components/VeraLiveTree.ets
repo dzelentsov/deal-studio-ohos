@@ -83,6 +83,8 @@ export class LiveNode {
   /** What the person last typed in this field, to tell their own clearing from the program's reset of the form. */
   typed: string = ''
   @Trace children: LiveNode[] = []
+  @Trace fieldValue: string = ''
+  @Trace fieldGeneration: number = 0
   /**
    * Renderer state: this node appeared because of something the person just did (a card opened, a result banner came up),
    * so the renderer brings it into view once it has a size. Never traced: reading it must not redraw anything.
@@ -136,6 +138,7 @@ export function toLive(node: VeraUiNode): LiveNode {
   live.tickerId = node.tickerId
   live.columns = node.columns
   live.value = node.value
+  live.fieldValue = node.value
   live.checked = node.checked
   live.minimum = node.minimum
   live.maximum = node.maximum
@@ -193,6 +196,14 @@ export function toLive(node: VeraUiNode): LiveNode {
  * show a journal -- then disagrees with its own state on every row.
  */
 export function reconcile(live: LiveNode, next: VeraUiNode): void {
+  if (live.kind !== next.kind || live.action !== next.action || live.enabled !== next.enabled ||
+      (live.value !== next.value && live.fieldValue !== next.value) ||
+      (live.kind === 'field' && (live.keyboardType !== next.keyboardType || live.required !== next.required ||
+        live.minLength !== next.minLength || live.maxLength !== next.maxLength ||
+        live.pattern !== next.pattern || live.email !== next.email))) {
+    live.fieldGeneration++
+  }
+  if (live.fieldValue !== next.value) { live.fieldValue = next.value }
   if (live.kind !== next.kind) {
     live.kind = next.kind
     live.layoutWidth = 0

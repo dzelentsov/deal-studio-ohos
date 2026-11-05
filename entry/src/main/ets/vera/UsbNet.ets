@@ -144,6 +144,10 @@ export async function stopUsbNet(filesDir: string): Promise<void> {
 }
 
 /** The VPN stopping itself: after a failure, or when it finds it is no longer wanted. */
-export function stopUsbNetSelf(): Promise<void> {
-  return vpnExtension.stopVpnExtensionAbility(want())
+export async function stopUsbNetSelf(): Promise<void> {
+  try {
+    await vpnExtension.stopVpnExtensionAbility(want())
+  } catch (e) {
+    throw e as Error
+  }
 }
