@@ -1,5 +1,59 @@
 # Changelog
 
+## TextField input buffering and commit lifecycle
+
+This change moves `ui.TextField` from per-keystroke VM execution to field-local buffering with deferred commits. Its purpose is to keep ordinary text editing responsive while avoiding repeated VM execution, state persistence, and view reconciliation for every character.
+
+### 1. Per-field input buffer
+
+- Each `ui.TextField` maintains its own pending edit state. Typing in one field does not reset or overwrite the debounce timer or buffered value of another field.
+- Every text change updates the local field buffer and restarts a **400 ms debounce timer**.
+- If no further input arrives for 400 ms, the latest buffered value is committed. Intermediate values from the same uninterrupted typing burst are not individually dispatched to the VM.
+- Submit and blur request an immediate commit rather than waiting for the debounce interval. If IME composition is active, the commit request is retained and the final composed value is committed as soon as composition ends. No additional 400 ms delay or duplicate dispatch is introduced in that path.
+
+### 2. Ordering with form actions
+
+- A form action first flushes pending text edits, then dispatches the action. This prevents an action from observing stale application state while a preceding text edit is still buffered.
+- If a field is in IME composition, the action remains pending until composition finishes and the final text value can be committed. The action is then resumed in the established order.
+- Text editing and action dispatch therefore have an explicit ordering boundary: pending text commits precede the action that follows them.
+
+### 3. Stale edit and callback invalidation
+
+Pending timers, commit requests, and deferred actions are invalidated when their target is no longer valid. The invalidation cases include:
+
+- an external program update changes the field value;
+- the field is replaced or its relevant identity/configuration changes;
+- the preview program is loaded/replaced, or the component enters a lifecycle state in which pending work must no longer execute.
+
+Callbacks validate that they still refer to the current field/edit generation before committing. This prevents a delayed callback from an older edit or program instance from overwriting newer state.
+
+### 4. Preserve input identity during accepted commits
+
+A normal accepted text commit does not automatically rebuild the `TextField`. The live input node and its field generation are retained when the field remains semantically the same. This avoids unnecessary component replacement during ordinary typing and gives ArkUI the opportunity to preserve focus and cursor state.
+
+A genuine field replacement or incompatible field change invalidates the previous edit generation. Presentation-only updates should not increment the generation unless the implementation explicitly treats them as a replacement; unnecessary generation changes can recreate the input and disturb focus or cursor position.
+
+### 5. Expected performance impact
+
+The principal expected gain is a reduction in the number of expensive downstream operations, not the elimination of per-keystroke UI events. Each keystroke still updates the local buffer and debounce timer, but a burst of typing is consolidated into one VM commit after the pause.
+
+For a continuous typing burst of **N** characters where every inter-character gap is shorter than 400 ms, the previous per-keystroke path could trigger N VM dispatches, N state saves, and N reconciliations. The debounced path triggers one of each after the final pause. The theoretical reduction in each of those operation counts is `(N - 1) / N`:
+
+| Characters in one burst (N) | Downstream commits before | Downstream commits after | Theoretical reduction |
+| ---: | ---: | ---: | ---: |
+| 5 | 5 | 1 | 80% |
+| 10 | 10 | 1 | 90% |
+| 20 | 20 | 1 | 95% |
+| 40 | 40 | 1 | 97.5% |
+
+These are operation-count estimates for an uninterrupted burst in a single field, not measured CPU, energy, latency, or frame-rate improvements. Pauses of 400 ms or longer can produce separate commits; separate fields maintain independent debounce windows; explicit form actions can force an earlier flush. Actual end-to-end gains depend on VM cost, persistence cost, reconciliation cost, and the user's typing pattern.
+
+### 6. Verification and remaining device checks
+
+- The visual regression suite passed all **320 checks**.
+- Validation, timer/graphics checks, and the unsigned ArkTS build passed.
+- Device behavior for focus retention, cursor placement, and IME composition has **not** been verified. These require on-device testing, including submit/blur during composition and form actions issued while composition is active.
+
 ## Fix miscellaneous errors
 
 - Fixed warm launches from the widget, shortcuts and the launcher icon no longer navigating: `navigateToProject()` had been moved inside `extractDevParameters`, which returns early for app callers, so the route queued by `extractProjectId` in `onNewWant` was never drained. It is now called explicitly at the end of both `onCreate` and `onNewWant`, after both extracts, and `extractDevParameters` no longer touches navigation — which also stops `hdc shell aa start` launches from queueing their route twice.
