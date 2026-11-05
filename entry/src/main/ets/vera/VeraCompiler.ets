@@ -2744,14 +2744,36 @@ class BytecodeCompiler {
     }
     let parent = b.parent
     if (parent !== null) {
-      let parentBinding = this.findBinding(name, parent)
-      if (parentBinding !== null) {
-        let slot = b.capturedBindings.size
-        let captureIdx = parentBinding.location === 'local' ? parentBinding.slot : -parentBinding.slot - 1
-        b.capturedBindings.set(name, captureIdx)
-        b.bindings.set(name, new Binding('capture', slot))
-        b.emit(mkLoadCapture(slot))
-        return
+      // The variable lives in an enclosing function. Capture it here, and thread
+      // the capture through every level between b and the owner: the owner is the
+      // builder walking up whose bindings already name it. A deep capture
+      // encoded straight from the owner's slot would be read from this frame's
+      // local/captures at make-closure time, so each level in between has to
+      // carry the variable itself for th depth-1 encoding to compose.
+      let chain: FunctionBuilder[] = []
+      let cur: FunctionBuilder | null = parent
+      while (cur !== null && !cur.bindings.has(name)) {
+        chain.push(cur)
+        cur = cur.parent
+      }
+      if (cur !== null) {
+        let ownerBinding = cur.bindings.get(name)
+        if (ownerBinding !== undefined) {
+          let captureIdx = ownerBinding.location === 'local' ? ownerBinding.slot : -ownerBinding.slot - 1
+          for (let i = chain.length -1; i >= 0; --i) {
+            let level = chain[i]
+            let levelSlot = level.capturedBindings.size
+            level.capturedBindings.set(name, captureIdx)
+            level.bindings.set(name, new Binding('capture', levelSlot))
+            captureIdx = -levelSlot - 1
+
+          }
+          let slot = b.capturedBindings.size
+          b.capturedBindings.set(name, captureIdx)
+          b.bindings.set(name, new Binding('capture', slot))
+          b.emit(mkLoadCapture(slot))
+          return
+        }
       }
     }
     b.emit(mkLoadFunction(name))
