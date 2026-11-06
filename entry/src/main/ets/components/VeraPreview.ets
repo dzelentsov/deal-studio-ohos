@@ -103,6 +103,14 @@ class FieldEdit {
   }
 }
 
+class FieldInput {
+  generation: number
+  controller: TextInputController = new TextInputController()
+  constructor(generation: number) {
+    this.generation = generation
+  }
+}
+
 class FieldAction {
   action: string
   payload: RuntimeValue
@@ -110,6 +118,13 @@ class FieldAction {
   persist: boolean
   node: LiveNode | null
   nodeGeneration: number
+  nodeKind: string
+  nodeState: string = ''
+  dependencies: LiveNode[] = []
+  unknownDependencies: boolean = true
+  dependencyCancellations: number[] = []
+  surfaceInput: SurfaceInput | null = null
+  surfaceId: number = -1
   constructor(action: string, payload: RuntimeValue, generation: number,
     persist: boolean = true, node: LiveNode | null = null) {
     this.action = action
@@ -118,6 +133,7 @@ class FieldAction {
     this.persist = persist
     this.node = node
     this.nodeGeneration = node !== null ? node.fieldGeneration : -1
+    this.nodeKind = node !== null ? node.kind : ''
   }
 }
 
@@ -125,6 +141,7 @@ class SurfaceInput {
   action: string
   generation: number
   nodeGeneration: number
+  ended: boolean = false
   constructor(node: LiveNode, generation: number) {
     this.action = node.value
     this.generation = generation
@@ -145,6 +162,8 @@ class TimerConfig {
 const SURFACE_VIEW_MS: number = 100
 /** How often a running surface's state is saved, in ms. Every frame would write the project sixty times a second. */
 const SURFACE_SAVE_MS: number = 5000
+/** Tickers at or above this interval are state/lifecycle events and must observe pending text edits. */
+const SLOW_TICK_MS: number = 500
 /** The longest a frame says has passed, in ms, so a pause -- the app in the background, a slow frame -- is not a leap. */
 const SURFACE_MAX_ELAPSED_MS: number = 100
 
@@ -235,8 +254,31 @@ function tileRows(children: LiveNode[]): LiveNode[][] {
   return rows
 }
 
+export class VeraPreviewController {
+  private capture: (() => boolean) | null = null
+
+  attach(capture: () => boolean): void {
+    this.capture = capture
+  }
+
+  detach(capture: () => boolean): void {
+    if (this.capture === capture) { this.capture = null }
+  }
+
+  flushAndSnapshot(): boolean {
+    return this.capture === null || this.capture!()
+  }
+}
+
 @Component
 export struct VeraPreview {
+  controller: VeraPreviewController | null = null
+  private captureFields: () => boolean = (): boolean => {
+    if (!this.flushUserFields()) { return false }
+    this.notifyStateSnapshot()
+    return true
+  }
+
   /**
    * The program is a picture of one still being written (VeraWidgetPreview):
    * its handlers may not exist yet, so nothing dispatches -- no taps, no
@@ -352,11 +394,17 @@ export struct VeraPreview {
   @State numberEpoch: number = 0
 
   private fieldEdits: Map<LiveNode, FieldEdit> = new Map<LiveNode, FieldEdit>()
+  private fieldInputs: Map<LiveNode, FieldInput> = new Map<LiveNode, FieldInput>()
   private fieldActions: FieldAction[] = []
+  private fieldMenus: Map<LiveNode, FieldAction[]> = new Map<LiveNode, FieldAction[]>()
   private surfaceInputs: Map<LiveNode, Map<number, SurfaceInput>> =
     new Map<LiveNode, Map<number, SurfaceInput>>()
   private resumingFieldActions: boolean = false
+  private fieldActionsNeedResume: boolean = false
+  private renderingDepth: number = 0
   private liveRoot: LiveNode | null = null
+  /** Current membership epoch for nodes reachable from liveRoot. */
+  private liveGeneration: number = 0
 
   /**
    * Which program liveRoot belongs to, bumped by every load(). The drawn tree
@@ -515,6 +563,7 @@ export struct VeraPreview {
     }
     this.watchDarkMode()
     this.load()
+    if (this.controller !== null) { this.controller!.attach(this.captureFields) }
   }
 
   onProgramChanged(): void {
@@ -575,6 +624,7 @@ export struct VeraPreview {
     this.host = null
     this.currentState = null
     if (!keep) {
+      this.liveGeneration++
       this.liveRoot = null
       this.hasRoot = false
       this.programId += 1
@@ -914,13 +964,28 @@ export struct VeraPreview {
       if (this.ticking || this.appForeground === false) { return }
       let current = this.timerConfigs.get(id)
       if (current === undefined) { return }
+      // Do not queue a tick while an IME composition is active: keep its elapsed time for the next deliverable tick.
+      for (let edit of this.fieldEdits.values()) {
+        if (edit.composing) { return }
+      }
+      // Fast tickers are frame-like. Let the 400-ms field debounce finish rather than committing on every tick;
+      // timerLastFire stays unchanged, so the next delivered tick carries the elapsed time accumulated while typing.
+      if (current.interval < SLOW_TICK_MS && this.fieldEdits.size > 0) { return }
       let last = this.timerLastFire.get(id)
       let now = Date.now()
       let elapsed = last !== undefined ? now - (last as number) : safe
       this.timerLastFire.set(id, now)
       this.ticking = true
-      this.dispatch(current.action, new VeraNumberValue(Math.round(elapsed)))
-      this.ticking = false
+      try {
+        let payload = new VeraNumberValue(Math.round(elapsed))
+        if (current.interval >= SLOW_TICK_MS) {
+          this.dispatchFieldAction(current.action, payload)
+        } else {
+          this.dispatch(current.action, payload)
+        }
+      } finally {
+        this.ticking = false
+      }
     }, safe)
     this.timers.set(id, handle)
   }
@@ -945,6 +1010,8 @@ export struct VeraPreview {
   }
 
   aboutToDisappear(): void {
+    this.flushFields()
+    if (this.controller !== null) { this.controller!.detach(this.captureFields) }
     // Without this the tickers -- and the VM they drive -- outlive the screen.
     this.disposed = true
     this.invalidateEffects()
@@ -1031,6 +1098,8 @@ export struct VeraPreview {
   private renderView(paint: boolean = true): void {
     if (this.vm === null || this.currentState === null) { return }
     this.lastViewAt = Date.now()
+    this.renderingDepth++
+    let rendered = false
     try {
       // view is re-run on every change, so an intent call from there would
       // start navigation on every repaint. The host refuses one while this is
@@ -1046,6 +1115,9 @@ export struct VeraPreview {
           ' children=' + (root !== null ? root!.children.length.toString() : '0'))
       }
       this.reconcileTheme(root)
+      // Invalidate all prior membership stamps before mutating the live tree.
+      // If reconciliation fails partway through, stale node references fail closed.
+      this.liveGeneration++
       if (root === null) {
         this.liveRoot = null
         this.hasRoot = false
@@ -1055,7 +1127,10 @@ export struct VeraPreview {
       } else {
         reconcile(this.liveRoot!, root!)
       }
-      if (this.liveRoot !== null) { markIconRoom(this.liveRoot!) }
+      if (this.liveRoot !== null) {
+        this.markLiveNodeGeneration(this.liveRoot!)
+        markIconRoom(this.liveRoot!)
+      }
       this.reconcileFields()
       this.revision += 1
       this.reconcileTimers(this.previewOnly ? null : root)
@@ -1063,9 +1138,13 @@ export struct VeraPreview {
       this.reconcileMotion()
       this.reconcileBackHandler(root)
       this.reconcileSurfaces(paint)
+      rendered = true
     } catch (e) {
       this.error = 'View error: ' + (e as Error).message
+    } finally {
+      this.renderingDepth--
     }
+    if (rendered) { this.scheduleFieldActions() }
   }
 
   /**
@@ -1088,7 +1167,10 @@ export struct VeraPreview {
 
   /** Every text field from here down may show its check now; see LiveNode.touched. */
   private touchFields(node: LiveNode): void {
-    if (node.kind === 'field') { node.touched = true }
+    if (node.kind === 'field') {
+      node.touched = true
+      this.refreshFieldIssue(node)
+    }
     for (let child of node.children) { this.touchFields(child) }
   }
 
@@ -1098,14 +1180,24 @@ export struct VeraPreview {
    * it, which is what touched was for (review of #46).
    */
   private touchFormOf(button: LiveNode): void {
-    if (this.liveRoot === null) { return }
+    let form = this.fieldFormOf(button)
+    if (form !== null) { this.touchFields(form!) }
+  }
+
+  private fieldFormOf(node: LiveNode): LiveNode | null {
+    if (this.liveRoot === null) { return null }
     let path: LiveNode[] = []
-    if (!this.pathTo(this.liveRoot!, button, path)) { return }
+    if (!this.pathTo(this.liveRoot!, node, path)) { return null }
     for (let i = path.length - 2; i >= 0; i--) {
-      if (this.hasField(path[i])) { this.touchFields(path[i]); return }
-      // A section or a card is as far as a form goes: a Start in its own section has none, though the screen around it has fields.
-      if (FORM_BOUNDS.indexOf(path[i].kind) >= 0) { return }
+      if (this.hasField(path[i])) { return path[i] }
+      if (FORM_BOUNDS.indexOf(path[i].kind) >= 0) { return path[i] }
     }
+    return null
+  }
+
+  private collectFieldDependencies(node: LiveNode, fields: LiveNode[]): void {
+    if (node.kind === 'field') { fields.push(node) }
+    for (let child of node.children) { this.collectFieldDependencies(child, fields) }
   }
 
   /** The nodes from `node` down to `target`, both included, into `path`; false when `target` is not under `node`. */
@@ -1176,11 +1268,17 @@ export struct VeraPreview {
    */
   private surfaceFrame(): void {
     if (this.disposed || this.pageHidden || this.framing || this.vm === null || this.currentState === null) { return }
+    // Do not advance the VM while an IME composition is in progress; resume with a bounded elapsed value afterward.
+    for (let edit of this.fieldEdits.values()) {
+      if (edit.composing) { return }
+    }
     let now = Date.now()
     let elapsed = this.lastFrameAt > 0 ? Math.min(SURFACE_MAX_ELAPSED_MS, Math.max(0, now - this.lastFrameAt)) : 16
     this.lastFrameAt = now
     this.framing = true
     try {
+      // Frames run at display cadence and intentionally use the last committed VM state: flushing debounced text here
+      // would turn every frame into a field commit. The periodic save below waits until no text draft is pending.
       // A frame handler is a handler, as a ticker's is: it may ask the phone for something when its time comes (a
       // vibration on each breath, a sound when the ball lands). Drawing may not.
       if (this.host !== null) { this.host!.effectsAllowed = true }
@@ -1198,7 +1296,9 @@ export struct VeraPreview {
         this.frameSplit[3] += Date.now() - viewAt
       }
       this.countFrame(now, Date.now() - now)
-      if (now - this.lastSurfaceSave >= SURFACE_SAVE_MS) {
+      // Surface frames are high-frequency and intentionally do not flush debounced text edits. Defer the periodic
+      // snapshot/save while a draft is pending; the field commit will persist the resulting state after it is delivered.
+      if (now - this.lastSurfaceSave >= SURFACE_SAVE_MS && this.fieldEdits.size === 0) {
         this.lastSurfaceSave = now
         this.persistState()
         this.notifyStateSnapshot()
@@ -1310,12 +1410,15 @@ export struct VeraPreview {
     if (phase === 'down') {
       let previous = this.surfaceInputs.get(node)
       if (previous !== undefined) {
-        for (let touch of event.changedTouches) { previous.delete(touch.id) }
+        for (let touch of event.changedTouches) {
+          let input = previous.get(touch.id)
+          if (input !== undefined && !input.ended) { previous.delete(touch.id) }
+        }
         if (previous.size === 0) { this.surfaceInputs.delete(node) }
       }
       if (!this.flushUserFields()) { return }
     }
-    if (this.liveRoot === null || !this.containsField(this.liveRoot!, node) ||
+    if (this.liveRoot === null || !this.isLiveNode(node) ||
         node.kind !== 'surface' || node.value.length === 0) {
       this.surfaceInputs.delete(node)
       return
@@ -1333,20 +1436,43 @@ export struct VeraPreview {
     }
     for (let touch of event.changedTouches) {
       if (this.surfaceInputs.get(node) !== inputs) { break }
-      if (phase === 'down') { inputs.set(touch.id, down) }
+      if (phase === 'down') {
+        let previous = inputs.get(touch.id)
+        if (previous !== undefined && previous.ended) { continue }
+        let accepted = new SurfaceInput(node, down.generation)
+        accepted.action = down.action
+        accepted.nodeGeneration = down.nodeGeneration
+        inputs.set(touch.id, accepted)
+      }
       let input = inputs.get(touch.id)
-      if (input === undefined) { continue }
+      if (input === undefined || input.ended) { continue }
+      if (phase === 'move' && !this.flushUserFields()) { continue }
+      if (this.surfaceInputs.get(node) !== inputs || inputs.get(touch.id) !== input) { continue }
       if (input.generation !== this.effectGeneration || this.disposed || this.previewOnly ||
-          this.liveRoot === null || !this.containsField(this.liveRoot!, node) || node.kind !== 'surface' ||
+          this.liveRoot === null || !this.isLiveNode(node) || node.kind !== 'surface' ||
           node.value !== input.action || node.fieldGeneration !== input.nodeGeneration) {
         inputs.delete(touch.id)
         continue
       }
-      if (phase === 'up' || phase === 'cancel') { inputs.delete(touch.id) }
-      let fit = gfxFit(box.width, box.height, node.minimum, node.maximum)
+      let currentBox = this.surfaces.get(node)
+      if (currentBox === undefined || currentBox.width <= 0 || currentBox.height <= 0) {
+        inputs.delete(touch.id)
+        continue
+      }
+      let fit = gfxFit(currentBox.width, currentBox.height, node.minimum, node.maximum)
       let at = gfxToSurface(fit, touch.x, touch.y)
       let value = pointerValue(phase, touch.id, at[0], at[1])
-      if (phase === 'move') { this.surfaceMove(input.action, value) } else { this.dispatch(input.action, value) }
+      if (phase === 'up' || phase === 'cancel') {
+        input.ended = true
+        let next = this.captureFieldAction(input.action, value, true, node)
+        next.surfaceInput = input
+        next.surfaceId = touch.id
+        this.enqueueFieldAction(next)
+      } else if (phase === 'move') {
+        this.surfaceMove(input.action, value)
+      } else {
+        this.dispatch(input.action, value)
+      }
     }
     if (inputs.size === 0 && this.surfaceInputs.get(node) === inputs) { this.surfaceInputs.delete(node) }
   }
@@ -1410,27 +1536,110 @@ export struct VeraPreview {
     return this.theme.resolved
   }
 
-  private handleAction(action: string, value: number): void {
-    this.dispatchFieldAction(action, new VeraNumberValue(value))
+  private handleAction(action: string, value: number, node: LiveNode | null = null): void {
+    this.dispatchFieldAction(action, new VeraNumberValue(value), true, node)
   }
 
+  /**
+   * A field commit dispatches directly, not through the deferred-action queue: it must precede any
+   * control action already queued (a pending text commit comes first), and it deliberately does not
+   * flush sibling fields, whose debounce deadlines are independent. A handler that reads another field
+   * sees its last committed value; control actions, surface gestures and slow tickers flush all ready
+   * edits before they dispatch.
+   */
   private handleStringAction(action: string, value: string): void {
     this.dispatch(action, new VeraStringValue(value))
   }
 
-  private handleBoolAction(action: string, value: boolean): void {
-    this.dispatchFieldAction(action, new VeraBooleanValue(value))
+  private handleBoolAction(action: string, value: boolean, node: LiveNode | null = null): void {
+    this.dispatchFieldAction(action, new VeraBooleanValue(value), true, node)
+  }
+
+  private fieldActionState(node: LiveNode): string {
+    if (node.kind === 'slider') { return JSON.stringify([node.minimum, node.maximum]) }
+    if (node.kind === 'toggle' || node.kind === 'checkbox') { return '' }
+    if (node.kind === 'numberfield' || node.kind === 'timefield' || node.kind === 'datefield') {
+      return JSON.stringify([node.label, node.numberValue, node.minimum, node.maximum, node.step])
+    }
+    if (node.kind === 'select' || node.kind === 'tabs') { return JSON.stringify([node.label, node.options]) }
+    return JSON.stringify([node.eventValue, node.text, node.label])
+  }
+
+  private fieldActionCurrent(next: FieldAction): boolean {
+    if (next.generation !== this.effectGeneration || this.disposed || this.previewOnly) { return false }
+    for (let i = 0; i < next.dependencies.length; i++) {
+      if (next.dependencies[i].fieldCancellation !== next.dependencyCancellations[i]) { return false }
+    }
+    if (next.node === null) { return true }
+    let node = next.node!
+    if (next.surfaceInput !== null) {
+      let input = next.surfaceInput!
+      let inputs = this.surfaceInputs.get(node)
+      let box = this.surfaces.get(node)
+      return this.liveRoot !== null && this.isLiveNode(node) && node.kind === 'surface' &&
+        node.value === next.action && node.fieldGeneration === input.nodeGeneration &&
+        input.generation === this.effectGeneration && inputs !== undefined &&
+        inputs.get(next.surfaceId) === input && input.ended &&
+        box !== undefined && box.width > 0 && box.height > 0
+    }
+    return this.liveRoot !== null && this.isLiveNode(node) &&
+      node.kind === next.nodeKind && node.enabled && node.action === next.action &&
+      node.fieldGeneration === next.nodeGeneration && this.fieldActionState(node) === next.nodeState
+  }
+
+  private releaseSurfaceAction(next: FieldAction): void {
+    if (next.surfaceInput === null || next.node === null) { return }
+    let inputs = this.surfaceInputs.get(next.node!)
+    if (inputs === undefined || inputs.get(next.surfaceId) !== next.surfaceInput) { return }
+    inputs.delete(next.surfaceId)
+    if (inputs.size === 0) { this.surfaceInputs.delete(next.node!) }
+  }
+
+  private scheduleFieldActions(): void {
+    if (!this.fieldActionsNeedResume || this.renderingDepth > 0 || this.fieldActions.length === 0) { return }
+    this.fieldActionsNeedResume = false
+    let generation = this.effectGeneration
+    Promise.resolve().then(() => {
+      if (generation !== this.effectGeneration || this.disposed || this.previewOnly || this.error.length > 0) { return }
+      this.resumeFieldActions()
+    })
+  }
+
+  private captureFieldAction(action: string, payload: RuntimeValue,
+    persist: boolean = true, node: LiveNode | null = null): FieldAction {
+    let next = new FieldAction(action, payload, this.effectGeneration, persist, node)
+    if (node !== null) {
+      next.nodeState = this.fieldActionState(node!)
+      let form = this.fieldFormOf(node!)
+      if (form !== null) {
+        let fields: LiveNode[] = []
+        this.collectFieldDependencies(form!, fields)
+        next.dependencies = fields
+        next.unknownDependencies = false
+      }
+    }
+    if (next.unknownDependencies && this.liveRoot !== null) {
+      this.collectFieldDependencies(this.liveRoot!, next.dependencies)
+    }
+    next.dependencyCancellations = next.dependencies.map((field: LiveNode): number => field.fieldCancellation)
+    return next
   }
 
   private dispatchFieldAction(action: string, payload: RuntimeValue,
     persist: boolean = true, node: LiveNode | null = null): void {
     if (this.disposed || this.previewOnly) { return }
-    let next = new FieldAction(action, payload, this.effectGeneration, persist, node)
+    this.enqueueFieldAction(this.captureFieldAction(action, payload, persist, node))
+  }
+
+  private enqueueFieldAction(next: FieldAction): void {
+    if (!this.fieldActionCurrent(next)) { this.releaseSurfaceAction(next); return }
+    let node = next.node
+    let action = next.action
     let last = this.fieldActions.length > 0
       ? this.fieldActions[this.fieldActions.length - 1] : undefined
-    if (node !== null && last !== undefined && last.node === node &&
+    if (node !== null && node!.kind === 'slider' && last !== undefined && last.node === node &&
         last.action === action && last.generation === next.generation &&
-        last.nodeGeneration === next.nodeGeneration && !last.persist) {
+        last.nodeGeneration === next.nodeGeneration && last.nodeState === next.nodeState && !last.persist) {
       this.fieldActions[this.fieldActions.length - 1] = next
     } else {
       this.fieldActions.push(next)
@@ -1439,6 +1648,10 @@ export struct VeraPreview {
   }
 
   private resumeFieldActions(): void {
+    if (this.renderingDepth > 0) {
+      this.fieldActionsNeedResume = true
+      return
+    }
     if (this.resumingFieldActions) { return }
     this.resumingFieldActions = true
     try {
@@ -1451,15 +1664,9 @@ export struct VeraPreview {
         }
         if (this.fieldActions.length === 0) { return }
         let next = this.fieldActions.shift() as FieldAction
-        if (next.generation !== this.effectGeneration) { continue }
-        if (next.node !== null) {
-          let node = next.node!
-          if (this.liveRoot === null || !this.containsField(this.liveRoot!, node) ||
-              node.kind !== 'slider' || !node.enabled || node.action !== next.action ||
-              node.fieldGeneration !== next.nodeGeneration) {
-            continue
-          }
-        }
+        let current = this.fieldActionCurrent(next)
+        this.releaseSurfaceAction(next)
+        if (!current) { continue }
         this.dispatch(next.action, next.payload, next.persist)
       }
     } finally {
@@ -1637,7 +1844,7 @@ export struct VeraPreview {
     this.pending = null
     if (effect !== null) {
       console.info('VERA-CONSENT refused ' + this.consentTarget(effect!))
-      this.dispatch(effect!.resultHandler, new VeraStringValue('declined by the person'))
+      this.dispatchFieldAction(effect!.resultHandler, new VeraStringValue('declined by the person'))
     }
     this.runQueued()
   }
@@ -1662,10 +1869,10 @@ export struct VeraPreview {
     }
     answer.then((text: string) => {
       if (this.disposed || generation !== this.effectGeneration) { return }
-      this.dispatch(effect.resultHandler, new VeraStringValue(text))
+      this.dispatchFieldAction(effect.resultHandler, new VeraStringValue(text))
     }).catch((e: Error) => {
       if (this.disposed || generation !== this.effectGeneration) { return }
-      this.dispatch(effect.resultHandler, new VeraStringValue('error: ' + e.message))
+      this.dispatchFieldAction(effect.resultHandler, new VeraStringValue('error: ' + e.message))
     })
   }
 
@@ -1938,7 +2145,7 @@ export struct VeraPreview {
             .backgroundColor('#00000000')
             .fontColor(readableInk(toneEdge(this.t(), node.style, this.t().inkStrong)))
             .onClick(() => {
-              if (node.action.length > 0) { this.handleAction(node.action, node.eventValue) }
+              if (node.action.length > 0) { this.handleAction(node.action, node.eventValue, node) }
             })
         }
       }
@@ -2014,7 +2221,7 @@ export struct VeraPreview {
     let value = Math.round(parseFloat(typed))
     if (!isNaN(value) && node.action.length > 0) {
       value = Math.max(node.minimum, Math.min(node.maximum, value))
-      if (value !== node.numberValue) { this.handleAction(node.action, value) }
+      if (value !== node.numberValue) { this.handleAction(node.action, value, node) }
     }
     this.numberEpoch++
   }
@@ -2027,25 +2234,65 @@ export struct VeraPreview {
 
   private fieldCurrent(node: LiveNode, generation: number): boolean {
     return !this.disposed && !this.previewOnly && node.kind === 'field' && node.enabled &&
-      node.fieldGeneration === generation && this.liveRoot !== null && this.containsField(this.liveRoot!, node)
+      node.fieldGeneration === generation && this.liveRoot !== null && this.isLiveNode(node)
   }
 
-  private containsField(root: LiveNode, node: LiveNode): boolean {
-    if (root === node) { return true }
-    for (let child of root.children) { if (this.containsField(child, node)) { return true } }
-    return false
+  /** Stamp every node reachable from the current root with this render's membership epoch. */
+  private markLiveNodeGeneration(root: LiveNode): void {
+    let pending: LiveNode[] = [root]
+    while (pending.length > 0) {
+      let node = pending.pop()!
+      node.liveGeneration = this.liveGeneration
+      for (let child of node.children) { pending.push(child) }
+    }
+  }
+
+  /** O(1) membership check; removed nodes retain an older epoch and need no explicit cleanup. */
+  private isLiveNode(node: LiveNode): boolean {
+    return node.liveGeneration === this.liveGeneration
+   }
+
+  private recordFieldInput(node: LiveNode, value: string): void {
+    if (value !== node.value) {
+      node.typed = value
+      if (!node.touched) { node.touched = true }
+    }
+  }
+
+  private refreshFieldIssue(node: LiveNode): void {
+    let edit = this.fieldEdits.get(node)
+    let issue = node.touched && (edit === undefined || !edit.composing)
+      ? this.textFieldIssue(node, edit !== undefined ? edit.value : node.value) : ''
+    if (node.fieldIssue !== issue) { node.fieldIssue = issue }
+  }
+
+  private refreshFieldIssues(node: LiveNode): void {
+    if (node.kind === 'field') { this.refreshFieldIssue(node) }
+    for (let child of node.children) { this.refreshFieldIssues(child) }
   }
 
   private cancelField(node: LiveNode): void {
     let edit = this.fieldEdits.get(node)
     if (edit !== undefined && edit.timer >= 0) { clearTimeout(edit.timer) }
-    if (edit !== undefined && edit.composing) { this.fieldActions = [] }
+    if (edit !== undefined && edit.composing) {
+      node.fieldCancellation++
+      this.fieldActions = this.fieldActions.filter((next: FieldAction): boolean => {
+        let keep = !next.unknownDependencies && next.dependencies.indexOf(node) < 0
+        if (!keep) { this.releaseSurfaceAction(next) }
+        return keep
+      })
+      this.fieldActionsNeedResume = this.fieldActions.length > 0
+    }
     this.fieldEdits.delete(node)
+    if (node.kind === 'field') { this.refreshFieldIssue(node) }
   }
 
   private cancelFields(): void {
+    this.fieldInputs.clear()
+    this.fieldMenus.clear()
     this.surfaceInputs.clear()
     this.fieldActions = []
+    this.fieldActionsNeedResume = false
     for (let node of Array.from(this.fieldEdits.keys())) { this.cancelField(node) }
     let nodes: LiveNode[] = this.liveRoot !== null ? [this.liveRoot!] : []
     while (nodes.length > 0) {
@@ -2055,13 +2302,35 @@ export struct VeraPreview {
     }
   }
 
+  private fieldController(node: LiveNode, generation: number): TextInputController {
+    let input = this.fieldInputs.get(node)
+    if (input === undefined || input.generation !== generation) {
+      input = new FieldInput(generation)
+      this.fieldInputs.set(node, input)
+    }
+    return input.controller
+  }
+
+  private endFieldEditing(node: LiveNode, generation: number): void {
+    if (!this.fieldCurrent(node, generation)) { return }
+    let input = this.fieldInputs.get(node)
+    if (input === undefined || input.generation !== generation) { return }
+    this.finishField(node, generation, input.controller.getText())
+  }
+
   private reconcileFields(): void {
+    for (let node of Array.from(this.fieldInputs.keys())) {
+      let input = this.fieldInputs.get(node)!
+      if (!this.fieldCurrent(node, input.generation)) { this.fieldInputs.delete(node) }
+    }
     for (let node of Array.from(this.fieldEdits.keys())) {
       let edit = this.fieldEdits.get(node)!
       if (!this.fieldCurrent(node, edit.generation) || node.action !== edit.action || node.value !== edit.base) {
         this.cancelField(node)
       }
     }
+    if (this.liveRoot !== null) { this.refreshFieldIssues(this.liveRoot!) }
+    this.scheduleFieldActions()
   }
 
   private changeField(node: LiveNode, generation: number, value: string, composing: boolean): void {
@@ -2074,6 +2343,8 @@ export struct VeraPreview {
     if (edit.timer >= 0) { clearTimeout(edit.timer); edit.timer = -1 }
     edit.value = value
     edit.composing = composing
+    this.recordFieldInput(node, value)
+    this.refreshFieldIssue(node)
     edit.sequence++
     let sequence = edit.sequence
     if (composing) { return }
@@ -2126,18 +2397,25 @@ export struct VeraPreview {
     return true
   }
 
-  private finishField(node: LiveNode, generation: number): void {
+  private finishField(node: LiveNode, generation: number, value?: string): void {
     let edit = this.fieldEdits.get(node)
     if (edit === undefined || edit.generation !== generation) { return }
     if (!this.fieldCurrent(node, generation) || node.value !== edit.base) {
       this.cancelField(node)
       return
     }
+    if (value !== undefined) {
+      edit.value = value
+      edit.composing = false
+      this.recordFieldInput(node, value)
+      this.refreshFieldIssue(node)
+    }
     if (edit.composing) {
       edit.commitRequested = true
       return
     }
     this.commitField(node, generation)
+    this.resumeFieldActions()
   }
 
   /** The pane ui.Tabs shows: its selected child, kept inside the children there are. */
@@ -2541,14 +2819,26 @@ export struct VeraPreview {
   }
 
   /** ui.Select's options as the overlay bindMenu opens, one MenuElement each. */
+  private openFieldMenu(node: LiveNode): void {
+    let actions: FieldAction[] = []
+    for (let i = 0; i < node.options.length; i++) {
+      actions.push(this.captureFieldAction(node.action, new VeraNumberValue(i), true, node))
+    }
+    this.fieldMenus.set(node, actions)
+  }
+
   private selectMenuItems(node: LiveNode): MenuElement[] {
     let items: MenuElement[] = []
+    let state = this.fieldActionState(node)
     for (let i = 0; i < node.options.length; i++) {
       let index = i
       items.push({
         value: node.options[i],
         action: () => {
-          if (node.action.length > 0) { this.handleAction(node.action, index) }
+          let actions = this.fieldMenus.get(node)
+          if (actions === undefined || index >= actions.length) { return }
+          let next = actions[index]
+          if (next.action.length > 0 && next.nodeState === state) { this.enqueueFieldAction(next) }
         }
       })
     }
@@ -3109,7 +3399,7 @@ export struct VeraPreview {
               .fontColor(readableInk(toneEdge(this.t(), node.style, this.t().primary)))
               .margin({ top: this.t().gapTight })
               .onClick(() => {
-                if (node.action.length > 0) { this.handleAction(node.action, node.eventValue) }
+                if (node.action.length > 0) { this.handleAction(node.action, node.eventValue, node) }
               })
           }
         }
@@ -3158,7 +3448,7 @@ export struct VeraPreview {
             .backgroundColor(this.t().primary)
             .fontColor(this.t().onPrimary)
             .onClick(() => {
-              if (node.action.length > 0) { this.handleAction(node.action, node.eventValue) }
+              if (node.action.length > 0) { this.handleAction(node.action, node.eventValue, node) }
             })
         }
       }
@@ -3381,7 +3671,7 @@ export struct VeraPreview {
               if (node.action.length === 0) { return }
               // A step that does not fit stops at the limit: 3 with a step of 5 and a minimum of 0 goes to 0.
               let next = Math.max(node.minimum, node.numberValue - this.numberStep(node))
-              if (next < node.numberValue) { this.handleAction(node.action, next) }
+              if (next < node.numberValue) { this.handleAction(node.action, next, node) }
             })
           // The value is typed as well as stepped: tap it and write 60, rather than tapping + sixty times. It is taken when the
           // person is done editing and kept inside the field's own limits.
@@ -3415,7 +3705,7 @@ export struct VeraPreview {
             .onClick(() => {
               if (node.action.length === 0) { return }
               let next = Math.min(node.maximum, node.numberValue + this.numberStep(node))
-              if (next > node.numberValue) { this.handleAction(node.action, next) }
+              if (next > node.numberValue) { this.handleAction(node.action, next, node) }
             })
         }
         .width('100%')
@@ -3445,13 +3735,15 @@ export struct VeraPreview {
             if (node.action.length === 0) { return }
             // The phone's own picker, so the value is always a real time and
             // the program never has to validate one.
+            let next = this.captureFieldAction(node.action, new VeraNumberValue(0), true, node)
             this.getUIContext().showTimePickerDialog({
               selected: this.minutesToDate(node.numberValue),
               useMilitaryTime: true,
               onAccept: (result: TimePickerResult) => {
                 let h = result.hour !== undefined ? result.hour as number : 0
                 let m = result.minute !== undefined ? result.minute as number : 0
-                this.handleAction(node.action, h * 60 + m)
+                next.payload = new VeraNumberValue(h * 60 + m)
+                this.enqueueFieldAction(next)
               }
             })
           })
@@ -3474,10 +3766,12 @@ export struct VeraPreview {
           .onClick(() => {
             if (node.action.length === 0) { return }
             // The phone's own calendar, as TimeField uses its clock dialog.
+            let next = this.captureFieldAction(node.action, new VeraNumberValue(0), true, node)
             this.getUIContext().showDatePickerDialog({
               selected: this.dayToDate(node.numberValue),
               onDateAccept: (value: Date) => {
-                this.handleAction(node.action, this.dateToDay(value))
+                next.payload = new VeraNumberValue(this.dateToDay(value))
+                this.enqueueFieldAction(next)
               }
             })
           })
@@ -3525,7 +3819,7 @@ export struct VeraPreview {
       .opacity(this.rowOpacity(node))
       .onClick(() => {
         if (node.action.length > 0 && node.enabled) {
-          this.handleAction(node.action, node.eventValue)
+          this.handleAction(node.action, node.eventValue, node)
         }
       })
     } else if (node.kind === 'actionbar' && parentKind === 'listgroup') {
@@ -3676,7 +3970,7 @@ export struct VeraPreview {
       .opacity(this.rowOpacity(node))
       .onClick(() => {
         if (node.action.length > 0 && node.enabled) {
-          this.handleAction(node.action, node.eventValue)
+          this.handleAction(node.action, node.eventValue, node)
         }
       })
     } else if (node.kind === 'kvgroup') {
@@ -3797,7 +4091,7 @@ export struct VeraPreview {
       .accessibilityText(node.label)
       .onClick(() => {
         if (node.action.length > 0 && node.enabled) {
-          this.handleAction(node.action, node.eventValue)
+          this.handleAction(node.action, node.eventValue, node)
         }
       })
     } else if (node.kind === 'badge') {
@@ -3855,7 +4149,7 @@ export struct VeraPreview {
           if (node.action.length > 0 && node.enabled) {
             // A button press is the attempt after which an empty required field of its own form is worth pointing out.
             this.touchFormOf(node)
-            this.handleAction(node.action, node.eventValue)
+            this.handleAction(node.action, node.eventValue, node)
           }
         })
     } else if (node.kind === 'cell') {
@@ -3879,7 +4173,7 @@ export struct VeraPreview {
       .borderRadius(this.t().radiusControl)
       .onClick(() => {
         if (node.action.length > 0 && node.enabled) {
-          this.handleAction(node.action, node.eventValue)
+          this.handleAction(node.action, node.eventValue, node)
         }
       })
     } else if (node.kind === 'spacer') {
@@ -3899,7 +4193,8 @@ export struct VeraPreview {
         // VM and into .text() still fights whoever is typing.
         // The label is already drawn above the box, so it is not repeated inside it as a placeholder.
         ForEach([node.fieldGeneration], (generation: number) => {
-          TextInput({ placeholder: node.label.length > 0 ? '' : ' ', text: node.fieldValue })
+          TextInput({ placeholder: node.label.length > 0 ? '' : ' ', text: node.fieldValue,
+            controller: this.fieldController(node, generation) })
             .fontSize(this.t().sizeBody)
             .fontFamily(this.textFamily())
             .fontColor(this.t().ink)
@@ -3913,18 +4208,13 @@ export struct VeraPreview {
             .enabled(node.enabled)
             .type(this.textFieldKeyboard(node))
             .onChange((v: string, previewText?: PreviewText) => {
-            // ArkUI also calls this when the program itself sets the text (a form cleared after Add): that echo is not typing.
-            if (v !== node.value) {
-              node.typed = v
-              node.touched = true
-            }
               this.changeField(node, generation, v, previewText !== undefined && previewText.value.length > 0)
             })
-            .onSubmit(() => { this.finishField(node, generation) })
-            .onEditChange((editing: boolean) => { if (!editing) { this.finishField(node, generation) } })
+            .onSubmit((_key: EnterKeyType, event: SubmitEvent) => { this.finishField(node, generation, event.text) })
+            .onEditChange((editing: boolean) => { if (!editing) { this.endFieldEditing(node, generation) } })
         }, (generation: number) => generation.toString())
-        if (node.touched && this.textFieldIssue(node).length > 0) {
-          Text(this.textFieldIssue(node)).fontSize(this.t().sizeCaption).fontFamily(this.textFamily()).fontColor(this.t().dangerInk)
+        if (node.fieldIssue.length > 0) {
+          Text(node.fieldIssue).fontSize(this.t().sizeCaption).fontFamily(this.textFamily()).fontColor(this.t().dangerInk)
             .width('100%')
         }
       }
@@ -3939,7 +4229,7 @@ export struct VeraPreview {
             .enabled(node.enabled)
             .selectedColor(this.t().primary)
             .onChange((on: boolean) => {
-              if (node.action.length > 0) { this.handleBoolAction(node.action, on) }
+              if (node.action.length > 0) { this.handleBoolAction(node.action, on, node) }
             })
         } else {
           Checkbox()
@@ -3947,7 +4237,7 @@ export struct VeraPreview {
             .enabled(node.enabled)
             .selectedColor(this.t().primary)
             .onChange((on: boolean) => {
-              if (node.action.length > 0) { this.handleBoolAction(node.action, on) }
+              if (node.action.length > 0) { this.handleBoolAction(node.action, on, node) }
             })
         }
       }
@@ -4012,7 +4302,10 @@ export struct VeraPreview {
         .border({ width: this.t().borderWidth, color: this.t().fieldLine })
         .opacity(node.enabled ? 1 : 0.5)
         .enabled(node.enabled)
-        .bindMenu(this.selectMenuItems(node))
+        .bindMenu(this.selectMenuItems(node), {
+          aboutToAppear: () => { this.openFieldMenu(node) },
+          onDisappear: () => { this.fieldMenus.delete(node) }
+        })
       }
       .width('100%')
       .padding({ top: this.t().gapTight, bottom: this.t().gapTight })
@@ -4035,7 +4328,7 @@ export struct VeraPreview {
               .borderRadius(this.t().radiusControl)
               .backgroundColor(index === this.tabSelected(node) ? this.t().primary : this.t().fieldFill)
               .onClick(() => {
-                if (node.action.length > 0) { this.handleAction(node.action, index) }
+                if (node.action.length > 0) { this.handleAction(node.action, index, node) }
               })
           }, (label: string, index: number) => index.toString() + ':' + label)
         }
@@ -4130,7 +4423,7 @@ export struct VeraPreview {
       .opacity(this.rowOpacity(node))
       .onClick(() => {
         if (node.action.length > 0 && node.enabled) {
-          this.handleAction(node.action, node.eventValue)
+          this.handleAction(node.action, node.eventValue, node)
         }
       })
     } else if (node.kind === 'ticker') {

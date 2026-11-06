@@ -17,7 +17,7 @@ import { smokeRun } from '../vera/VeraSmoke'
 import { logMark, logStep, initTrace, trace, traceCompile } from '../vera/VeraTiming'
 import { deepseek, DEEPSEEK_GENERATION_MAX_TOKENS, SideCall } from '../vera/DeepSeekEngine'
 import { OperationController, throwIfCancelled } from '../vera/OperationCancellation'
-import { VeraPreview } from '../components/VeraPreview'
+import { VeraPreview, VeraPreviewController } from '../components/VeraPreview'
 import { settings } from '../vera/SettingsStore'
 import { startUsbNet, stopUsbNet, readUsbNetStatus, usbNetIsOn } from '../vera/UsbNet'
 import { resetLogprobsProbe } from '../vera/JevProxy'
@@ -339,6 +339,7 @@ export struct GeneratePage {
   @State @Watch('showCorner') compiledVbc2: string = ''
   /** The running preview's state as it last changed; not @State, as writing it must not redraw the page. */
   private liveState: string = ''
+  private previewController: VeraPreviewController = new VeraPreviewController()
   /** What the next compiled program starts from (VeraPreview.seedState): the state at the moment a refine was asked for. */
   @State carriedState: string = ''
   /** The run's own line ("Ready in 8.3 s") over a new app just opened full screen, for a few seconds. */
@@ -610,7 +611,14 @@ export struct GeneratePage {
     this.scrollDown()
   }
 
+  private previewSnapshot(controller: VeraPreviewController): (encoded: string) => void {
+    return (encoded: string): void => {
+      if (!this.disposed && this.previewController === controller) { this.liveState = encoded }
+    }
+  }
+
   private startNew(): void {
+    this.previewController = new VeraPreviewController()
     this.savedVbc2 = ''
     this.historyOpen = false
     this.liveState = ''
@@ -1896,6 +1904,7 @@ export struct GeneratePage {
     // What the person typed is what the widget shows; the instructions for a widget are the system prompt's (widgetRefinementPrompt).
     if (this.makeWidget) { ask = WIDGET_ASK + ask }
     // What the person typed into the preview is kept through the refine.
+    if (!this.previewController.flushAndSnapshot()) { return }
     this.carriedState = this.liveState
     // A change that only adds, removes, replaces or moves a block of a composed screen is made on its
     // record, with no model rewrite; anything else, and any step that does not hold, refines as before.
@@ -3085,6 +3094,7 @@ export struct GeneratePage {
   /** What was typed into the program goes with it to the other view, which draws a program of its own. */
   private setFullscreen(on: boolean): void {
     this.cornerHidden = false
+    if (!this.previewController.flushAndSnapshot()) { return }
     this.carriedState = this.liveState
     this.tab = TAB_PREVIEW
     this.composerHidden = false
@@ -3100,9 +3110,10 @@ export struct GeneratePage {
     Column() {
       Stack({ alignContent: Alignment.TopEnd }) {
         // With the box folded, the round button lies over the bottom corner: the program gets room to scroll clear of it.
-        VeraPreview({ vbc2: this.compiledVbc2, seedState: this.carriedState, destinationHidden: this.destinationHidden,
+        VeraPreview({ controller: this.previewController,
+          vbc2: this.compiledVbc2, seedState: this.carriedState, destinationHidden: this.destinationHidden,
           bottomRoom: this.composerHidden ? FOLD_ROOM : 0,
-          onStateSnapshot: (encoded: string): void => { if (!this.disposed) { this.liveState = encoded } },
+          onStateSnapshot: this.previewSnapshot(this.previewController),
           // The two round buttons lie over the program's corner: on the way down they would cover its rows (a stop's
           // Navigate button, measured on Istanbul layover), so they step aside and come back on the way up.
           onReadingDown: (down: boolean): void => { animateTo({ duration: 180 }, () => { this.cornerHidden = down }) } })
@@ -3236,8 +3247,9 @@ export struct GeneratePage {
 
       Stack() {
         // Kept built under the other tabs, hidden, so what was typed into the running program is still there on return.
-        VeraPreview({ vbc2: this.compiledVbc2, seedState: this.carriedState, destinationHidden: this.destinationHidden,
-          onStateSnapshot: (encoded: string): void => { if (!this.disposed) { this.liveState = encoded } } })
+        VeraPreview({ controller: this.previewController,
+          vbc2: this.compiledVbc2, seedState: this.carriedState, destinationHidden: this.destinationHidden,
+          onStateSnapshot: this.previewSnapshot(this.previewController) })
           .width('100%')
           .height('100%')
           .visibility(this.tab === TAB_PREVIEW ? Visibility.Visible : Visibility.Hidden)
@@ -3467,6 +3479,7 @@ export struct GeneratePage {
    * change on the version before it, or a new app when it was the first request.
    */
   private restoreBase(base: RequestBase): void {
+    if (base.compiledSource.length === 0) { this.previewController = new VeraPreviewController() }
     this.compiledSource = base.compiledSource
     this.compiledVbc2 = base.compiledVbc2
     this.generatedSource = base.compiledSource

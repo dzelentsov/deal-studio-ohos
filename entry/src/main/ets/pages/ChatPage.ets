@@ -1,6 +1,6 @@
 import { KeyboardAvoidMode, SymbolGlyphModifier } from '@kit.ArkUI'
 import { common } from '@kit.AbilityKit'
-import { VeraPreview } from '../components/VeraPreview'
+import { VeraPreview, VeraPreviewController } from '../components/VeraPreview'
 import { loadRawfileText } from '../vera/LlamaEngine'
 import { logMark, logStep, initTrace } from '../vera/VeraTiming'
 import { settings } from '../vera/SettingsStore'
@@ -65,6 +65,7 @@ class ChatMessage {
   update: boolean = false
   /** Latest renderer values are reference data, never a revision's initial state. */
   latestState: string = ''
+  previewController: VeraPreviewController = new VeraPreviewController()
   /** Fences callbacks from a VeraPreview instance after this page disappears. */
   previewGeneration: number = 0
   error: string = ''
@@ -349,7 +350,8 @@ struct MessageBubble {
       // renderer is handed the finished program in place instead of a new one
       // appearing where the picture was.
       if (this.msg.appState === APP_READY || (this.msg.appState === APP_BUILDING && this.msg.previewVbc2.length > 0)) {
-        VeraPreview({ previewOnly: this.msg.appState !== APP_READY, destinationHidden: this.destinationHidden,
+        VeraPreview({ controller: this.msg.previewController,
+          previewOnly: this.msg.appState !== APP_READY, destinationHidden: this.destinationHidden,
           vbc2: this.msg.appState === APP_READY ? this.msg.vbc2 : this.msg.previewVbc2, embedded: true,
           persistKey: this.chatId.length > 0 ? chats.stateKey(this.chatId, this.msg.id) : '',
           onStateSnapshot: this.snapshotHandler(this.msg.previewGeneration) })
@@ -821,6 +823,14 @@ export struct ChatPage {
     return turns
   }
 
+  private flushReferenceFields(): boolean {
+    for (let msg of this.messages) {
+      if (msg.role !== 'assistant' || msg.appState !== APP_READY) { continue }
+      if (!msg.previewController.flushAndSnapshot()) { return false }
+    }
+    return !this.disposed
+  }
+
   /** Capture scalar values before the reply or a queued build can change them. */
   private referenceSnapshots(): WidgetReference[] {
     let references: WidgetReference[] = []
@@ -888,6 +898,7 @@ export struct ChatPage {
   private async send(): Promise<void> {
     let text = this.draft.trim()
     if (this.disposed || text.length === 0 || this.busy) { return }
+    if (!this.flushReferenceFields()) { return }
     let run = this.createRun()
     let references = this.referenceSnapshots()
     this.draft = ''

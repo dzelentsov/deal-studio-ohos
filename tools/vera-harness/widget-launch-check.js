@@ -14,10 +14,6 @@ const compiled = ts.transpileModule(source, {
 });
 assert.deepEqual((compiled.diagnostics || []).filter(d => d.category === ts.DiagnosticCategory.Error), [],
   'EntryAbility must transpile without syntax errors');
-const widget = fs.readFileSync(path.join(sourceRoot, 'widget/pages/WidgetCard.ets'), 'utf8');
-assert.match(widget, /'action': 'router'/);
-assert.match(widget, /'abilityName': 'EntryAbility'/);
-assert.match(widget, /'params':\s*\{\s*'projectId': project\['id'\],\s*'veraRun': '1'\s*\}/);
 
 const project = { id: 'project-1' };
 const runnable = { id: 'version-2', vbc2: 'fixture-bytecode' };
@@ -203,6 +199,117 @@ function assertCommit(f, stage, paths, isolated, normalFullScreen = false) {
   assert.equal(f.ability.pendingRoute, null);
   assert.deepEqual(f.errors, []);
 }
+function extractMethods(source, names, state, dependencies = {}) {
+  const methods = names.map(name => {
+    const match = source.match(new RegExp('^  (?:private )?(?:async )?' + name + '\\([^\\n]*\\)[^{]*\\{[\\s\\S]*?^  \\}', 'm'));
+    assert(match, name + ' must exist');
+    return match[0];
+  });
+  const compiled = ts.transpileModule('class ComponentMethods {\n' + methods.join('\n') + '\n}', {
+    compilerOptions: { target: ts.ScriptTarget.ES2020 }, reportDiagnostics: true
+  });
+  assert.deepEqual((compiled.diagnostics || []).filter(d => d.category === ts.DiagnosticCategory.Error), []);
+  const prototype = new Function(...Object.keys(dependencies), compiled.outputText + '\nreturn ComponentMethods.prototype;')
+    (...Object.values(dependencies));
+  for (const name of names) { state[name] = prototype[name].bind(state); }
+}
+
+function nativeControl(source, marker, state, scope = {}) {
+  const start = source.indexOf(marker);
+  assert(start >= 0, marker + ' must exist');
+  const parsed = ts.createSourceFile('NativeControl.ts', source.slice(start), ts.ScriptTarget.ES2020, true);
+  const statement = parsed.statements[0];
+  assert(ts.isExpressionStatement(statement), marker + ' must start a native control chain');
+  const control = {};
+  let expression = statement.expression;
+  while (ts.isCallExpression(expression) && ts.isPropertyAccessExpression(expression.expression)) {
+    const name = expression.expression.name.text;
+    if (['onChange', 'onEditChange', 'onSubmit', 'onClick', 'enabled'].includes(name)) {
+      assert.equal(expression.arguments.length, 1);
+      const compiled = ts.transpileModule('function value() { return (' + expression.arguments[0].getText(parsed) + '); }', {
+        compilerOptions: { target: ts.ScriptTarget.ES2020 }, reportDiagnostics: true
+      });
+      assert.deepEqual((compiled.diagnostics || []).filter(d => d.category === ts.DiagnosticCategory.Error), []);
+      const value = new Function(...Object.keys(scope), compiled.outputText + '\nreturn value;')(...Object.values(scope));
+      Object.defineProperty(control, name, { get: () => value.call(state) });
+    }
+    expression = expression.expression.expression;
+  }
+  assert(ts.isCallExpression(expression) && ts.isIdentifier(expression.expression), marker + ' must be a native control');
+  return control;
+}
+
+function projectModalFixture() {
+  const source = fs.readFileSync(path.join(sourceRoot, 'pages/ProjectPage.ets'), 'utf8');
+  const events = [];
+  const nativeInput = { text: '', reads: 0, getText() { this.reads++; return this.text; } };
+  const context = { filesDir: '/fixture/files' };
+  const state = {
+    pageVisible: true, project: { name: 'Original', icon: 'icon' }, projectId: 'project-1', versions: [],
+    getUIContext: () => ({ getHostContext: () => context }),
+    showProjectMessage(message) { events.push(['message', message]); },
+    activePanel: '', renameText: 'Old draft', renameComposing: false, renameInputController: nativeInput,
+    viewedSource: '', viewedPrompt: '', viewedVersionNumber: 0,
+    viewedMetricsVersion: null, viewedMetricsNumber: 0, shortcutRefreshGeneration: 0,
+    reload() { events.push(['reload']); },
+    pathStack: { pop() { assert.fail('closing a dialog must not pop the page'); } }
+  };
+  const store = { updateProject(...args) { events.push(['rename', ...args]); } };
+  const refresh = () => events.push(['refresh']);
+  const renameGate = deferred();
+  let shortcutStatus = 'success';
+  const projectOperations = { async renameShortcut(getContext, id) {
+    assert.equal(getContext(), context, 'shortcut rename must use the page host context');
+    events.push(['shortcut', id]);
+    await renameGate.promise;
+    return shortcutStatus;
+  } };
+  extractMethods(source, ['clearPanels', 'closePanels', 'handleBack', 'viewSource', 'viewMetrics',
+    'openRename', 'openIconPicker', 'setIcon', 'changeRename', 'finishRename', 'submitRename', 'doRename',
+    'destinationHidden', 'aboutToDisappear'], state, {
+    store, refreshForms: refresh, ProjectShortcutState: { Unknown: 'unknown' }, projectOperations,
+    ProjectOperationStatus: { Failed: 'failed' }
+  });
+  const cancellations = [];
+  for (const panel of ['source', 'metrics', 'rename', 'icon']) {
+    const controller = source.match(new RegExp('private ' + panel + 'Controller:[\\s\\S]*?new CustomDialogController\\(\\{([\\s\\S]*?)^  \\}\\)', 'm'));
+    assert(controller, panel + ' controller must exist');
+    assert.match(controller[1], new RegExp('builder: ProjectPanelDialog\\(\\{ content: this\\.' + panel + 'Dialog \\}\\)'));
+    assert.match(controller[1], /isModal: true/);
+    assert.match(controller[1], /autoCancel: true/);
+    assert.match(controller[1], /maskColor: '#50000000'/);
+    const cancel = controller[1].match(/cancel: \(\) => \{([^}]+)\}/);
+    assert(cancel, panel + ' must clear selection on native Back and outside-tap dismissal');
+    cancellations.push(new Function(cancel[1]).bind(state));
+    state[panel + 'Controller'] = {
+      open() { events.push(['open', panel, state.activePanel]); },
+      close() { events.push(['close', panel]); }
+    };
+  }
+  return { source, state, events, nativeInput, renameGate, cancellations,
+    setShortcutStatus(value) { shortcutStatus = value; },
+    input: nativeControl(source, "TextInput({ placeholder: 'Project name'", state),
+    save: nativeControl(source, "Button('Save')", state),
+    cancel: nativeControl(source, "Button('Cancel')", state) };
+}
+
+function questionFixture() {
+  const source = fs.readFileSync(path.join(sourceRoot, 'components/QuestionCard.ets'), 'utf8');
+  const events = [];
+  const nativeInput = { text: '', reads: 0, getText() { this.reads++; return this.text; } };
+  const state = {
+    typed: '', composing: false, disposed: false, inputController: nativeInput,
+    options: ['One', 'Two'], fallback: 1,
+    onPick(index) { events.push(['pick', index]); },
+    onTyped(text) { events.push(['answer', text]); }
+  };
+  extractMethods(source, ['aboutToAppear', 'aboutToDisappear', 'changeAnswer', 'finishAnswer', 'submitAnswer', 'answer'], state);
+  return { source, state, events, nativeInput,
+    input: nativeControl(source, "TextInput({ placeholder: 'Or type your own answer'", state),
+    answer: nativeControl(source, "Button('Answer')", state),
+    option: index => nativeControl(source, 'Button(index === this.fallback', state, { index }) };
+}
+
 let passed = 0;
 async function test(name, run) {
   if (process.env.VERA_CHECK_FILTER && !new RegExp(process.env.VERA_CHECK_FILTER).test(name)) { return; }
@@ -212,6 +319,12 @@ async function test(name, run) {
 }
 
 (async () => {
+  await test('Widget card routes to its project', async () => {
+    const widget = fs.readFileSync(path.join(sourceRoot, 'widget/pages/WidgetCard.ets'), 'utf8');
+    assert.match(widget, /'action': 'router'/);
+    assert.match(widget, /'abilityName': 'EntryAbility'/);
+    assert.match(widget, /'params':\s*\{\s*'projectId': project\['id'\],\s*'veraRun': '1'\s*\}/);
+  });
   await test('Navigation receives the raw stack without notifying observed state during render', async () => {
     const shell = fs.readFileSync(path.join(sourceRoot, 'pages/AppShell.ets'), 'utf8');
     assert.match(shell, /import\s*\{[^}]*\bUIUtils\b[^}]*\}\s*from\s*'@kit\.ArkUI'/);
@@ -236,7 +349,7 @@ async function test(name, run) {
     assert.equal(notifications, 0);
   });
   await test('Project Rename, Code, Metrics and Picture use modal dialogs without popping the page', async () => {
-    const source = fs.readFileSync(path.join(sourceRoot, 'pages/ProjectPage.ets'), 'utf8');
+    const { source, state, events, renameGate, cancellations, setShortcutStatus } = projectModalFixture();
     assert.match(source, /NavDestination\(\)\s*\{\s*this\.pageContent\(\)/);
     assert.match(source, /@CustomDialog\s+struct ProjectPanelDialog/);
     assert.match(source, /@BuilderParam content: \(\) => void = this\.emptyContent/);
@@ -247,63 +360,16 @@ async function test(name, run) {
     assert.match(source, /onPick: \(icon: string\): void => \{ this\.setIcon\(icon\) \}/);
     assert.match(source, /\.onClick\(\(\) => \{ this\.viewSource\(v, this\.versions\.length - index\) \}\)/);
     assert.match(source, /\.onClick\(\(\) => \{ this\.viewMetrics\(v, this\.versions\.length - index\) \}\)/);
-    assert.match(source, /\.enabled\(this\.renameText\.trim\(\)\.length > 0\)/);
+    assert.match(source, /@State renameComposing: boolean = false/);
+    assert.match(source, /private renameInputController: TextInputController = new TextInputController\(\)/);
+    assert.match(source, /controller: this\.renameInputController/);
+    assert.match(source, /\.enabled\(!this\.renameComposing && this\.renameText\.trim\(\)\.length > 0\)/);
     assert.match(source, /\.onClick\(\(\) => \{ this\.doRename\(\) \}\)/);
     assert.equal((source.match(/\.onClick\(\(\) => \{ this\.closePanels\(\) \}\)/g) || []).length, 3);
-    const events = [];
     const version = { source: 'app source', prompt: 'version request', metrics: null };
-    const state = {
-      pageVisible: true, project: { name: 'Original', icon: 'icon' }, projectId: 'project-1', versions: [],
-      getUIContext: () => ({ getHostContext: () => context }),
-      showProjectMessage(message) { events.push(['message', message]); },
-      activePanel: '', renameText: 'Old draft', viewedSource: '', viewedPrompt: '', viewedVersionNumber: 0,
-      viewedMetricsVersion: null, viewedMetricsNumber: 0, shortcutRefreshGeneration: 0,
-      reload() { events.push(['reload']); },
-      pathStack: { pop() { assert.fail('closing a dialog must not pop the page'); } }
-    };
-    const store = { updateProject(...args) { events.push(['rename', ...args]); } };
-    const refresh = () => events.push(['refresh']);
-    const context = { filesDir: '/fixture/files' };
-    const renameGate = deferred();
-    let shortcutStatus = 'success';
-    const projectOperations = { async renameShortcut(getContext, id) {
-      assert.equal(getContext(), context, 'shortcut rename must use the page host context');
-      events.push(['shortcut', id]);
-      await renameGate.promise;
-      return shortcutStatus;
-    } };
-    const method = name => {
-      const match = source.match(new RegExp('^  (?:private )?(?:async )?' + name + '\\([^\\n]*\\)[^{]*\\{[\\s\\S]*?^  \\}', 'm'));
-      assert(match, name + ' must exist');
-      const compiled = ts.transpileModule('class PageMethods {\n' + match[0] + '\n}', {
-        compilerOptions: { target: ts.ScriptTarget.ES2020 }
-      });
-      return new Function('store', 'refreshForms', 'ProjectShortcutState', 'projectOperations', 'ProjectOperationStatus',
-        compiled.outputText + '\nreturn PageMethods.prototype.' + name + ';')
-        (store, refresh, { Unknown: 'unknown' }, projectOperations, { Failed: 'failed' }).bind(state);
-    };
-    for (const name of ['clearPanels', 'closePanels', 'handleBack', 'viewSource', 'viewMetrics',
-      'openRename', 'openIconPicker', 'setIcon', 'doRename', 'destinationHidden', 'aboutToDisappear']) {
-      state[name] = method(name);
-    }
-    const cancellations = [];
-    for (const panel of ['source', 'metrics', 'rename', 'icon']) {
-      const controller = source.match(new RegExp('private ' + panel + 'Controller:[\\s\\S]*?new CustomDialogController\\(\\{([\\s\\S]*?)^  \\}\\)', 'm'));
-      assert(controller, panel + ' controller must exist');
-      assert.match(controller[1], new RegExp('builder: ProjectPanelDialog\\(\\{ content: this\\.' + panel + 'Dialog \\}\\)'));
-      assert.match(controller[1], /isModal: true/);
-      assert.match(controller[1], /autoCancel: true/);
-      assert.match(controller[1], /maskColor: '#50000000'/);
-      const cancel = controller[1].match(/cancel: \(\) => \{([^}]+)\}/);
-      assert(cancel, panel + ' must clear selection on native Back and outside-tap dismissal');
-      cancellations.push(new Function(cancel[1]).bind(state));
-      state[panel + 'Controller'] = {
-        open() { events.push(['open', panel, state.activePanel]); },
-        close() { events.push(['close', panel]); }
-      };
-    }
     const assertCleared = () => {
       assert.equal(state.activePanel, '');
+      assert.equal(state.renameComposing, false);
       assert.equal(state.viewedSource, '');
       assert.equal(state.viewedPrompt, '');
       assert.equal(state.viewedVersionNumber, 0);
@@ -372,18 +438,20 @@ async function test(name, run) {
     await pendingRename;
     assert.equal(renamed, true);
     assert(!events.some(event => event[0] === 'message'), 'successful shortcut rename must not show a warning');
-    shortcutStatus = 'failed';
+    setShortcutStatus('failed');
     events.length = 0;
     state.openRename();
     await state.doRename();
     assert.deepEqual(events.at(-1), ['message',
       'Renamed, but the shortcut on the home screen may still show the old name. Remove and re-add it to update.']);
     assertCleared();
+    setShortcutStatus('success');
     events.length = 0;
     state.openIconPicker();
-    state.setIcon('new-icon');
+    await state.setIcon('new-icon');
     assert.deepEqual(events, [['open', 'icon', 'icon'], ['close', 'source'], ['close', 'metrics'],
-      ['close', 'rename'], ['close', 'icon'], ['rename', 'project-1', 'Original', 'new-icon'], ['reload'], ['refresh']]);
+      ['close', 'rename'], ['close', 'icon'], ['rename', 'project-1', 'Original', 'new-icon'],
+      ['reload'], ['refresh'], ['shortcut', 'project-1']]);
     assertCleared();
     events.length = 0;
     state.openIconPicker();
@@ -398,6 +466,228 @@ async function test(name, run) {
     state.setIcon('new-icon');
     await state.doRename();
     assert.deepEqual(events, [], 'a missing project must not open or save Rename or Picture');
+  });
+  await test('Rename native submit saves finalized event text over stale state during composition', async () => {
+    for (const composing of [false, true]) {
+      const f = projectModalFixture();
+      f.renameGate.resolve();
+      f.state.openRename();
+      f.input.onChange('stale state', composing ? { offset: 0, value: 'provisional' } : undefined);
+      assert.equal(f.state.renameComposing, composing);
+      f.events.length = 0;
+      f.input.onSubmit(0, { text: '  Final name  ' });
+      await pause();
+      assert.equal(f.state.renameText, '  Final name  ');
+      assert.equal(f.state.renameComposing, false);
+      assert.equal(f.state.activePanel, '');
+      assert.deepEqual(f.events.filter(event => event[0] === 'rename'), [['rename', 'project-1', 'Final name', 'icon']]);
+    }
+  });
+  await test('Rename Save and method guard reject provisional text until ordinary change commits it', async () => {
+    for (const preview of [undefined, { offset: 0, value: '' }]) {
+      const f = projectModalFixture();
+      f.renameGate.resolve();
+      f.state.openRename();
+      f.input.onChange('draft', { offset: 0, value: 'provisional' });
+      f.events.length = 0;
+      assert.equal(f.save.enabled, false);
+      await f.save.onClick();
+      await f.state.doRename();
+      assert.deepEqual(f.events, []);
+      assert.equal(f.state.activePanel, 'rename');
+      f.input.onChange('  Committed name  ', preview);
+      assert.equal(f.state.renameComposing, false);
+      assert.equal(f.save.enabled, true);
+      await f.save.onClick();
+      assert.deepEqual(f.events.filter(event => event[0] === 'rename'), [['rename', 'project-1', 'Committed name', 'icon']]);
+    }
+  });
+  await test('Rename blur synchronizes native text without submitting or reading on focus', async () => {
+    const f = projectModalFixture();
+    f.state.openRename();
+    f.input.onChange('stale', { offset: 0, value: 'provisional' });
+    f.nativeInput.text = '  Native name  ';
+    f.events.length = 0;
+    f.input.onEditChange(true);
+    assert.equal(f.nativeInput.reads, 0);
+    assert.equal(f.state.renameComposing, true);
+    f.input.onEditChange(false);
+    assert.equal(f.nativeInput.reads, 1);
+    assert.equal(f.state.renameText, f.nativeInput.text);
+    assert.equal(f.state.renameComposing, false);
+    assert.equal(f.save.enabled, true);
+    assert.equal(f.state.activePanel, 'rename');
+    assert.deepEqual(f.events, []);
+  });
+  await test('Rename ignores whitespace from change, blur and authoritative submit', async () => {
+    for (const text of ['', ' \t\n ']) {
+      const f = projectModalFixture();
+      f.state.openRename();
+      f.events.length = 0;
+      f.input.onChange(text);
+      assert.equal(f.save.enabled, false);
+      await f.save.onClick();
+      f.input.onChange('stale', { offset: 0, value: 'provisional' });
+      f.input.onSubmit(0, { text });
+      f.nativeInput.text = text;
+      f.input.onEditChange(false);
+      await f.state.doRename();
+      assert.equal(f.state.renameText, text);
+      assert.equal(f.state.renameComposing, false);
+      assert.equal(f.save.enabled, false);
+      assert.equal(f.state.activePanel, 'rename');
+      assert.deepEqual(f.events, []);
+    }
+  });
+  await test('Rename cancellation and dismissal reject late native callbacks and direct saves', async () => {
+    for (const dismiss of [f => f.cancel.onClick(), f => f.state.handleBack(),
+      ...[0, 1, 2, 3].map(index => f => f.cancellations[index]()),
+      f => f.state.destinationHidden(), f => f.state.aboutToDisappear()]) {
+      const f = projectModalFixture();
+      f.state.openRename();
+      f.input.onChange('cancelled draft', { offset: 0, value: 'provisional' });
+      dismiss(f);
+      assert.equal(f.state.activePanel, '');
+      assert.equal(f.state.renameComposing, false);
+      f.events.length = 0;
+      f.nativeInput.text = 'late native text';
+      f.input.onEditChange(false);
+      f.input.onChange('late change', { offset: 0, value: 'late preview' });
+      f.state.finishRename('late finish');
+      f.input.onSubmit(0, { text: 'late submit' });
+      f.state.submitRename('late direct submit');
+      await f.save.onClick();
+      await f.state.doRename();
+      assert.equal(f.nativeInput.reads, 0);
+      assert.equal(f.state.renameText, 'cancelled draft');
+      assert.equal(f.state.renameComposing, false);
+      assert.deepEqual(f.events, []);
+    }
+  });
+  await test('Rename guards hidden pages and other panels and resets composition on reopen', async () => {
+    const f = projectModalFixture();
+    f.state.openRename();
+    f.input.onChange('draft', { offset: 0, value: 'provisional' });
+    f.state.pageVisible = false;
+    f.events.length = 0;
+    f.input.onSubmit(0, { text: 'hidden submit' });
+    f.state.submitRename('hidden direct submit');
+    assert.equal(f.state.renameText, 'draft');
+    assert.equal(f.state.renameComposing, true);
+    f.state.renameComposing = false;
+    await f.state.doRename();
+    assert.deepEqual(f.events, []);
+    f.state.pageVisible = true;
+    f.state.closePanels();
+    f.state.renameComposing = true;
+    f.state.openRename();
+    assert.equal(f.state.renameText, 'Original');
+    assert.equal(f.state.renameComposing, false);
+    assert.equal(f.save.enabled, true);
+    f.state.closePanels();
+    f.state.openIconPicker();
+    f.events.length = 0;
+    f.input.onChange('wrong panel', { offset: 0, value: 'preview' });
+    f.state.finishRename('wrong panel finish');
+    f.input.onEditChange(false);
+    f.input.onSubmit(0, { text: 'wrong panel submit' });
+    await f.state.doRename();
+    assert.equal(f.state.renameText, 'Original');
+    assert.equal(f.state.renameComposing, false);
+    assert.equal(f.nativeInput.reads, 0);
+    assert.deepEqual(f.events, []);
+  });
+  await test('Question native submit answers finalized event text over stale state during composition', async () => {
+    for (const composing of [false, true]) {
+      const f = questionFixture();
+      assert.match(f.source, /@State composing: boolean = false/);
+      assert.match(f.source, /private inputController: TextInputController = new TextInputController\(\)/);
+      assert.match(f.source, /controller: this\.inputController/);
+      assert.match(f.source, /if \(this\.typed\.trim\(\)\.length > 0\)\s*\{\s*Button\('Answer'\)/);
+      f.input.onChange('stale answer', composing ? { offset: 0, value: 'provisional' } : undefined);
+      assert.equal(f.state.composing, composing);
+      f.input.onSubmit(0, { text: '  Final answer  ' });
+      assert.equal(f.state.typed, '  Final answer  ');
+      assert.equal(f.state.composing, false);
+      assert.deepEqual(f.events, [['answer', 'Final answer']]);
+    }
+  });
+  await test('Question Answer and method guard reject provisional text until ordinary change commits it', async () => {
+    for (const preview of [undefined, { offset: 0, value: '' }]) {
+      const f = questionFixture();
+      f.input.onChange('draft', { offset: 0, value: 'provisional' });
+      assert.equal(f.answer.enabled, false);
+      f.answer.onClick();
+      f.state.answer();
+      assert.deepEqual(f.events, []);
+      f.input.onChange('  Committed answer  ', preview);
+      assert.equal(f.state.composing, false);
+      assert.equal(f.answer.enabled, true);
+      f.answer.onClick();
+      assert.deepEqual(f.events, [['answer', 'Committed answer']]);
+    }
+  });
+  await test('Question blur synchronizes native text without answering or reading on focus', async () => {
+    const f = questionFixture();
+    f.input.onChange('stale', { offset: 0, value: 'provisional' });
+    f.nativeInput.text = '  Native answer  ';
+    f.input.onEditChange(true);
+    assert.equal(f.nativeInput.reads, 0);
+    assert.equal(f.state.composing, true);
+    f.input.onEditChange(false);
+    assert.equal(f.nativeInput.reads, 1);
+    assert.equal(f.state.typed, f.nativeInput.text);
+    assert.equal(f.state.composing, false);
+    assert.equal(f.answer.enabled, true);
+    assert.deepEqual(f.events, []);
+  });
+  await test('Question ignores whitespace from change, blur and authoritative submit', async () => {
+    for (const text of ['', ' \t\n ']) {
+      const f = questionFixture();
+      f.input.onChange(text);
+      f.answer.onClick();
+      f.state.answer();
+      f.input.onChange('stale', { offset: 0, value: 'provisional' });
+      f.input.onSubmit(0, { text });
+      f.nativeInput.text = text;
+      f.input.onEditChange(false);
+      f.state.answer();
+      assert.equal(f.state.typed, text);
+      assert.equal(f.state.composing, false);
+      assert.deepEqual(f.events, []);
+    }
+  });
+  await test('Question dismissal rejects late native callbacks and answers until it appears again', async () => {
+    const f = questionFixture();
+    f.input.onChange('cancelled draft', { offset: 0, value: 'provisional' });
+    f.state.aboutToDisappear();
+    assert.equal(f.state.disposed, true);
+    assert.equal(f.state.composing, false);
+    f.nativeInput.text = 'late native text';
+    f.input.onEditChange(false);
+    f.input.onChange('late change', { offset: 0, value: 'preview' });
+    f.state.finishAnswer('late finish');
+    f.input.onSubmit(0, { text: 'late submit' });
+    f.state.submitAnswer('late direct submit');
+    f.answer.onClick();
+    f.state.answer();
+    assert.equal(f.nativeInput.reads, 0);
+    assert.equal(f.state.typed, 'cancelled draft');
+    assert.equal(f.state.composing, false);
+    assert.deepEqual(f.events, []);
+    f.state.aboutToAppear();
+    assert.equal(f.state.disposed, false);
+    f.input.onSubmit(0, { text: '  New answer  ' });
+    assert.deepEqual(f.events, [['answer', 'New answer']]);
+  });
+  await test('Question option picks retain their indices even while typed input is composing', async () => {
+    const f = questionFixture();
+    for (const preview of [undefined, { offset: 0, value: 'provisional' }]) {
+      f.input.onChange('draft', preview);
+      f.option(0).onClick();
+      f.option(1).onClick();
+    }
+    assert.deepEqual(f.events, [['pick', 0], ['pick', 1], ['pick', 0], ['pick', 1]]);
   });
   await test('Home composer opens Generate or Chat with prompt and run params without creating a project', async () => {
     const source = fs.readFileSync(path.join(sourceRoot, 'pages/Index.ets'), 'utf8');
