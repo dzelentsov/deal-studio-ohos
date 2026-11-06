@@ -11,8 +11,44 @@ export struct QuestionCard {
   @Prop options: string[] = []
   @Prop fallback: number = 0
   @State typed: string = ''
+  @State composing: boolean = false
+  private inputController: TextInputController = new TextInputController()
+  private disposed: boolean = false
   onPick: (index: number) => void = (_index: number): void => {}
   onTyped: (text: string) => void = (_text: string): void => {}
+
+  aboutToAppear(): void {
+    this.disposed = false
+  }
+
+  aboutToDisappear(): void {
+    this.disposed = true
+    this.composing = false
+  }
+
+  private changeAnswer(value: string, previewText?: PreviewText): void {
+    if (this.disposed) { return }
+    this.typed = value
+    this.composing = previewText !== undefined && previewText.value.length > 0
+  }
+
+  private finishAnswer(value: string): void {
+    if (this.disposed) { return }
+    this.typed = value
+    this.composing = false
+  }
+
+  private submitAnswer(value: string): void {
+    if (this.disposed) { return }
+    this.finishAnswer(value)
+    this.answer()
+  }
+
+  private answer(): void {
+    if (this.disposed || this.composing) { return }
+    const text = this.typed.trim()
+    if (text.length > 0) { this.onTyped(text) }
+  }
 
   build() {
     Column({ space: 10 }) {
@@ -34,9 +70,12 @@ export struct QuestionCard {
       }
       .width('100%')
       Row({ space: 8 }) {
-        TextInput({ placeholder: 'Or type your own answer', text: this.typed })
-          .onChange((value: string) => { this.typed = value })
-          .onSubmit(() => { if (this.typed.trim().length > 0) { this.onTyped(this.typed.trim()) } })
+        TextInput({ placeholder: 'Or type your own answer', text: this.typed, controller: this.inputController })
+          .onChange((value: string, previewText?: PreviewText) => { this.changeAnswer(value, previewText) })
+          .onEditChange((editing: boolean) => {
+            if (!editing && !this.disposed) { this.finishAnswer(this.inputController.getText()) }
+          })
+          .onSubmit((_key: EnterKeyType, event: SubmitEvent) => { this.submitAnswer(event.text) })
           .enterKeyType(EnterKeyType.Done)
           .fontSize(14)
           .height(40)
@@ -51,7 +90,8 @@ export struct QuestionCard {
             .fontColor(app.onPrimary)
             .fontSize(14)
             .height(40)
-            .onClick(() => { this.onTyped(this.typed.trim()) })
+            .enabled(!this.composing)
+            .onClick(() => { this.answer() })
         }
       }
       .width('100%')

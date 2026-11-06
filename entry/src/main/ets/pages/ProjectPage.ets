@@ -51,6 +51,8 @@ export struct ProjectPage {
   // actually need when deciding whether to refine it or start again.
   @State viewedPrompt: string = ''
   @State renameText: string = ''
+  @State renameComposing: boolean = false
+  private renameInputController: TextInputController = new TextInputController()
   private activePanel: string = ''
 
   private sourceController: CustomDialogController = new CustomDialogController({
@@ -154,6 +156,7 @@ export struct ProjectPage {
 
   private clearPanels(): void {
     this.activePanel = ''
+    this.renameComposing = false
     this.viewedSource = ''
     this.viewedPrompt = ''
     this.viewedVersionNumber = 0
@@ -464,6 +467,7 @@ export struct ProjectPage {
   private openRename(): void {
     if (!this.pageVisible || this.project === null || this.activePanel.length > 0) { return }
     this.renameText = this.project!.name
+    this.renameComposing = false
     this.activePanel = 'rename'
     this.renameController.open()
   }
@@ -741,10 +745,13 @@ export struct ProjectPage {
   renameDialog() {
       Column() {
         Text('Rename').fontSize(20).fontWeight(FontWeight.Bold).margin({ bottom: 16 }).width('100%')
-        TextInput({ placeholder: 'Project name', text: this.renameText })
-          .onChange((value: string) => { this.renameText = value })
+        TextInput({ placeholder: 'Project name', text: this.renameText, controller: this.renameInputController })
+          .onChange((value: string, previewText?: PreviewText) => { this.changeRename(value, previewText) })
+          .onEditChange((editing: boolean) => {
+            if (!editing && this.activePanel === 'rename') { this.finishRename(this.renameInputController.getText()) }
+          })
           .defaultFocus(true)
-          .onSubmit(() => { this.doRename() })
+          .onSubmit((_key: EnterKeyType, event: SubmitEvent) => { this.submitRename(event.text) })
           .width('100%')
           .height(44)
         Row({ space: 12 }) {
@@ -755,7 +762,7 @@ export struct ProjectPage {
           Button('Save')
             .attributeModifier(new PrimaryButton())
             .layoutWeight(1)
-            .enabled(this.renameText.trim().length > 0)
+            .enabled(!this.renameComposing && this.renameText.trim().length > 0)
             .onClick(() => { this.doRename() })
         }
         .width('100%')
@@ -813,7 +820,26 @@ export struct ProjectPage {
     .shadow({ radius: 8, color: '#30000000' })
   }
 
+  private changeRename(value: string, previewText?: PreviewText): void {
+    if (this.activePanel !== 'rename') { return }
+    this.renameText = value
+    this.renameComposing = previewText !== undefined && previewText.value.length > 0
+  }
+
+  private finishRename(value: string): void {
+    if (this.activePanel !== 'rename') { return }
+    this.renameText = value
+    this.renameComposing = false
+  }
+
+  private submitRename(value: string): void {
+    if (this.activePanel !== 'rename' || !this.pageVisible) { return }
+    this.finishRename(value)
+    this.doRename()
+  }
+
   private async doRename(): Promise<void> {
+    if (this.activePanel !== 'rename' || !this.pageVisible || this.renameComposing) { return }
     let name = this.renameText.trim()
     if (name.length === 0 || this.project === null) { return }
     store.updateProject(this.projectId, name, this.project!.icon)

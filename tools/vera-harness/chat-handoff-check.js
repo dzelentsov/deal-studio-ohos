@@ -20,8 +20,10 @@ function page(){
   const prefix=src.slice(0,src.indexOf('@Component')).replace(/^import .*$/gm,'').replace('@Observed','');
   const runAt=src.indexOf('class ChatRunContext');assert(runAt>=0,'ChatRunContext');
   const run=src.slice(runAt,src.indexOf('@Component',runAt));
-  const names=['isPageActive','isRunActive','createRun','releaseRunIfIdle','cancelActiveRuns','stopChat','hostContext','openChat','persist','storedChat','loadResources','history','apply','send','queueBuild','referenceSnapshots','startWidget'];
-  const code=imports+'\n'+prefix+'\n'+run+'\nclass Controller {'+names.map(n=>method(src,n)).join('\n')+'}\nmodule.exports={Controller,ChatMessage};';
+  const names=['isPageActive','isRunActive','createRun','releaseRunIfIdle','cancelActiveRuns','stopChat','hostContext','openChat','persist','storedChat','loadResources','history','apply','send','queueBuild','flushReferenceFields','referenceSnapshots','startWidget'];
+  const renderer=read('entry/src/main/ets/components/VeraPreview.ets');
+  const controller=renderer.slice(renderer.indexOf('export class VeraPreviewController'),renderer.indexOf('@Component')).replace('export class ','class ');
+  const code=imports+'\n'+controller+'\n'+prefix+'\n'+run+'\nclass Controller {'+names.map(n=>method(src,n)).join('\n')+'}\nmodule.exports={Controller,ChatMessage};';
   const globals={...stats,...storage,...vera('VeraWidgetContext'),ensureCapabilities:()=>readiness(),modelSupportNote:()=>'',loadRawfileText:(...a)=>resourceRead(...a),loadCatalogFile:()=>{},describeCatalogForPrompt:()=> 'CATALOG',store:{loadState:()=>''},logMark:()=>{},logStep:()=>{},trace:()=>{}};
   const m={exports:{}};new Function('require','module','exports',...Object.keys(globals),transpile(code))(n=>load(path.resolve(base,'../pages',n+'.ets')),m,m.exports,...Object.values(globals));
   const c=new m.exports.Controller();Object.assign(c,{messages:[],draft:'',busy:false,canStop:false,status:'',chatId:'chat',title:'',createdAt:1,nextId:1,lastSavedJson:'',skillPrompt:'SKILL',resourcesReady:null,resourcesLoaded:false,disposed:false,lifecycleGeneration:1,nextRunId:1,activeRuns:[],buildQueue:Promise.resolve()});
