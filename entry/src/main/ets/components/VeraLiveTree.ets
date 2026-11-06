@@ -84,7 +84,14 @@ export class LiveNode {
   typed: string = ''
   @Trace children: LiveNode[] = []
   @Trace fieldValue: string = ''
+  @Trace fieldIssue: string = ''
   @Trace fieldGeneration: number = 0
+
+  fieldCancellation: number = 0
+
+  /** Renderer-only membership stamp; deliberately not @Trace to avoid triggering ArkUI updates. */
+  liveGeneration: number = 0
+
   /**
    * Renderer state: this node appeared because of something the person just did (a card opened, a result banner came up),
    * so the renderer brings it into view once it has a size. Never traced: reading it must not redraw anything.
@@ -197,7 +204,8 @@ export function toLive(node: VeraUiNode): LiveNode {
  */
 export function reconcile(live: LiveNode, next: VeraUiNode): void {
   if (live.kind !== next.kind || live.action !== next.action || live.enabled !== next.enabled ||
-      (live.value !== next.value && live.fieldValue !== next.value) ||
+      ((live.kind === 'field' || live.kind === 'surface') &&
+        live.value !== next.value && live.fieldValue !== next.value) ||
       (live.kind === 'field' && (live.keyboardType !== next.keyboardType || live.required !== next.required ||
         live.minLength !== next.minLength || live.maxLength !== next.maxLength ||
         live.pattern !== next.pattern || live.email !== next.email))) {
