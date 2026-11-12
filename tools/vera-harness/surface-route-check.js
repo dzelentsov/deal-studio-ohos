@@ -13,15 +13,15 @@ const {AgentRequest} = loadVera('agent/VeraAgent')
 const {compileVeraSource} = loadVera('VeraCompiler')
 const {playSurface} = loadVera('VeraSurfacePlay')
 
-const rawfile = name => fs.readFileSync(path.join(__dirname, '../../entry/src/main/resources/rawfile', name), 'utf8')
+const rawfile = name => fs.readFileSync(path.join(__dirname, '../../entry/src/main/resources/rawfile', name), 'utf8').replace(/\r\n/g, '\n')
 const guide = rawfile('vera-surface-skill.txt')
 const language = rawfile('vera-skill.txt')
 const example = guide.slice(guide.indexOf('--- EXAMPLE ---') + '--- EXAMPLE ---'.length, guide.indexOf('--- END EXAMPLE ---')).trim()
 
 // The guide's example is the program the model copies its structure from: it must compile, run and play.
 assert.equal(S.checkSurfaceProgram(example), '', 'the guide\'s example compiles, runs once and plays')
-assert.equal(example.trim(), fs.readFileSync(path.join(__dirname, 'examples/surface-catch.vera'), 'utf8')
-  .slice(fs.readFileSync(path.join(__dirname, 'examples/surface-catch.vera'), 'utf8').indexOf('@jsonable')).trim(),
+const catchSource = fs.readFileSync(path.join(__dirname, 'examples/surface-catch.vera'), 'utf8').replace(/\r\n/g, '\n')
+assert.equal(example.trim(), catchSource.slice(catchSource.indexOf('@jsonable')).trim(),
 'the guide carries examples/surface-catch.vera as it is (regenerate the rawfile when the example changes)')
 
 // The gate: game words ask, everything else goes straight to the agent.
