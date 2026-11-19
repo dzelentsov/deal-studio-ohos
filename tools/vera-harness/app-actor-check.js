@@ -3,11 +3,15 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const path = require('node:path')
 const ts = require(process.env.VERA_TYPESCRIPT_PATH || 'typescript')
+const crypto = require('node:crypto')
+const { TextEncoder } = require('node:util')
 const root = path.resolve(__dirname, '../../entry/src/main/ets')
 const cache = new Map()
 const disk = new Map()
 let records = []
 let failure = ''
+let cryptoFailure = null
+let cryptoFailureStage = 'create'
 let now = 100000
 const filesystem = {
   OpenMode: { CREATE: 1, WRITE_ONLY: 2, TRUNC: 4 },
@@ -62,6 +66,25 @@ function load(file) {
   cache.set(file, module)
   const importer = name => {
     if (name === '@kit.CoreFileKit') return { fileIo: filesystem }
+    if (name === '@kit.ArkTS') return { util: { TextEncoder: class {
+      encodeInto(text) { return text.length === 0 ? undefined : new TextEncoder().encode(text) }
+    } } }
+    if (name === '@kit.CryptoArchitectureKit') return { cryptoFramework: { createMd(algorithm) {
+      assert.equal(algorithm, 'SHA256')
+      if (cryptoFailure && cryptoFailureStage === 'create') throw cryptoFailure
+      const hash = crypto.createHash('sha256')
+      let updates = 0
+      return {
+        updateSync({ data }) {
+          if (cryptoFailure && cryptoFailureStage === 'update' + ++updates) throw cryptoFailure
+          hash.update(data)
+        },
+        digestSync() {
+          if (cryptoFailure && cryptoFailureStage === 'digest') throw cryptoFailure
+          return { data: hash.digest() }
+        }
+      }
+    } } }
     if (name === '@kit.PerformanceAnalysisKit') return { hilog: forbidden('hilog') }
     if (name.startsWith('@kit.') || name === 'libllama.so') return forbidden(name)
     if (name.startsWith('.')) return load(path.resolve(path.dirname(file), name + '.ets'))
@@ -1104,6 +1127,154 @@ test('real ProjectStore roundtrip retains legacy stamp/value object and failure 
   assert.equal(disk.get(file), previous)
   other.clearState('roundtrip', 'version')
   assert.equal(other.loadState('roundtrip', 'version', programs.basic.stamp), '')
+})
+
+const format2 = load(path.join(root, 'runtime/StateFormat.ets'))
+const codec = vera('VeraInterpreter')
+const stateMeta = { appId: 'format/version', schemaVersion: 1, vmGeneration: 3, revision: 7, stamp: 'program-λ😀' }
+const corruptState = run => assert.throws(run, error => error.code === 'STATE_CORRUPTED')
+
+test('Format 2 roundtrip preserves tagged insertion order, arrays and class identity with SHA-256 over UTF-8', () => {
+  const entries = [['10', ['n', -0]], ['2', ['s', 'λ😀\u0000\\\"']], ['é', ['b', true]],
+    ['é', ['z']], ['😀', ['a', [['n', 2], ['n', 1]]]]]
+  const value = codec.decodeRuntimeValue(['o', 'AppState#identity', entries])
+  const text = format2.encodeStateFile(stateMeta, value)
+  const file = JSON.parse(text)
+  assert.deepEqual(Object.keys(file), ['format', 'appId', 'schemaVersion', 'vmGeneration', 'revision', 'payloadLength', 'payloadHash', 'stamp', 'value'])
+  const payload = format2.canonicalPayload(codec.encodeRuntimeValue(value))
+  assert.equal(file.payloadLength, Buffer.byteLength(payload, 'utf8'))
+  assert.equal(file.payloadHash, 'sha256:' + crypto.createHash('sha256').update(stateMeta.stamp + '\u0000' + payload, 'utf8').digest('hex'))
+  const decoded = format2.decodeStateFile(text, stateMeta.appId)
+  assert.equal(decoded.format, 'FORMAT2')
+  assert.equal(decoded.vmGeneration, 3)
+  assert.equal(decoded.revision, 7)
+  assert.equal(decoded.ignoreBackup, false)
+  assert.equal(decoded.value.classIdentity, 'AppState#identity')
+  assert.deepEqual([...decoded.value.fields.keys()], entries.map(entry => entry[0]))
+  assert.deepEqual(decoded.value.fields.get('😀').elements.map(item => item.value), [2, 1])
+  assert.equal(Object.is(decoded.value.fields.get('10').value, -0), false)
+  assert.equal(format2.encodeStateFile(stateMeta, decoded.value), text)
+  const reversed = codec.decodeRuntimeValue(['o', 'AppState#identity', [...entries].reverse()])
+  assert.notEqual(format2.encodeStateFile(stateMeta, reversed), text)
+  assert.notEqual(codec.formatRuntimeValue(value), codec.formatRuntimeValue(reversed))
+  for (const size of [0, 1, 55, 56, 63, 64, 65, 1024, 8192]) {
+    const content = 'λ😀'.repeat(size)
+    assert.deepEqual(Buffer.from(format2.statePayloadBytes(content)), Buffer.from(content))
+    assert.equal(format2.statePayloadHash('stamp', format2.statePayloadBytes(content)),
+      'sha256:' + crypto.createHash('sha256').update('stamp\u0000' + content).digest('hex'))
+  }
+})
+
+test('canonical JSON explicitly sorts properties by UTF-16 but never sorts tagged fields or ordinary arrays', () => {
+  const pairs = [['10', 10], ['2', 2], ['é', 3], ['😀', 4], ['\ue000', 5], ['a', -0]]
+  const expected = '{"10":10,"2":2,"a":0,"é":3,"😀":4,"\ue000":5}'
+  assert.equal(format2.canonicalPayload(Object.fromEntries(pairs)), expected)
+  assert.equal(format2.canonicalPayload(Object.fromEntries([...pairs].reverse())), expected)
+  assert.equal(format2.canonicalPayload([2, 1, 'λ', null]), '[2,1,"λ",null]')
+  for (const bad of [undefined, () => {}, NaN, Infinity, -Infinity, new Date(), [undefined], new Array(1)]) {
+    assert.throws(() => format2.canonicalPayload(bad), error => error.code === 'STATE_VALIDATION_FAILED')
+  }
+  const cycle = []; cycle.push(cycle)
+  assert.throws(() => format2.canonicalPayload(cycle), error => error.code === 'STATE_VALIDATION_FAILED')
+  const shared = [1]
+  assert.equal(format2.canonicalPayload([shared, shared]), '[[1],[1]]')
+})
+
+test('Format 2 detects payload, stamp, length, schema, identity, counter and header corruption', () => {
+  const text = format2.encodeStateFile(stateMeta, codec.decodeRuntimeValue(['s', 'safe']))
+  for (const [from, to] of [
+    ['"safe"', '"evil"'], ['program-λ😀', 'program-λ😈'], ['"format":2', '"format":3'],
+    ['"payloadLength":12', '"payloadLength":13'], ['"schemaVersion":1', '"schemaVersion":2'],
+    ['"revision":7', '"revision":-1'], ['"revision":7', '"revision":1.5'],
+    ['"revision":7', '"revision":9007199254740991'], ['"revision":7', '"revision":9007199254740992'],
+    ['"vmGeneration":3', '"vmGeneration":9007199254740991'],
+    ['"format":2,"appId":"format/version"', '"appId":"format/version","format":2']
+  ]) {
+    assert.notEqual(text.replace(from, to), text, from)
+    corruptState(() => format2.decodeStateFile(text.replace(from, to), stateMeta.appId))
+  }
+  corruptState(() => format2.decodeStateFile(text, 'another/version'))
+  corruptState(() => format2.decodeStateFile(text.slice(0, -1), stateMeta.appId))
+  corruptState(() => format2.decodeStateFile(text + 'junk', stateMeta.appId))
+  corruptState(() => format2.decodeStateFile(text.replace(',"value":', ',"formatVersion":2,"value":'), stateMeta.appId))
+  corruptState(() => format2.decodeStateFile(text.replace(',"value":', ',"stamp":"duplicate","value":'), stateMeta.appId))
+  for (const field of ['revision', 'vmGeneration']) {
+    corruptState(() => format2.encodeStateFile({ ...stateMeta, [field]: Number.MAX_SAFE_INTEGER }, codec.NULL_VALUE))
+    const edge = format2.encodeStateFile({ ...stateMeta, [field]: Number.MAX_SAFE_INTEGER - 1 }, codec.NULL_VALUE)
+    assert.equal(format2.decodeStateFile(edge, stateMeta.appId)[field], Number.MAX_SAFE_INTEGER - 1)
+  }
+  corruptState(() => format2.encodeStateFile({ ...stateMeta, stamp: 'bad\u0000stamp' }, codec.NULL_VALUE))
+  assert.throws(() => format2.encodeStateFile(stateMeta, new codec.VeraNumberValue(NaN)), error => error.code === 'STATE_VALIDATION_FAILED')
+  assert.throws(() => format2.encodeStateFile(stateMeta, new codec.FunctionValue('f', [])), error => error.code === 'STATE_VALIDATION_FAILED')
+})
+
+test('header scanner stops before payload and requests full read for oversized or split headers', () => {
+  const text = format2.encodeStateFile(stateMeta, new codec.VeraStringValue('x'.repeat(4096)))
+  const prefix = text.slice(0, format2.STATE_HEADER_WINDOW_BYTES)
+  const header = format2.readStateHeader(prefix)
+  assert.equal(header.kind, 'READY')
+  assert.equal(header.header.revision, 7)
+  assert.equal(header.stamp, stateMeta.stamp)
+  assert.equal(text.slice(header.payloadOffset, header.payloadOffset + 5), '["s",')
+  assert.equal(format2.readStateHeader(text.slice(0, header.payloadOffset) + 'not JSON').kind, 'READY')
+  for (let end = 0; end < header.payloadOffset; end++) {
+    assert.equal(format2.readStateHeader(text.slice(0, end)).kind, 'NEED_MORE', 'prefix ' + end)
+  }
+  const large = format2.encodeStateFile({ ...stateMeta, stamp: '"\\λ😀'.repeat(600) }, codec.NULL_VALUE)
+  assert.equal(format2.readStateHeader(large.slice(0, 1024)).kind, 'NEED_MORE')
+  assert.equal(format2.readStateHeader(large, true).kind, 'READY')
+  corruptState(() => format2.readStateHeader(large.slice(0, 1024), true))
+})
+
+test('Format 2 validates hashes against literal payload bytes rather than reserialized JSON', () => {
+  const payload = '["s","\\u03bb"]'
+  const text = format2.assembleStateFile(stateMeta, payload)
+  const decoded = format2.decodeStateFile(text, stateMeta.appId)
+  assert.equal(decoded.encodedState, payload)
+  assert.equal(decoded.value.value, 'λ')
+  corruptState(() => format2.decodeStateFile(text.replace('\\u03bb', 'λ'), stateMeta.appId))
+  for (const invalid of [' ["z"]', '["z"] ', '[ "z"]', '["z",1]', '{broken']) {
+    assert.throws(() => format2.assembleStateFile(stateMeta, invalid), error => error.code === 'STATE_VALIDATION_FAILED')
+  }
+  const withSpace = format2.assembleStateFile(stateMeta, '["s","space inside"]')
+  assert.equal(format2.decodeStateFile(withSpace, stateMeta.appId).value.value, 'space inside')
+  cryptoFailure = Error('crypto service unavailable')
+  try {
+    for (cryptoFailureStage of ['create', 'update1', 'update2', 'digest']) {
+      assert.throws(() => format2.decodeStateFile(text, stateMeta.appId), error => error === cryptoFailure)
+      assert.throws(() => format2.assembleStateFile(stateMeta, payload), error => error === cryptoFailure)
+    }
+  } finally { cryptoFailure = null; cryptoFailureStage = 'create' }
+})
+
+test('Format 2 and old ProjectStore alternate without state loss; legacy counters are zero and backup is ignored', () => {
+  const value = codec.decodeRuntimeValue(JSON.parse(edited(fresh, { n: 23 })))
+  const meta = { ...stateMeta, appId: 'roundtrip/version', stamp: programs.basic.stamp }
+  const file = stateFile(meta.appId)
+  disk.set(file, format2.encodeStateFile(meta, value))
+  const oldRead = store.loadState('roundtrip', 'version', meta.stamp)
+  assert.deepEqual(JSON.parse(oldRead), codec.encodeRuntimeValue(value))
+  const mismatch = format2.decodeStateFile(disk.get(file), meta.appId)
+  assert.equal(mismatch.stamp, meta.stamp)
+  assert.equal(mismatch.revision, meta.revision)
+  assert.equal(store.loadState('roundtrip', 'version', 'new-program'), '')
+  store.saveState('roundtrip', 'version', meta.stamp, oldRead)
+  disk.set(file + '.bak', 'invalid stale backup')
+  const legacy = format2.decodeStateFile(disk.get(file), meta.appId)
+  assert.equal(legacy.format, 'LEGACY')
+  assert.equal(legacy.vmGeneration, 0)
+  assert.equal(legacy.revision, 0)
+  assert.equal(legacy.ignoreBackup, true)
+  assert.deepEqual(codec.encodeRuntimeValue(legacy.value), codec.encodeRuntimeValue(value))
+  const restored = format2.encodeStateFile({ ...meta, vmGeneration: 1, revision: 1 }, legacy.value)
+  assert.equal(format2.decodeStateFile(restored, meta.appId).revision, 1)
+  for (const bad of [null, {}, ['n'], ['n', null], ['n', '1'], ['s', 3], ['b', 1], ['z', 1],
+    ['a', {}], ['o', 1, []], ['o', 'C', [['x', ['z']], ['x', ['z']]]], ['o', 'C', [['x']]], ['f', 'fn']]) {
+    corruptState(() => format2.decodeStateFile(JSON.stringify({ stamp: meta.stamp, value: bad }), meta.appId))
+  }
+  for (const raw of ['null', '[]', '{}', '{broken', '{"stamp":1,"value":["z"]}']) {
+    corruptState(() => format2.decodeStateFile(raw, meta.appId))
+  }
 })
 
 test('actors own independent real VM/state/host; dispose is idempotent and all execution becomes inert', () => {
