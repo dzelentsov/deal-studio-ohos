@@ -7,16 +7,17 @@ import { carryState } from '../vera/VeraStateCarry'
 import { store } from '../vera/ProjectStore'
 import { ProgramRef, AcquireOptions, RuntimeMode } from './shared/Messages'
 import { StageTrace } from './trace/StageTrace'
+import { HostActor } from './InProcessHost'
 
 export interface AppActorCallbacks {
-  render: (paint: boolean, reveal: boolean) => void
+  render: (paint: boolean, reveal: boolean) => void | Promise<void>
   snapshot: (encoded: string) => void
   saved: (projectId: string) => void
   effects: (effects: HostEffect[]) => void
   error: (kind: string, message: string) => void
 }
 
-export class AppActor {
+export class AppActor implements HostActor {
   private callbacks: AppActorCallbacks
   private traceOwner: Object
   private vm: VirtualMachine | null = null
