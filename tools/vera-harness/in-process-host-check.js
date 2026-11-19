@@ -276,8 +276,8 @@ const stateFile = (key = 'project/version') => '/host-fixture/vera/' + key + '.s
 function external(program, value, key = 'project/version') {
   disk.set(stateFile(key), JSON.stringify({ stamp: program.stamp, value: JSON.parse(value) }))
 }
-function host() {
-  const h = new InProcessHost(() => now)
+function host(factory = null) {
+  const h = new InProcessHost(() => now, factory)
   hosts.push(h)
   return h
 }
@@ -375,10 +375,7 @@ async function outcome(value) {
   const result = value && value.promise ? value : watch(value)
   for (let turns = 0; !result.done && turns < 5000; turns++) {
     await Promise.resolve()
-    if (!result.done && !runTimer()) {
-      await Promise.resolve()
-      assert(result.done, 'operation remained unresolved with no runnable fake timers')
-    }
+    if (!result.done) runTimer()
   }
   assert(result.done, 'operation did not settle within bounded fake drain')
   return result
@@ -793,22 +790,26 @@ test('release barrier excludes later work of another active lease across a sched
   accepted(post(h, b, 'add', 2))
 })
 
-test('final-save failure rejects only after releasing lease; other lease remains live', async () => {
+test('nonlast release never final-saves; last save failure rejects after releasing its lease', async () => {
   const h = host(), p = probe(), a = await acquire(h, p, programs.basic, persistent())
   const b = await acquire(h, p, programs.basic, persistent(), a.appId)
   accepted(post(h, a, 'add', 4))
   p.reset()
   failure = 'rename'
-  const error = await rejects(h.release(a, { saveState: true }))
-  assert.match(error.message, /save|rename/i)
-  const attempts = count('save-attempt')
-  assert.equal(p.saved.length, 0)
+  await finish(h.release(a, { saveState: true }))
+  assert.equal(count('save-attempt'), 0)
   rejected(post(h, a))
-  failure = ''
   accepted(post(h, b, 'add', 2))
   assert.equal((await snapshot(h, b)).n, 7)
+  const error = await rejects(h.release(b, { saveState: true }))
+  assert.match(error.message, /save|rename/i)
+  assert.equal(p.saved.length, 0)
+  rejected(post(h, b))
+  assert.equal(h.leases.size, 0)
+  failure = ''
   await finish(h.release(a))
-  assert.equal(attempts, 1, 'final save must actually attempt ProjectStore IO before rejecting')
+  await finish(h.release(b))
+  assert.equal(count('save-attempt'), 1)
 })
 
 test('last lease idle reuse retains unsaved state, changes subscriber, cancels destruction', async () => {
@@ -2558,6 +2559,563 @@ test('world saves keep dirty state on failure and stopping retries without snaps
   assert.equal(count('save'), 1)
   assert.equal(p.frames.length, 0)
   assert.equal(p.snapshots.length, 0)
+})
+
+function deferred() {
+  let resolve, reject
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no })
+  return { promise, resolve, reject }
+}
+async function microtasks() {
+  for (let i = 0; i < 100; i++) await Promise.resolve()
+}
+function delayedActors() {
+  const actors = []
+  const { AppActor } = load(path.join(root, 'runtime/AppActor.ets'))
+  const factory = (callbacks, owner) => {
+    const real = new AppActor(callbacks, owner)
+    const control = { real, callbacks, owner, calls: [], gates: new Map(), facade: {} }
+    control.hold = method => {
+      const gate = deferred()
+      control.gates.set(method, gate)
+      return gate
+    }
+    for (const method of Object.getOwnPropertyNames(AppActor.prototype)) {
+      if (method === 'constructor') continue
+      control.facade[method] = (...args) => {
+        control.calls.push(method)
+        const gate = control.gates.get(method)
+        if (!gate) return real[method](...args)
+        control.gates.delete(method)
+        return gate.promise.then(() => real[method](...args))
+      }
+    }
+    control.facade.quiesce = () => {
+      control.calls.push('quiesce')
+      const gate = control.gates.get('quiesce')
+      control.gates.delete('quiesce')
+      return gate ? gate.promise : undefined
+    }
+    actors.push(control)
+    if (actors.configure) actors.configure(control, actors.length - 1)
+    return control.facade
+  }
+  return { actors, factory }
+}
+
+test('async initialization exposes no provisional handle and awaits first-frame validation', async () => {
+  const { actors, factory } = delayedActors()
+  let init, view
+  actors.configure = actor => { init = actor.hold('initialize'); view = actor.hold('view') }
+  const h = host(factory), p = probe()
+  const opening = watch(h.acquire('', programs.basic, options(), p.subscriber))
+  const idle = watch(h.whenIdle())
+  await microtasks()
+  assert.equal(opening.done, false)
+  assert.equal(idle.done, false)
+  assert.equal(opening.value, undefined)
+  assert.equal(p.frames.length, 0)
+  init.resolve()
+  await microtasks()
+  assert.equal(opening.done, false)
+  assert.equal(p.frames.length, 0)
+  view.resolve()
+  await finish(opening)
+  await finish(idle)
+  assert.equal(p.frames.length, 1)
+  accepted(post(h, opening.value))
+})
+
+for (const method of ['initialize', 'view', 'runWidgetRefresh']) {
+  test('async ' + method + ' failure rejects startup and permits clean reacquisition', async () => {
+    const { actors, factory } = delayedActors()
+    let gate
+    actors.configure = (actor, index) => { if (index === 0) gate = actor.hold(method) }
+    const h = host(factory), p = probe()
+    const opening = watch(h.acquire('', programs.basic, persistent(), p.subscriber))
+    await microtasks()
+    gate.reject(Error('delayed ' + method))
+    await rejects(opening, 'ACTOR_NOT_READY')
+    await finish(h.whenIdle())
+    assert.equal(actors[0].calls.filter(call => call === 'dispose').length, 1)
+    assert.equal(h.leases.size, 0)
+    const a = await acquire(h, p, programs.basic, persistent())
+    accepted(post(h, a))
+  })
+}
+
+test('async dispatch holds its mailbox and lease while another actor progresses', async () => {
+  const { actors, factory } = delayedActors()
+  const h = host(factory), p = probe(), q = probe()
+  const a = await acquire(h, p), b = await acquire(h, q)
+  const gate = actors[0].hold('dispatch')
+  accepted(post(h, a, 'add', 2))
+  accepted(post(h, a, 'add', 3))
+  const barrier = watch(h.requestSnapshot(a))
+  const release = watch(h.release(a))
+  const idle = watch(h.whenIdle())
+  rejected(post(h, a))
+  accepted(post(h, b, 'add', 7))
+  assert.equal((await snapshot(h, b)).n, 8)
+  await microtasks()
+  assert.equal(barrier.done, false)
+  assert.equal(release.done, false)
+  assert.equal(idle.done, false)
+  assert.equal(actors[0].owner.current.kind, 'INPUT')
+  assert.equal(actors[0].owner.current.lease.pending, 2)
+  assert.equal(actors[0].calls.filter(call => call === 'dispatch').length, 1)
+  gate.resolve()
+  await finish(release)
+  await finish(idle)
+  assert.equal(stateOf(await finish(barrier)).n, 6)
+  assert.equal(actors[0].owner.current, null)
+})
+
+for (const method of ['dispatch', 'frameHandlers', 'draw']) {
+  test('async ' + method + ' rejection settles ownership once and drains later barriers', async () => {
+    const { actors, factory } = delayedActors()
+    const h = host(factory), p = probe(), a = await acquire(h, p)
+    const gate = actors[0].hold(method)
+    if (method === 'dispatch') accepted(post(h, a, 'add', 2))
+    else if (method === 'draw') accepted(h.requestDraw(a, [draw()]))
+    else accepted(h.postSurfaceFrame(a, surface()))
+    const barrier = watch(h.requestSnapshot(a))
+    gate.reject(Error('delayed operation refused'))
+    await finish(barrier)
+    await finish(h.whenIdle())
+    assert.equal(p.errors.length, 1)
+    assert.equal(actors[0].owner.current, null)
+    assert.equal(actors[0].owner.leases.get(a.leaseId).pending, 0)
+    accepted(post(h, a, 'add', 3))
+    assert.equal((await snapshot(h, a)).n, 4)
+  })
+}
+
+test('async snapshot retains its exact barrier and prevents later mutation', async () => {
+  const { actors, factory } = delayedActors()
+  const h = host(factory), p = probe(), a = await acquire(h, p)
+  const gate = actors[0].hold('snapshot')
+  const barrier = watch(h.requestSnapshot(a))
+  accepted(post(h, a, 'add', 9))
+  await microtasks()
+  assert.equal(barrier.done, false)
+  assert.equal(actors[0].calls.filter(call => call === 'dispatch').length, 0)
+  gate.resolve()
+  assert.equal(stateOf(await finish(barrier)).n, 1)
+  await finish(h.whenIdle())
+  assert.equal((await snapshot(h, a)).n, 10)
+})
+
+test('async replacement reserves source and target until cleanup and refresh settle', async () => {
+  const { actors, factory } = delayedActors()
+  const h = host(factory), p = probe(), a = await acquire(h, p, programs.basic, persistent())
+  const cleanup = actors[0].hold('dispose')
+  let startup, refresh
+  actors.configure = actor => { startup = actor.hold('initialize'); refresh = actor.hold('runWidgetRefresh') }
+  const replacing = watch(h.replaceProgram(a, programs.newer, persistent('target/version')))
+  accepted(post(h, a, 'add', 90))
+  await rejects(h.acquire('', programs.basic, persistent(), p.subscriber), 'ACTOR_NOT_READY')
+  await rejects(h.acquire('', programs.newer, persistent('target/version'), p.subscriber), 'ACTOR_NOT_READY')
+  startup.resolve()
+  await microtasks()
+  assert.equal(replacing.done, false)
+  await rejects(h.acquire('', programs.basic, persistent(), p.subscriber), 'ACTOR_NOT_READY')
+  cleanup.resolve()
+  await microtasks()
+  assert.equal(replacing.done, false)
+  await rejects(h.acquire('', programs.basic, persistent(), p.subscriber), 'ACTOR_NOT_READY')
+  refresh.resolve()
+  const b = await finish(replacing)
+  await finish(h.whenIdle())
+  assert.equal((await snapshot(h, b)).n, 5)
+  rejected(post(h, a))
+  assert.equal(actors[0].calls.filter(call => call === 'dispose').length, 1)
+})
+
+test('async replacement rollback keeps target reserved through candidate cleanup', async () => {
+  const { actors, factory } = delayedActors()
+  const h = host(factory), p = probe(), a = await acquire(h, p, programs.basic, persistent())
+  let startup, cleanup
+  actors.configure = actor => { startup = actor.hold('initialize'); cleanup = actor.hold('dispose') }
+  const replacing = watch(h.replaceProgram(a, programs.newer, persistent('target/version')))
+  accepted(post(h, a, 'add', 4))
+  startup.reject(Error('load refused'))
+  await microtasks()
+  assert.equal(replacing.done, false)
+  await rejects(h.acquire('', programs.newer, persistent('target/version'), p.subscriber), 'ACTOR_NOT_READY')
+  cleanup.resolve()
+  await rejects(replacing, 'ACTOR_NOT_READY')
+  await finish(h.whenIdle())
+  assert.equal((await snapshot(h, a)).n, 5)
+})
+
+test('async promotion retains valid-handle bounded admission and settles stale queued inputs', async () => {
+  const { actors, factory } = delayedActors()
+  const h = host(factory), p = probe(), a = await acquire(h, p)
+  const gate = actors[0].hold('promote')
+  const promoting = watch(h.promote(a, 'LIVE_PERSISTENT', 'target/version'))
+  for (let i = 0; i < 240; i++) accepted(post(h, a, 'add', 1))
+  assert.equal(post(h, a).status, 'BACKPRESSURE')
+  const barrier = watch(h.requestSnapshot(a))
+  const idle = watch(h.whenIdle())
+  gate.resolve()
+  const b = await finish(promoting)
+  await rejects(barrier, 'INVALID_HANDLE')
+  await finish(idle)
+  assert.equal((await snapshot(h, b)).n, 1)
+  assert.equal(actors[0].owner.eventSlots, 0)
+})
+
+test('async shared release never saves or quiesces; final rejection waits for cleanup', async () => {
+  const { actors, factory } = delayedActors()
+  const h = host(factory), p = probe(), a = await acquire(h, p, programs.basic, persistent())
+  const b = await acquire(h, p, programs.basic, persistent(), a.appId)
+  await finish(h.release(a, { saveState: true }))
+  assert.equal(actors[0].calls.includes('saveNow'), false)
+  assert.equal(actors[0].calls.includes('quiesce'), false)
+  accepted(post(h, b, 'add', 2))
+  const save = actors[0].hold('saveNow'), cleanup = actors[0].hold('quiesce')
+  const promise = h.release(b, { saveState: true }), closing = watch(promise)
+  assert.equal(h.release(b), promise)
+  save.reject(Error('final commit refused'))
+  await microtasks()
+  assert.equal(closing.done, false)
+  assert.equal(h.leases.size, 1)
+  cleanup.resolve()
+  assert.match((await rejects(closing)).message, /final commit refused/)
+  assert.equal(h.leases.size, 0)
+  rejected(post(h, b))
+  await finish(h.whenIdle())
+})
+
+for (const method of ['initialize', 'dispatch', 'snapshot']) {
+  test('dispose awaits delayed ' + method + ' and actor cleanup without late revival', async () => {
+    const { actors, factory } = delayedActors()
+    let gate
+    if (method === 'initialize') actors.configure = actor => { gate = actor.hold(method) }
+    const h = host(factory), p = probe()
+    let operation
+    if (method === 'initialize') operation = watch(h.acquire('', programs.basic, persistent(), p.subscriber))
+    else {
+      const a = await acquire(h, p, programs.basic, persistent())
+      gate = actors[0].hold(method)
+      if (method === 'snapshot') operation = watch(h.requestSnapshot(a))
+      else accepted(post(h, a, 'add', 2))
+    }
+    const cleanup = actors[0].hold('dispose')
+    p.reset()
+    const promise = h.dispose(), closing = watch(promise), idle = watch(h.whenIdle())
+    assert.equal(h.dispose(), promise)
+    await microtasks()
+    assert.equal(closing.done, false)
+    assert.equal(idle.done, false)
+    gate.resolve()
+    await microtasks()
+    assert.equal(closing.done, false)
+    cleanup.resolve()
+    await finish(closing)
+    await finish(idle)
+    if (operation) await rejects(operation, 'ACTOR_NOT_READY')
+    assert.equal(h.registry.size, 0)
+    assert.equal(h.leases.size, 0)
+    assert.equal(p.frames.length + p.snapshots.length + p.effects.length + p.saved.length, 0)
+    assert.equal(actors[0].calls.filter(call => call === 'dispose').length, 1)
+  })
+}
+
+for (const method of ['resume', 'frameHandlers', 'move', 'draw', 'surfaceSave', 'worldSave']) {
+  test('async ' + method + ' retains turn ownership through snapshot and idle barriers', async () => {
+    const { actors, factory } = delayedActors()
+    const h = host(factory), p = probe(), a = await acquire(h, p, programs.basic)
+    const gate = actors[0].hold(method)
+    let admitted
+    if (method === 'resume') admitted = h.postRefresh(a, 'APP')
+    else if (method === 'move') admitted = post(h, a, 'pointer', 0, {
+      kind: 'SURFACE_MOVE', payload: payload('POINTER', 0), draws: [draw()]
+    })
+    else if (method === 'draw') admitted = h.requestDraw(a, [draw()])
+    else admitted = h.postSurfaceFrame(a, method === 'worldSave' ? worldFrame() : surface())
+    accepted(admitted)
+    const barrier = watch(h.requestSnapshot(a)), idle = watch(h.whenIdle())
+    await microtasks()
+    assert.equal(barrier.done, false)
+    assert.equal(idle.done, false)
+    assert.notEqual(actors[0].owner.current, null)
+    gate.resolve()
+    await finish(barrier)
+    await finish(idle)
+    assert.equal(actors[0].owner.current, null)
+    assert.equal(p.errors.length, 0)
+  })
+}
+
+test('async idle reconciliation waits before snapshot, first frame and reopen refresh', async () => {
+  const { actors, factory } = delayedActors()
+  const h = host(factory), p = probe(), a = await acquire(h, p, programs.refreshed, persistent())
+  await finish(h.release(a))
+  const gate = actors[0].hold('reconcileState')
+  external(programs.refreshed, encoded(30))
+  p.reset()
+  const reopening = watch(h.acquire('', programs.refreshed, persistent(), p.subscriber))
+  const idle = watch(h.whenIdle())
+  await microtasks()
+  assert.equal(reopening.done, false)
+  assert.equal(idle.done, false)
+  assert.equal(p.frames.length + p.snapshots.length, 0)
+  gate.resolve()
+  const b = await finish(reopening)
+  await finish(idle)
+  assert.equal((await snapshot(h, b)).refreshes, 1)
+  assert.equal(p.errors.length, 0)
+})
+
+test('async scene assembly stays sequential and publishes no partial frame', async () => {
+  const { actors, factory } = delayedActors()
+  let gate
+  actors.configure = actor => { gate = actor.hold('buildScene') }
+  const h = host(factory), p = probe()
+  const opening = watch(h.acquire('', programs.world, options(), p.subscriber))
+  await microtasks()
+  assert.equal(p.frames.length, 0)
+  assert.equal(actors[0].calls.filter(call => call === 'buildScene').length, 1)
+  gate.resolve()
+  await finish(opening)
+  await finish(h.whenIdle())
+  assertScenes(latest(p), 1)
+  assert.equal(actors[0].calls.filter(call => call === 'buildScene').length, 2)
+})
+
+test('async effect-result dispatch is not replayed and preserves following snapshot order', async () => {
+  const { actors, factory } = delayedActors()
+  const h = host(factory), p = probe(), a = await acquire(h, p)
+  accepted(post(h, a, 'change', 2))
+  const effect = p.effects[0], gate = actors[0].hold('dispatch')
+  accepted(h.postEffectResult(a, effect.effectId, 'ok'))
+  rejected(h.postEffectResult(a, effect.effectId, 'ok'))
+  const barrier = watch(h.requestSnapshot(a))
+  await microtasks()
+  assert.equal(barrier.done, false)
+  gate.resolve()
+  await finish(barrier)
+  await finish(h.whenIdle())
+  assert.equal(actors[0].calls.filter(call => call === 'dispatch').length, 2)
+  assert.equal(p.errors.length, 0)
+})
+
+test('obsolete actor callbacks cannot publish after replacement or disposal', async () => {
+  const { actors, factory } = delayedActors()
+  const h = host(factory), p = probe(), a = await acquire(h, p)
+  const old = actors[0].callbacks
+  const b = await finish(h.replaceProgram(a, programs.newer, options()))
+  p.reset()
+  old.snapshot(encoded(99))
+  old.saved('obsolete')
+  old.effects([])
+  old.error('handler', 'obsolete')
+  await old.render(true, true)
+  assert.equal(p.frames.length + p.snapshots.length + p.saved.length + p.errors.length, 0)
+  assert.equal((await snapshot(h, b)).n, 5)
+  await finish(h.dispose())
+  actors[1].callbacks.snapshot(encoded(99))
+  await actors[1].callbacks.render(true, true)
+  assert.equal(p.frames.length + p.snapshots.length, 0)
+})
+
+test('disposal during quiesce retains release until disposal cleanup completes', async () => {
+  const { actors, factory } = delayedActors()
+  const h = host(factory), p = probe(), a = await acquire(h, p)
+  const quiesce = actors[0].hold('quiesce'), cleanup = actors[0].hold('dispose')
+  const release = watch(h.release(a)), disposal = watch(h.dispose())
+  quiesce.resolve()
+  await microtasks()
+  assert.equal(release.done, false)
+  assert.equal(disposal.done, false)
+  cleanup.resolve()
+  await finish(release)
+  await finish(disposal)
+})
+
+for (const failed of [false, true]) {
+  test('dispose awaits already-running final save and cleanup; save rejection=' + failed, async () => {
+    const { actors, factory } = delayedActors()
+    const h = host(factory), p = probe(), a = await acquire(h, p, programs.basic, persistent())
+    const save = deferred(), cleanup = actors[0].hold('dispose')
+    actors[0].facade.saveNow = () => {
+      const saved = actors[0].real.saveNow()
+      return save.promise.then(() => saved)
+    }
+    const release = watch(h.release(a, { saveState: true }))
+    const disposal = watch(h.dispose())
+    await microtasks()
+    assert.equal(release.done, false)
+    assert.equal(disposal.done, false)
+    if (failed) save.reject(Error('late final save failure'))
+    else save.resolve()
+    await microtasks()
+    assert.equal(release.done, false)
+    assert.equal(disposal.done, false)
+    cleanup.resolve()
+    if (failed) assert.match((await rejects(release)).message, /late final save failure/)
+    else await finish(release)
+    await finish(disposal)
+    assert.equal(h.leases.size, 0)
+    assert.equal(actors[0].calls.filter(call => call === 'dispose').length, 1)
+  })
+}
+
+test('dispose during delayed replacement settles both actor cleanups and reservations', async () => {
+  const { actors, factory } = delayedActors()
+  const h = host(factory), p = probe(), a = await acquire(h, p, programs.basic, persistent())
+  let startup, candidateCleanup
+  actors.configure = actor => { startup = actor.hold('initialize'); candidateCleanup = actor.hold('dispose') }
+  const replacing = watch(h.replaceProgram(a, programs.newer, persistent('target/version')))
+  const oldCleanup = actors[0].hold('dispose')
+  const closing = watch(h.dispose())
+  startup.resolve()
+  await microtasks()
+  assert.equal(closing.done, false)
+  candidateCleanup.resolve()
+  await microtasks()
+  assert.equal(closing.done, false)
+  oldCleanup.resolve()
+  await rejects(replacing, 'ACTOR_NOT_READY')
+  await finish(closing)
+  assert.equal(h.registry.size, 0)
+  for (const actor of actors) assert.equal(actor.calls.filter(call => call === 'dispose').length, 1)
+})
+
+for (const operation of ['replace', 'promote']) {
+  test('async postcommit ' + operation + ' refresh rejection destroys the undelivered lease', async () => {
+    const { actors, factory } = delayedActors()
+    const h = host(factory), p = probe()
+    const a = await acquire(h, p, programs.basic, options('PREVIEW'))
+    let refresh, cleanup
+    if (operation === 'replace') {
+      actors.configure = actor => { refresh = actor.hold('runWidgetRefresh'); cleanup = actor.hold('dispose') }
+    } else {
+      refresh = actors[0].hold('runWidgetRefresh')
+      cleanup = actors[0].hold('dispose')
+    }
+    const changing = watch(operation === 'replace' ?
+      h.replaceProgram(a, programs.newer, persistent('target/version')) :
+      h.promote(a, 'LIVE_PERSISTENT', 'target/version'))
+    await microtasks()
+    const record = actors[0].owner, committed = record.leases.get(a.leaseId).handle
+    assert.notEqual(committed, a)
+    const queuedRelease = watch(h.release(committed)), idle = watch(h.whenIdle())
+    refresh.reject(Error('postcommit refresh refused'))
+    await microtasks()
+    assert.equal(changing.done, false)
+    assert.equal(idle.done, false)
+    assert.equal(h.leases.size, 0)
+    assert.equal(record.leases.size, 0)
+    rejected(post(h, a))
+    rejected(post(h, committed))
+    await rejects(queuedRelease, 'ACTOR_NOT_READY')
+    cleanup.resolve()
+    assert.match((await rejects(changing)).message, /postcommit refresh refused/)
+    await finish(idle)
+    assert.equal(h.registry.size, 0)
+    for (const actor of actors) assert.equal(actor.calls.filter(call => call === 'dispose').length, 1)
+    actors.configure = null
+    const b = await acquire(h, p, programs.newer, persistent('target/version'))
+    accepted(post(h, b))
+  })
+}
+
+for (const synchronous of [false, true]) {
+  test('host disposal rejects its shared promise after every cleanup; sync failure=' + synchronous, async () => {
+    const { actors, factory } = delayedActors()
+    const h = host(factory), p = probe(), q = probe()
+    await acquire(h, p)
+    await acquire(h, q)
+    const reason = Error('actor disposal refused')
+    let failed
+    if (synchronous) actors[0].facade.dispose = () => { throw reason }
+    else failed = actors[0].hold('dispose')
+    const remaining = actors[1].hold('dispose')
+    const promise = h.dispose(), closing = watch(promise), idle = watch(h.whenIdle())
+    assert.equal(h.dispose(), promise)
+    if (failed) failed.reject(reason)
+    await microtasks()
+    assert.equal(closing.done, false)
+    assert.equal(idle.done, false)
+    assert.equal(h.leases.size, 0)
+    assert.equal(h.registry.size, 0)
+    remaining.resolve()
+    assert.equal(await rejects(closing), reason)
+    await finish(idle)
+    assert.equal(h.dispose(), promise)
+    assert.equal(await rejects(h.dispose()), reason)
+    hosts.splice(hosts.indexOf(h), 1)
+  })
+}
+
+test('release propagates disposal rejection after removing its lease and completing teardown', async () => {
+  const { actors, factory } = delayedActors()
+  const h = host(factory), p = probe(), a = await acquire(h, p)
+  const quiesce = actors[0].hold('quiesce'), cleanup = actors[0].hold('dispose')
+  const promise = h.release(a), release = watch(promise)
+  assert.equal(h.release(a), promise)
+  const disposal = watch(h.dispose()), idle = watch(h.whenIdle())
+  quiesce.resolve()
+  await microtasks()
+  assert.equal(release.done, false)
+  assert.equal(disposal.done, false)
+  assert.equal(idle.done, false)
+  const reason = Error('release disposal refused')
+  cleanup.reject(reason)
+  assert.equal(await rejects(release), reason)
+  assert.equal(await rejects(disposal), reason)
+  await finish(idle)
+  assert.equal(h.leases.size, 0)
+  assert.equal(h.registry.size, 0)
+  assert.equal(actors[0].owner.leases.size, 0)
+  assert.equal(actors[0].owner.current, null)
+  assert.equal(actors[0].calls.filter(call => call === 'dispose').length, 1)
+  hosts.splice(hosts.indexOf(h), 1)
+})
+
+test('replacement propagates old disposal rejection only after candidate teardown', async () => {
+  const { actors, factory } = delayedActors()
+  const h = host(factory), p = probe(), a = await acquire(h, p, programs.basic, persistent())
+  const oldCleanup = actors[0].hold('dispose')
+  let candidateCleanup
+  actors.configure = actor => { candidateCleanup = actor.hold('dispose') }
+  const replacing = watch(h.replaceProgram(a, programs.newer, persistent('target/version')))
+  const idle = watch(h.whenIdle()), reason = Error('old actor disposal refused')
+  oldCleanup.reject(reason)
+  await microtasks()
+  assert.equal(replacing.done, false)
+  assert.equal(idle.done, false)
+  assert.equal(h.leases.size, 0)
+  rejected(post(h, a))
+  candidateCleanup.resolve()
+  assert.equal(await rejects(replacing), reason)
+  await finish(idle)
+  assert.equal(h.registry.size, 0)
+  assert.equal(actors[0].owner.current, null)
+  for (const actor of actors) assert.equal(actor.calls.filter(call => call === 'dispose').length, 1)
+})
+
+test('replacement rollback propagates candidate disposal rejection and preserves the old lease', async () => {
+  const { actors, factory } = delayedActors()
+  const h = host(factory), p = probe(), a = await acquire(h, p, programs.basic, persistent())
+  let startup, cleanup
+  actors.configure = actor => { startup = actor.hold('initialize'); cleanup = actor.hold('dispose') }
+  const replacing = watch(h.replaceProgram(a, programs.newer, persistent('target/version')))
+  const idle = watch(h.whenIdle()), reason = Error('candidate disposal refused')
+  startup.reject(Error('candidate startup refused'))
+  await microtasks()
+  assert.equal(replacing.done, false)
+  assert.equal(idle.done, false)
+  cleanup.reject(reason)
+  assert.equal(await rejects(replacing), reason)
+  await finish(idle)
+  assert.equal(h.registry.size, 1)
+  assert.equal(h.leases.size, 1)
+  assert.equal((await snapshot(h, a)).n, 1)
+  assert.equal(actors[1].calls.filter(call => call === 'dispose').length, 1)
 })
 
 const originals = {

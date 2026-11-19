@@ -1,6 +1,7 @@
 import { fileIo as fs } from '@kit.CoreFileKit'
 import { BusinessError } from '@kit.BasicServicesKit'
 import { requestHeadline } from './ProjectText'
+import { ProjectMigrationMetadata, ProjectVersionInput } from './ProjectStateMigration'
 
 
 export class Project {
@@ -323,19 +324,32 @@ export class ProjectStore {
       lastPrompt: string = '', parentVersionId: string = '', metrics: VersionMetrics | null = null,
       initialState: string = '', initialStamp: string = ''): Version {
     ensureDir(this.projectDir(projectId))
+    let v = this.prepareVersion({ projectId: projectId, source: source, vbc2: vbc2, note: note,
+      prompt: prompt, origin: origin, composition: composition, lastPrompt: lastPrompt,
+      parentVersionId: parentVersionId, metrics: metrics })
+    if (initialState.length > 0) { this.saveState(projectId, v.id, initialStamp, initialState) }
+    this.publishVersion(v)
+    return v
+  }
+
+  private prepareVersion(input: ProjectVersionInput): Version {
     let v = new Version()
     v.id = generateId()
-    v.projectId = projectId
-    v.source = source
-    v.vbc2 = vbc2
-    v.note = note
-    v.prompt = prompt.length > 0 ? prompt : note
-    v.lastPrompt = lastPrompt.length > 0 ? lastPrompt : v.prompt
-    v.parentVersionId = parentVersionId
-    v.origin = origin
-    v.composition = composition
-    v.metrics = metrics
+    v.projectId = input.projectId
+    v.source = input.source
+    v.vbc2 = input.vbc2
+    v.note = input.note
+    v.prompt = input.prompt || input.note
+    v.lastPrompt = input.lastPrompt || v.prompt
+    v.parentVersionId = input.parentVersionId || ''
+    v.origin = input.origin || ''
+    v.composition = input.composition || ''
+    v.metrics = input.metrics || null
     v.createdAt = Date.now()
+    return v
+  }
+
+  private publishVersion(v: Version): void {
     let obj: Record<string, Object> = {}
     obj['id'] = v.id
     obj['projectId'] = v.projectId
@@ -349,11 +363,28 @@ export class ProjectStore {
     obj['composition'] = v.composition
     if (v.metrics !== null) { obj['metrics'] = v.metrics }
     obj['createdAt'] = v.createdAt
-    // Make widget stages preserved state before publishing the version as latest.
-    if (initialState.length > 0) { this.saveState(projectId, v.id, initialStamp, initialState) }
-    writeJson(this.versionPath(projectId, v.id), JSON.stringify(obj))
-    this.summaries.delete(projectId)
-    return v
+    writeJson(this.versionPath(v.projectId, v.id), JSON.stringify(obj))
+    this.summaries.delete(v.projectId)
+  }
+
+  migrationMetadata(): ProjectMigrationMetadata {
+    let metadata: ProjectMigrationMetadata = {
+      prepareVersion: (input: ProjectVersionInput): Version => this.prepareVersion(input),
+      publishVersion: (version: Version): void => this.publishVersion(version),
+      listVersions: (projectId: string): Version[] => this.listVersions(projectId),
+      removeVersionMetadata: (projectId: string, versionId: string): void => {
+        this.summaries.delete(projectId)
+        fs.unlinkSync(this.versionPath(projectId, versionId))
+      },
+      removeProjectMetadata: (projectId: string): void => {
+        this.summaries.delete(projectId)
+        for (let version of this.listVersions(projectId)) {
+          fs.unlinkSync(this.versionPath(projectId, version.id))
+        }
+        this.writeIndex(this.readIndex().filter((project: Project): boolean => project.id !== projectId))
+      }
+    }
+    return metadata
   }
 
   updateVersionVbc2(projectId: string, versionId: string, vbc2: string): void {
