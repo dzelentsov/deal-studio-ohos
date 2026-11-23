@@ -74,7 +74,8 @@ function load(file) {
   return module.exports
 }
 const vera = name => load(path.join(root, 'vera', name + '.ets'))
-const { InProcessHost } = load(path.join(root, 'runtime/InProcessHost.ets'))
+const { InProcessHost, makeRevisionedFrame, makeRevisionedEffect, makeStateSnapshot,
+  sameHostPublication } = load(path.join(root, 'runtime/InProcessHost.ets'))
 const { compileVeraSource } = vera('VeraCompiler')
 const { veraStateStamp } = vera('VeraStateStamp')
 const { store } = vera('ProjectStore')
@@ -1712,6 +1713,76 @@ test('frames and effects are detached plain DTOs and delivered frames never muta
   assert.deepEqual(p.effects[0].params, ['label', 'change', 'value', '3'])
   assert.equal(p.effects[0].resultHandler, 'answered')
   assert.equal(p.effects[0].mode, 'background')
+  assert.deepEqual(Object.keys(previous).sort(),
+    ['appId', 'vmGeneration', 'frameSeq', 'appliedSeq', 'reveal', 'view', 'gfx', 'timing', 'scenes'].sort())
+  assert.deepEqual(Object.keys(p.effects[0]).sort(),
+    ['appId', 'vmGeneration', 'effectId', 'kind', 'rawTarget', 'params', 'resultHandler', 'mode'].sort())
+  const version = { runtimeMode: 'LIVE_PERSISTENT', vmGeneration: a.vmGeneration, stateRevision: 7 }
+  const frame = makeRevisionedFrame(previous, version), request = makeRevisionedEffect(p.effects[0], version)
+  const encoded = await finish(h.requestSnapshot(a)), state = makeStateSnapshot(a.appId, encoded, version)
+  assert.deepEqual(frame, { ...previous, ...version })
+  assert.deepEqual(request, { ...p.effects[0], ...version })
+  assert.deepEqual(state, { appId: a.appId, encoded, ...version })
+  assert.equal(typeof p.snapshots[0], 'string')
+  assert.equal(request.mode, 'background')
+  assert.notEqual(request.mode, request.runtimeMode)
+  for (const key of ['view', 'gfx', 'timing']) assert.notStrictEqual(frame[key], previous[key])
+  assert.notStrictEqual(request.params, p.effects[0].params)
+  const copies = JSON.stringify([frame, request, state])
+  version.stateRevision = 8
+  p.effects[0].params.push('subscriber edit')
+  previous.view.text = 'subscriber edit'
+  assert.equal(JSON.stringify([frame, request, state]), copies)
+  p.effects[0].params.pop()
+  previous.view.text = 'n=3'
+  const nextRevision = makeRevisionedFrame(previous, version)
+  assert.equal(nextRevision.stateRevision, 8)
+  assert.equal(nextRevision.frameSeq, frame.frameSeq)
+  assert.equal(nextRevision.appliedSeq, frame.appliedSeq)
+  for (const runtimeMode of ['PREVIEW', 'LIVE_EPHEMERAL']) {
+    const zero = { ...version, runtimeMode, stateRevision: 0 }
+    assert.equal(makeRevisionedFrame(previous, zero).stateRevision, 0)
+    const effectCopy = makeRevisionedEffect(p.effects[0], zero), snapshotCopy = makeStateSnapshot(a.appId, encoded, zero)
+    if (runtimeMode === 'PREVIEW') assert.deepEqual([effectCopy, snapshotCopy], [null, null])
+    else assert.deepEqual([effectCopy.stateRevision, snapshotCopy.stateRevision], [0, 0])
+    assert.throws(() => makeRevisionedFrame(previous, { ...zero, stateRevision: 1 }))
+    assert.throws(() => makeRevisionedEffect(p.effects[0], { ...zero, stateRevision: 1 }))
+    assert.throws(() => makeStateSnapshot(a.appId, encoded, { ...zero, stateRevision: 1 }))
+  }
+  for (const bad of [-1, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER]) {
+    const invalid = { ...version, stateRevision: bad }
+    assert.throws(() => makeRevisionedFrame(previous, invalid))
+    assert.throws(() => makeRevisionedEffect(p.effects[0], invalid))
+    assert.throws(() => makeStateSnapshot(a.appId, encoded, invalid))
+  }
+  const mismatch = { ...version, vmGeneration: a.vmGeneration + 1 }
+  assert.throws(() => makeRevisionedFrame(previous, mismatch))
+  assert.throws(() => makeRevisionedEffect(p.effects[0], mismatch))
+  const fence = { incarnation: h, appId: a.appId, ...version }
+  assert.equal(sameHostPublication(fence, { ...fence, stateRevision: 99 }), true)
+  for (const change of [{ incarnation: host() }, { incarnation: {} }, { appId: 'other/v' },
+    { runtimeMode: 'LIVE_EPHEMERAL' }, { vmGeneration: a.vmGeneration + 1 }]) {
+    assert.equal(sameHostPublication(fence, { ...fence, ...change }), false)
+  }
+  const parse = file => ts.createSourceFile(file.replace(/\.ets$/, '.ts'),
+    fs.readFileSync(path.join(root, file), 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+  const ast = parse('runtime/InProcessHost.ets')
+  const hostClass = ast.statements.find(node => ts.isClassDeclaration(node) && node.name.text === 'InProcessHost')
+  assert(hostClass)
+  const helperNames = new Set(['makeRevisionedFrame', 'makeRevisionedEffect', 'makeStateSnapshot', 'sameHostPublication'])
+  const visit = node => {
+    if (ts.isIdentifier(node)) assert.equal(helperNames.has(node.text), false, 'default host must not activate publication helpers')
+    ts.forEachChild(node, visit)
+  }
+  visit(hostClass)
+  const messages = parse('runtime/shared/Messages.ets')
+  const subscriber = messages.statements.find(node => ts.isInterfaceDeclaration(node) && node.name.text === 'AppSubscriber')
+  assert(subscriber)
+  assert.deepEqual(subscriber.members.map(node => node.getText(messages).replace(/\s/g, '')), [
+    'onViewFrame(frame:FrameEnvelope):void', 'onError(kind:string,message:string,inputSeq?:number):void',
+    'onStateSnapshot(encoded:string):void', 'onStateSaved(projectId:string):void', 'onEffectRequest(effect:EffectRequest):void',
+    'flushPendingInputFor(appId:string):void|Promise<void>', 'onMailboxWritable():void'
+  ])
   previous.view.text = 'subscriber edit'
   accepted(h.requestView(a))
   assert.equal(latest(p).view.text, 'n=3')
@@ -1720,6 +1791,21 @@ test('frames and effects are detached plain DTOs and delivered frames never muta
   accepted(post(h, a, 'add', 4))
   assert.equal(JSON.stringify(previous), saved)
   assert(latest(p).frameSeq > previous.frameSeq)
+  assert.equal(JSON.stringify([frame, request, state]), copies)
+  const later = makeRevisionedFrame(latest(p), version)
+  assert.equal(later.stateRevision, nextRevision.stateRevision)
+  assert(later.frameSeq > nextRevision.frameSeq)
+  assert(later.appliedSeq > nextRevision.appliedSeq)
+  accepted(h.requestDraw(a, [draw()]))
+  const drawn = latest(p), drawnCopy = makeRevisionedFrame(drawn, version), drawnSaved = JSON.stringify(drawnCopy)
+  drawn.gfx[0].ops[0].x = 999
+  drawn.timing.push(999)
+  assert.equal(JSON.stringify(drawnCopy), drawnSaved)
+  const q = probe(), world = await acquire(h, q, programs.world)
+  const scene = latest(q), sceneCopy = makeRevisionedFrame(scene, { ...version, vmGeneration: world.vmGeneration })
+  const sceneSaved = JSON.stringify(sceneCopy)
+  scene.scenes[0].spec.bodies[0].position[0] = 999
+  assert.equal(JSON.stringify(sceneCopy), sceneSaved)
 })
 
 test('stale effect results after release and replacement are rejected without executing VM', async () => {

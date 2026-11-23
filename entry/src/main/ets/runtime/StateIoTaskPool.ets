@@ -163,7 +163,7 @@ export class StateIoTaskPool {
           reply.operationId !== request.operationId || reply.kind !== request.kind) {
         return this.unknown(request, 'task-correlation')
       }
-      if (request.kind === 'load') {
+      if (request.kind === 'load' || request.kind === 'recoverLost') {
         if (reply.header !== undefined || reply.result !== undefined || reply.error !== undefined ||
             !validLoad(reply.load as LoadResult, request.appId as string, request.expectedStamp as string)) {
           return this.unknown(request, 'task-result')
@@ -199,7 +199,7 @@ export class StateIoTaskPool {
     this.uncertain = true
     this.fenced = true
     if (request.kind === 'readHeader') { throw new StateIoError('STATE_READ_FAILED', stage) }
-    if (request.kind === 'load') {
+    if (request.kind === 'load' || request.kind === 'recoverLost') {
       return { operationId: request.operationId, kind: request.kind,
         load: { kind: 'UNAVAILABLE', code: 'STATE_COMMIT_UNCERTAIN', stage: stage } }
     }
@@ -215,6 +215,18 @@ export class StateIoTaskPool {
       return reply.load as LoadResult
     } catch (error) {
       let issue = error as StateIoError
+      return { kind: 'UNAVAILABLE', code: issue.code, stage: issue.stage }
+    }
+  }
+
+  async recoverLost(identity: string, expectedStamp: string): Promise<LoadResult> {
+    try {
+      this.admit()
+      check(appId(identity) && stamp(expectedStamp), 'lost-request')
+      let reply = await this.enqueue({ operationId: '', kind: 'recoverLost', appId: identity, expectedStamp: expectedStamp })
+      return reply.load as LoadResult
+    } catch (error) {
+      let issue = error instanceof StateIoError ? error : new StateIoError('STATE_UNAVAILABLE', 'lost-authority-refused')
       return { kind: 'UNAVAILABLE', code: issue.code, stage: issue.stage }
     }
   }

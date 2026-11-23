@@ -26,7 +26,7 @@ const FIRST_APP_UID = 10000
 export const DEV_PARAMETER_NAMES: string[] = [
   'deepseekKey', 'typesafeKey', 'exaKey', 'reasoningEffort', 'veraServer', 'localJev',
   'probeTarget', 'probeParams', 'probeMode', 'probeSdkTarget', 'probeSdkParams',
-  'probeSdkSearch', 'veraBenchmark', 'veraSdkEval', 'veraUiEval', 'veraUiAb',
+  'probeSdkSearch', 'veraBenchmark', 'veraVmSafetyBenchmark', 'veraSdkEval', 'veraUiEval', 'veraUiAb',
   'veraCompose', 'veraComposePlan', 'veraCustom', 'veraAlign', 'veraWhole',
   'veraTemplateSelect', 'worldFloorGain', 'stageTrace'
 ]

@@ -6,8 +6,11 @@ import {
   VeraNullValue,
   VeraArrayValue,
   VeraObjectValue,
+  freshArrayValue,
+  freshObjectValue,
   NULL_VALUE,
   HostEnvironment,
+  VmHostSafetyScope,
   RuntimeTrap,
 } from './VeraInterpreter'
 import { resolveStyle } from './VeraUiCatalog'
@@ -225,7 +228,7 @@ function argBool(args: RuntimeValue[], i: number, fallback: boolean = true): boo
 }
 
 function argArray(args: RuntimeValue[], i: number): VeraArrayValue {
-  if (i >= args.length) { return new VeraArrayValue([]) }
+  if (i >= args.length) { return freshArrayValue([]) }
   return asArray(args[i])
 }
 
@@ -235,7 +238,7 @@ function viewNode(type: string, fields: Array<[string, RuntimeValue]>): VeraObje
   for (let pair of fields) {
     map.set(pair[0], pair[1])
   }
-  return new VeraObjectValue('std/ui:View', map)
+  return freshObjectValue('std/ui:View', map)
 }
 
 function containerNode(type: string, args: RuntimeValue[]): RuntimeValue {
@@ -410,7 +413,7 @@ function invokeStdStrings(name: string, args: RuntimeValue[]): RuntimeValue {
       let parts: RuntimeValue[] = []
       if (sep.length === 0) {
         for (let ch of scalars(text)) { parts.push(new VeraStringValue(ch)) }
-        return new VeraArrayValue(parts)
+        return freshArrayValue(parts)
       }
       let i = 0
       while (true) {
@@ -419,7 +422,7 @@ function invokeStdStrings(name: string, args: RuntimeValue[]): RuntimeValue {
         parts.push(new VeraStringValue(text.substring(i, hit)))
         i = hit + sep.length
       }
-      return new VeraArrayValue(parts)
+      return freshArrayValue(parts)
     }
     case 'toNumber': {
       // Typed text as a number: spaces dropped, a decimal comma accepted, and
@@ -475,6 +478,35 @@ export class HostEffect {
   }
 }
 
+class UiHostSafetyScope implements VmHostSafetyScope {
+  private settle: (outcome: string) => void
+
+  constructor(settle: (outcome: string) => void) {
+    this.settle = settle
+  }
+
+  accept(): void { this.settle('accept') }
+  rollback(): void { this.settle('rollback') }
+  discard(): void { this.settle('discard') }
+}
+
+class UiHostSafetyRecord {
+  queue: HostEffect[]
+  entries: HostEffect[]
+  nextId: number
+  allowed: boolean
+  reserve: () => void
+  failed: boolean = false
+
+  constructor(queue: HostEffect[], nextId: number, allowed: boolean, reserve: () => void) {
+    this.queue = queue
+    this.entries = queue.slice()
+    this.nextId = nextId
+    this.allowed = allowed
+    this.reserve = reserve
+  }
+}
+
 export class UiHostEnvironment extends HostEnvironment {
   /** Requests made during the handler that is running now. */
   pendingEffects: HostEffect[] = []
@@ -486,8 +518,83 @@ export class UiHostEnvironment extends HostEnvironment {
    */
   effectsAllowed: boolean = false
   private nextEffectId: number = 1
+  private safetyRecord: UiHostSafetyRecord | null = null
+  private safetyPure: boolean = false
+  private safetyInvalid: boolean = false
+  private invoking: boolean = false
+
+  beginSafetyTurn(reserve: () => void): VmHostSafetyScope {
+    this.checkSafetyIdle()
+    if (this.safetyRecord !== null || this.safetyPure) {
+      if (this.safetyRecord !== null) { this.safetyRecord.failed = true }
+      throw new RuntimeTrap('R-TURN', 'host safety turn already active')
+    }
+    let record = new UiHostSafetyRecord(this.pendingEffects, this.nextEffectId, this.effectsAllowed, reserve)
+    this.safetyRecord = record
+    return new UiHostSafetyScope((outcome: string): void => { this.settleSafety(record, outcome) })
+  }
+
+  setSafetyPure(pure: boolean): void {
+    this.checkSafetyIdle()
+    this.safetyPure = pure
+  }
+
+  private checkSafetyIdle(): void {
+    if (this.invoking) {
+      if (this.safetyRecord !== null) { this.safetyRecord.failed = true }
+      throw new RuntimeTrap('R-TURN', 'host invoke is active')
+    }
+    if (this.safetyInvalid) { throw new RuntimeTrap('R-TURN', 'host safety instance discarded') }
+  }
+
+  private settleSafety(record: UiHostSafetyRecord, outcome: string): void {
+    this.checkSafetyIdle()
+    if (this.safetyRecord !== record) {
+      if (this.safetyRecord !== null) { this.safetyRecord.failed = true }
+      throw new RuntimeTrap('R-TURN', 'host safety scope already settled')
+    }
+    if (outcome === 'accept' && record.failed) { throw new RuntimeTrap('R-TURN', 'host safety scope failed') }
+    if (outcome === 'rollback') {
+      record.queue.length = 0
+      for (let effect of record.entries) { record.queue.push(effect) }
+      this.pendingEffects = record.queue
+      this.nextEffectId = record.nextId
+    }
+    if (outcome === 'discard') {
+      this.pendingEffects.length = 0
+      record.queue.length = 0
+      this.pendingEffects = record.queue
+      this.safetyInvalid = true
+    }
+    this.effectsAllowed = record.allowed
+    this.safetyPure = false
+    this.safetyRecord = null
+    record.queue = []
+    record.entries = []
+    record.reserve = (): void => {}
+  }
 
   invoke(module: string, name: string, args: RuntimeValue[], awaited: boolean): RuntimeValue {
+    this.checkSafetyIdle()
+    if (this.safetyRecord !== null && this.safetyRecord.failed) {
+      throw new RuntimeTrap('R-TURN', 'host safety scope failed')
+    }
+    this.invoking = true
+    try {
+      let value = this.invokeValue(module, name, args, awaited)
+      if (this.safetyRecord !== null && this.safetyRecord.failed) {
+        throw new RuntimeTrap('R-TURN', 'host safety scope failed')
+      }
+      return value
+    } catch (e) {
+      if (this.safetyRecord !== null) { this.safetyRecord.failed = true }
+      throw e as Error
+    } finally {
+      this.invoking = false
+    }
+  }
+
+  private invokeValue(module: string, name: string, args: RuntimeValue[], awaited: boolean): RuntimeValue {
     if (module === 'std/time') { return invokeStdTime(name, args) }
     if (module === 'std/math') { return invokeStdMath(name, args) }
     if (module === 'std/strings') { return invokeStdStrings(name, args) }
@@ -1015,7 +1122,8 @@ export class UiHostEnvironment extends HostEnvironment {
    * that anything went wrong.
    */
   private queueSdk(args: RuntimeValue[]): RuntimeValue {
-    if (!this.effectsAllowed) {
+    let safety = this.safetyRecord !== null || this.safetyPure
+    if (!safety && !this.effectsAllowed) {
       throw new RuntimeTrap('R0026', 'sdk.call may only be called from a handler, not from view')
     }
     let target = asString(args[0]).trim()
@@ -1028,14 +1136,24 @@ export class UiHostEnvironment extends HostEnvironment {
     let order: string[] = []
     for (let i = 0; i + 1 < pairs.length; i = i + 2) {
       let key = asString(pairs[i]).trim()
+      if (safety) { asString(pairs[i + 1]) }
       if (key.length === 0) { continue }
       values.set(key, asString(pairs[i + 1]))
       order.push(key)
     }
     let mode = args.length > 3 ? asString(args[3]) : 'background'
+    let handler = safety ? asString(args[2]) : ''
+    if (this.safetyPure) { throw new RuntimeTrap('R-PURE', 'sdk.call is unavailable during pure execution') }
+    if (safety && !this.effectsAllowed) {
+      throw new RuntimeTrap('R0026', 'sdk.call may only be called from a handler, not from view')
+    }
+    if (this.safetyRecord !== null) {
+      this.safetyRecord.reserve()
+      if (this.safetyRecord.failed) { throw new RuntimeTrap('R-TURN', 'host safety scope failed') }
+    }
     let id = this.nextEffectId
     this.nextEffectId = id + 1
-    let effect = new HostEffect(id, 'sdk', 'call', values, asString(args[2]))
+    let effect = new HostEffect(id, 'sdk', 'call', values, safety ? handler : asString(args[2]))
     effect.rawTarget = target
     effect.rawParams = order.join(' ')
     effect.rawMode = mode

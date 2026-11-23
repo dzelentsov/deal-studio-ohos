@@ -11,7 +11,7 @@ import { resetLogprobsProbe } from '../vera/JevProxy'
 import { requestCalendarPermissions, requestMicrophonePermission } from '../vera/VeraPermissions'
 import { runProbe } from '../vera/IntentProbe'
 import { runSdkProbe, requestSdkSearch } from '../vera/VeraSdkProbe'
-import { requestBenchmark } from '../vera/VeraSearchBenchmark'
+import { requestBenchmark, runVmSafetyBenchmark } from '../vera/VeraSearchBenchmark'
 import { requestSdkEval } from '../vera/VeraSdkEval'
 import { requestUiEval } from '../vera/VeraUiEval'
 import { requestUiAb } from '../vera/VeraUiAb'
@@ -49,9 +49,19 @@ export default class EntryAbility extends UIAbility {
   private routeDrainGeneration: number = -1
   private navigationSession: AppNavigationSession | null = null
   private normalLayoutFullScreen: boolean = false
+  private vmSafetyLaunchMode: string = 'normal'
+  private vmSafetyBenchmarkActive: boolean = false
+  private vmSafetyBenchmarkTimer: number = -1
+  private vmSafetyBenchmarkGeneration: number = 0
 
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     hilog.info(DOMAIN, 'VERA', 'EntryAbility onCreate')
+    if (this.vmSafetyLaunchRequested(want)) {
+      const runId = this.vmSafetyRunId(want)
+      this.vmSafetyLaunchMode = runId.length > 0 ? 'benchmark' : 'ignored'
+      if (runId.length > 0) { this.scheduleVmSafetyBenchmark(runId) }
+      return
+    }
     try {
       this.context.setOnNewWantSkipScenarios(
         contextConstant.Scenarios.SCENARIO_MOVE_MISSION_TO_FRONT |
@@ -80,9 +90,53 @@ export default class EntryAbility extends UIAbility {
 
   onNewWant(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     hilog.info(DOMAIN, 'VERA', 'EntryAbility onNewWant')
+    if (this.vmSafetyLaunchMode !== 'normal' || this.vmSafetyLaunchRequested(want)) {
+      const runId = this.vmSafetyRunId(want)
+      if (runId.length > 0) {
+        if (this.vmSafetyLaunchMode === 'benchmark' && !this.vmSafetyBenchmarkActive) {
+          this.scheduleVmSafetyBenchmark(runId)
+        } else {
+          hilog.info(DOMAIN, 'VERA', 'VERA-P2 %{public}s', JSON.stringify({
+            protocol: 2, runId: runId, event: 'end', outcome: 'busy', restartRequired: this.vmSafetyLaunchMode !== 'benchmark'
+          }))
+        }
+      }
+      return
+    }
     this.extractProjectId(want)
     this.extractDevParameters(want)
     this.navigateToProject()
+  }
+
+  private vmSafetyLaunchRequested(want: Want): boolean {
+    if (startedByApp(want) || want.parameters === null || want.parameters === undefined) { return false }
+    return Object.keys(want.parameters).indexOf('veraVmSafetyBenchmark') >= 0
+  }
+
+  private vmSafetyRunId(want: Want): string {
+    if (!this.vmSafetyLaunchRequested(want)) { return '' }
+    const runId = (want.parameters as Record<string, Object>)['veraVmSafetyBenchmark']
+    return typeof runId === 'string' && /^[A-Za-z0-9_-]{1,48}$/.test(runId) && runId.trim() === runId ? runId : ''
+  }
+
+  private scheduleVmSafetyBenchmark(runId: string): void {
+    const generation = ++this.vmSafetyBenchmarkGeneration
+    this.vmSafetyBenchmarkActive = true
+    this.vmSafetyBenchmarkTimer = setTimeout(async (): Promise<void> => {
+      this.vmSafetyBenchmarkTimer = -1
+      if (this.vmSafetyLaunchMode !== 'benchmark' || this.vmSafetyBenchmarkGeneration !== generation) { return }
+      try {
+        store.init(this.context.filesDir)
+        await runVmSafetyBenchmark(runId, (): boolean =>
+          this.vmSafetyLaunchMode === 'benchmark' && this.vmSafetyBenchmarkGeneration === generation)
+      } catch {
+        hilog.error(DOMAIN, 'VERA', 'VERA-P2 %{public}s', JSON.stringify({
+          protocol: 2, runId: runId, event: 'end', outcome: 'failed'
+        }))
+      } finally {
+        if (this.vmSafetyBenchmarkGeneration === generation) { this.vmSafetyBenchmarkActive = false }
+      }
+    }, 1500)
   }
 
   /**
@@ -111,6 +165,8 @@ export default class EntryAbility extends UIAbility {
     }
 
     if (want.parameters === null || want.parameters === undefined) { return }
+
+    if (present.indexOf('veraVmSafetyBenchmark') >= 0) { return }
 
     this.extractApiKey(want)
     this.extractApiBase(want)
@@ -566,6 +622,7 @@ export default class EntryAbility extends UIAbility {
   }
 
   onWindowStageCreate(windowStage: window.WindowStage): void {
+    if (this.vmSafetyLaunchMode !== 'normal') { return }
     hilog.info(DOMAIN, 'VERA', 'EntryAbility onWindowStageCreate')
     this.contentReady = false
     let generation = ++this.windowStageGeneration
@@ -647,6 +704,7 @@ export default class EntryAbility extends UIAbility {
   }
 
   private navigateToProject(): void {
+    if (this.vmSafetyLaunchMode !== 'normal') { return }
     let generation = this.windowStageGeneration
     if (!this.contentReady || this.activeWindowStage === null || this.pendingRoute === null ||
       this.navigationSession === null || this.navigationSession.pathStack === null ||
@@ -793,6 +851,16 @@ export default class EntryAbility extends UIAbility {
   }
 
   onDestroy(): void {
+    if (this.vmSafetyLaunchMode !== 'normal') {
+      this.vmSafetyLaunchMode = 'destroyed'
+      this.vmSafetyBenchmarkGeneration++
+      this.vmSafetyBenchmarkActive = false
+      if (this.vmSafetyBenchmarkTimer !== -1) {
+        clearTimeout(this.vmSafetyBenchmarkTimer)
+        this.vmSafetyBenchmarkTimer = -1
+      }
+      return
+    }
     this.invalidateWindowStage()
     this.launchRevision++
     this.pendingRoute = null
@@ -801,11 +869,13 @@ export default class EntryAbility extends UIAbility {
   }
 
   onWindowStageDestroy(): void {
+    if (this.vmSafetyLaunchMode !== 'normal') { return }
     this.invalidateWindowStage()
     hilog.info(DOMAIN, 'VERA', 'EntryAbility onWindowStageDestroy')
   }
 
   onForeground(): void {
+    if (this.vmSafetyLaunchMode !== 'normal') { return }
     hilog.info(DOMAIN, 'VERA', 'EntryAbility onForeground')
     AppStorage.setOrCreate('veraForeground', true)
     AppStorage.setOrCreate('veraResume', Date.now())
@@ -813,6 +883,7 @@ export default class EntryAbility extends UIAbility {
   }
 
   onBackground(): void {
+    if (this.vmSafetyLaunchMode !== 'normal') { return }
     hilog.info(DOMAIN, 'VERA', 'EntryAbility onBackground')
     AppStorage.setOrCreate('veraForeground', false)
   }
