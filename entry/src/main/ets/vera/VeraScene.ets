@@ -19,7 +19,7 @@
  */
 
 import { RuntimeValue, VeraNumberValue, VeraStringValue, VeraBooleanValue, VeraArrayValue, VeraObjectValue,
-  RuntimeTrap } from './VeraInterpreter'
+  RuntimeTrap, freshArrayValue, freshObjectValue } from './VeraInterpreter'
 import { GfxParam, GfxFunction, GFX_ROLES } from './VeraGfx'
 import { SURFACE_PATTERNS, surfacePattern, surfaceSeed } from './VeraSurfaces'
 import { MAX_SHAPE_POINTS, MAX_BODY_PARTS, outlineCheck, hullCheck, pointBounds, partBounds, partCount } from './VeraShapes'
@@ -289,7 +289,7 @@ export class SceneThing {
 export class SceneThingValue extends VeraObjectValue {
   thing: SceneThing
   constructor(thing: SceneThing) {
-    super(SCENE_THING, new Map<string, RuntimeValue>())
+    super(SCENE_THING, freshObjectValue(SCENE_THING, new Map<string, RuntimeValue>()).fields)
     this.thing = thing
   }
 }
@@ -769,9 +769,9 @@ export function sceneEventValue(kind: string, bodyId: string, other: string, x: 
   for (let b of bodies) { ids.push(new VeraStringValue(b)) }
   let nums: RuntimeValue[] = []
   for (let v of values) { nums.push(new VeraNumberValue(v)) }
-  fields.set('bodies', new VeraArrayValue(ids))
-  fields.set('values', new VeraArrayValue(nums))
-  return new VeraObjectValue(SCENE_EVENT, fields)
+  fields.set('bodies', freshArrayValue(ids))
+  fields.set('values', freshArrayValue(nums))
+  return freshObjectValue(SCENE_EVENT, fields)
 }
 
 // ---------------------------------------------------------------- the world as plain data

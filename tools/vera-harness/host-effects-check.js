@@ -1550,6 +1550,1696 @@ test('disabled host requests carry no owner association or retained bridge owner
   assert.equal(p.posts.length, 0)
 })
 
+const hostBookkeeping = [
+  { class: 'C', owner: 'UiHostEnvironment.pendingEffects', legacy: 'queueSdk appends immediately; owners drain or drop the array', required: 'A future guard.accept must leave accepted effects queued, not dispatch them; rollback restores the original queue baseline' },
+  { class: 'C', owner: 'UiHostEnvironment.nextEffectId', legacy: 'queueSdk reserves and returns an ID immediately, before constructing the effect', required: 'Rollback restores the original ID baseline; IDs remain monotonically visible/reserved across the whole-turn queue; reuse is allowed only after refused results become unreachable' },
+  { class: 'C', owner: 'UiHostEnvironment.effectsAllowed', legacy: 'owners toggle permission and usually force false on exit', required: 'Every future exit restores the original effectsAllowed value, not an assumed false; discard invalidates the host instance' },
+  { class: 'C', owner: 'AppActor', legacy: 'toggles host permission; clearEffects drops requests; drainEffects replaces queue then invokes callbacks.effects', required: 'Future whole-turn acceptance retains effects queued; callbacks publish only afterward, never in scope.accept' },
+  { class: 'C', owner: 'VeraLiveWidget', legacy: 'WidgetSession toggles permission, clears queues and extracts permitted source requests; answer refuses phone effects', required: 'Future refusal restores bookkeeping or discards and invalidates the instance; accepted source requests remain deferred' },
+  { class: 'C', owner: 'VeraMovingPart', legacy: 'appMovingPart enables effects, drops requests during samples and clears permission/queue on exit', required: 'Future sample rollback restores original bookkeeping or discards and invalidates the instance' },
+  { class: 'C', owner: 'VeraSurfacePlay', legacy: 'playSurface enables handler effects then drops requests in finally', required: 'Future whole-turn refusal restores the original permission/queue/ID baseline or discards and invalidates the instance' },
+  { class: 'C', owner: 'VeraWorldPlay', legacy: 'WorldPlay.handle enables effects then clears permission/queue in finally', required: 'Future whole-turn refusal restores the original permission/queue/ID baseline or discards and invalidates the instance' },
+  { class: 'C', owner: 'VeraSmoke', legacy: 'smokeRun enables handler effects then clears permission/queue in finally', required: 'Future sample rollback restores original bookkeeping or discards and invalidates the instance' },
+  { class: 'C', owner: 'VeraSourceFind', legacy: 'sourceShownError enables then disables effects on its local host without draining', required: 'Future refusal restores bookkeeping or discards and invalidates the instance; no dispatch during acceptance' },
+  { class: 'D', owner: 'VeraUi.nextNodeId', legacy: 'decodeVeraUi resets; decodeNode reads and increments', required: 'Decode-only scratch, reset per decode; not authoritative state or a turn effect ID' },
+  { class: 'D', owner: 'UiHostEnvironment.invoke UI constructors', legacy: 'Surface/World/Ticker/BackHandler and other constructors return declarative view values', required: 'Registry declarations remain declarative decode data; no immediate VM registry mutation' },
+  { class: 'C', owner: 'renderer registry updates', legacy: 'renderer consumes decoded declarations', required: 'Future registry updates are post-accept publication, not VM-time registration or effects callbacks in scope.accept' },
+  { class: 'B', owner: 'StateManager authoritative root', legacy: 'beginTurn captures originalRoot and opens the rollback guard; setWorkingState replaces working; refuseTurn rolls back the guard and restores originalRoot; finishTurn accepts without publishing', required: 'Preserve authoritative root identity on refusal and defer publication until acceptance; classification records the implemented root rollback, not production transaction validation by this inventory' }
+]
+const hostGuardCoverage = {
+  roots: ['entry/src/main/ets', 'widget/src/main/ets'],
+  extensions: ['.ets', '.ts', '.tsx', '.js'],
+  limits: 'Bounded conservative AST inventory, not an ArkTS type proof: tracks explicit type/import/new and cast-only seeds, local extends subclasses, local assignment aliases, receiver-independent sensitive binding keys, destructuring declarations/assignments and member escapes. File-wide alias names deliberately overapproximate shadowed/unrelated receivers and sensitive object-literal keys, including P2 counters/log declarations. Thirteen approved safety-scope/record/hook/invoke/queueSdk/decode bodies, five AppActorTurnCoordinator constructor/runTurn/publication/fence bodies and two P2Host safety/invoke forwarding bodies pin enclosing control. Coordinator permissions return to its owned false baseline outside VM guard settlement; the VM guard restores its captured entry permission. Benchmark hosts queue/introspect locally without adapter dispatch; benchmark diagnostics and other owner scopes pin ordered sites only, not control-flow equivalence. Token-aware printer normalization preserves literal whitespace. TypeScript parser recovery is used for ArkUI syntax. No inter-file/interprocedural alias inference, reflective string synthesis, eval, runtime/native alias proof, generated sources, other roots, journal-inactive validation or production transaction validation; StateManager B root classification is manually reviewed, not body-pinned here.'
+}
+const hostBaseline = {
+  'entry/src/main/ets/components/VeraLiveTree.ets:<module>': ["import { VeraUiNode } from '../vera/VeraUi';"],
+  'entry/src/main/ets/components/VeraPreview.ets:<module>': ["import { VeraUiNode, formatVeraNumber, formatVeraClock, formatVeraDate, unitAfter, keepUnits } from '../vera/VeraUi';"],
+  'entry/src/main/ets/runtime/AppActor.ets:<module>': [
+    "import { UiHostEnvironment, HostEffect, VeraUiNode, decodeVeraUi } from '../vera/VeraUi';",
+    'export interface AppActorTurnEffects extends AppActorTurnVersion { readonly effects: HostEffect[]; }',
+    'export interface AppActorTurnCallbacks { snapshot: (snapshot: AppActorTurnSnapshot) => void; effects: (delivery: AppActorTurnEffects) => void; render: (version: AppActorTurnVersion, pure: (call: AppActorTurnCall) => RuntimeValue) => void | Promise<void>; error: (error: AppActorTurnError) => void; }',
+    'export interface AppActorCallbacks { render: (paint: boolean, reveal: boolean) => void | Promise<void>; snapshot: (encoded: string) => void; saved: (projectId: string) => void; effects: (effects: HostEffect[]) => void; error: (kind: string, message: string) => void; }'
+  ],
+  'entry/src/main/ets/runtime/AppActor.ets:AppActorTurnCoordinator': ['private host: UiHostEnvironment;'],
+  'entry/src/main/ets/runtime/AppActor.ets:AppActorTurnCoordinator.constructor': [
+    'host: UiHostEnvironment', 'this.host = host;', 'state.status().mode !== mode || host.pendingEffects.length !== 0', 'this.host.effectsAllowed = false;'
+  ],
+  'entry/src/main/ets/runtime/AppActor.ets:AppActorTurnCoordinator.runTurn': [
+    "this.host.effectsAllowed = this.mode !== 'PREVIEW';", 'this.host.pendingEffects.length > 0',
+    'hasEffects = this.host.pendingEffects.length > 0;', 'this.host.effectsAllowed = false;',
+    'this.host.pendingEffects = [];', 'this.host.effectsAllowed = false;', 'this.host.pendingEffects = [];',
+    'this.host.pendingEffects = [];', 'this.host.pendingEffects = [];', 'this.host.pendingEffects = [];',
+    'effects = this.host.pendingEffects', 'this.host.pendingEffects = [];', 'await this.publish(result, effects, owner);',
+    'this.host.pendingEffects = [];', 'this.host.effectsAllowed = false;'
+  ],
+  'entry/src/main/ets/runtime/AppActor.ets:AppActorTurnCoordinator.publish': ['await this.publishOwned(result, effects, owner);'],
+  'entry/src/main/ets/runtime/AppActor.ets:AppActorTurnCoordinator.publishOwned': [
+    'effects.length > 0', 'this.callbacks.effects({ mode: version.mode, vmGeneration: version.vmGeneration, stateRevision: version.stateRevision, effects: effects });'
+  ],
+  'entry/src/main/ets/runtime/AppActor.ets:AppActorTurnCoordinator.fence': ['this.host.effectsAllowed = false;', 'this.host.pendingEffects = [];'],
+  'entry/src/main/ets/runtime/AppActor.ets:AppActor': ['private host: UiHostEnvironment | null = null;'],
+  'entry/src/main/ets/runtime/AppActor.ets:AppActor.initialize': ['this.host = null;', 'this.host = new UiHostEnvironment();', 'this.vm = new VirtualMachine(module, this.host);'],
+  'entry/src/main/ets/runtime/AppActor.ets:AppActor.clearEffects': ['this.host !== null', 'this.host!.effectsAllowed = false;', 'this.host!.pendingEffects = [];'],
+  'entry/src/main/ets/runtime/AppActor.ets:AppActor.dispose': ['this.host = null;'],
+  'entry/src/main/ets/runtime/AppActor.ets:AppActor.view': ['this.host !== null', 'this.host!.effectsAllowed = false;'],
+  'entry/src/main/ets/runtime/AppActor.ets:AppActor.draw': ['this.host !== null', 'this.host!.effectsAllowed = false;'],
+  'entry/src/main/ets/runtime/AppActor.ets:AppActor.buildScene': ['this.host !== null', 'this.host!.effectsAllowed = false;'],
+  'entry/src/main/ets/runtime/AppActor.ets:AppActor.dispatch': ['this.host !== null', 'this.host!.effectsAllowed = true;', 'this.host !== null', 'this.host!.effectsAllowed = false;'],
+  'entry/src/main/ets/runtime/AppActor.ets:AppActor.runWidgetRefresh': ['this.host !== null', 'this.host!.effectsAllowed = true;', 'this.host !== null', 'this.host!.effectsAllowed = false;'],
+  'entry/src/main/ets/runtime/AppActor.ets:AppActor.frameHandlers': ['this.host !== null', 'this.host!.effectsAllowed = true;', 'this.host !== null', 'this.host!.effectsAllowed = false;'],
+  'entry/src/main/ets/runtime/AppActor.ets:AppActor.move': ['this.host !== null', 'this.host!.effectsAllowed = true;', 'this.host !== null', 'this.host!.effectsAllowed = false;'],
+  'entry/src/main/ets/runtime/AppActor.ets:AppActor.seeded': ['this.host !== null', 'this.host!.effectsAllowed = false;'],
+  'entry/src/main/ets/runtime/AppActor.ets:AppActor.drainEffects': [
+    "!this.ready() || this.mode === 'PREVIEW' || this.host === null", 'effects: HostEffect[] = this.host!.pendingEffects',
+    'effects.length === 0', 'this.host!.pendingEffects = [];', 'this.callbacks.effects(effects);'
+  ],
+  'entry/src/main/ets/runtime/InProcessHost.ets:<module>': ["import { HostEffect, VeraUiNode } from '../vera/VeraUi';"],
+  'entry/src/main/ets/vera/VeraLiveWidget.ets:<module>': ["import { UiHostEnvironment, VeraUiNode, decodeVeraUi, formatVeraNumber } from './VeraUi';"],
+  'entry/src/main/ets/vera/VeraLiveWidget.ets:WidgetSession': ['private host: UiHostEnvironment = new UiHostEnvironment();'],
+  'entry/src/main/ets/vera/VeraLiveWidget.ets:WidgetSession.constructor': ['this.vm = new VirtualMachine(module, this.host, LIVE_MAX_STEPS);'],
+  'entry/src/main/ets/vera/VeraLiveWidget.ets:WidgetSession.settle': ['this.host.effectsAllowed = true;', 'this.host.pendingEffects = [];', 'this.host.effectsAllowed = false;', 'this.host.pendingEffects = [];'],
+  'entry/src/main/ets/vera/VeraLiveWidget.ets:WidgetSession.frame': ['this.host.effectsAllowed = false;'],
+  'entry/src/main/ets/vera/VeraLiveWidget.ets:WidgetSession.refresh': ['this.host.effectsAllowed = true;', 'this.host.pendingEffects = [];', 'this.host.effectsAllowed = false;', 'this.host.pendingEffects = [];'],
+  'entry/src/main/ets/vera/VeraLiveWidget.ets:WidgetSession.answer': ['this.host.effectsAllowed = true;', 'this.host.pendingEffects = [];', 'this.host.pendingEffects.length > 0', 'this.host.effectsAllowed = false;', 'this.host.pendingEffects = [];'],
+  'entry/src/main/ets/vera/VeraLiveWidget.ets:WidgetSession.tap': ['this.host.effectsAllowed = true;', 'this.host.pendingEffects = [];', 'this.host.effectsAllowed = false;', 'this.host.pendingEffects = [];'],
+  'entry/src/main/ets/vera/VeraLiveWidget.ets:WidgetSession.tapSwitch': ['this.host.effectsAllowed = true;', 'this.host.pendingEffects = [];', 'this.host.effectsAllowed = false;', 'this.host.pendingEffects = [];'],
+  'entry/src/main/ets/vera/VeraLiveWidget.ets:WidgetSession.tapSurface': ['this.host.effectsAllowed = true;', 'this.host.pendingEffects = [];', 'this.host.effectsAllowed = false;', 'this.host.pendingEffects = [];'],
+  'entry/src/main/ets/vera/VeraLiveWidget.ets:WidgetSession.sourceRequests': ['this.host.pendingEffects'],
+  'entry/src/main/ets/vera/VeraMovingPart.ets:<module>': ["import { decodeVeraUi, UiHostEnvironment, VeraUiNode } from './VeraUi';"],
+  'entry/src/main/ets/vera/VeraMovingPart.ets:appMovingPart': ['host = new UiHostEnvironment()', 'host.effectsAllowed = true;', 'vm = new VirtualMachine(deserializeVbc2(vbc2), host, PART_MAX_VM_STEPS)', 'host.pendingEffects = [];', 'host.pendingEffects = [];', 'host.effectsAllowed = false;', 'host.pendingEffects = [];'],
+  'entry/src/main/ets/vera/VeraSearchBenchmark.ets:<module>': [
+    "import { UiHostEnvironment, VeraUiNode, decodeVeraUi } from './VeraUi';",
+    'interface P2LogRecord { event?: string; runId?: string; protocol?: number; outcome?: string; mode?: string; modes?: string[]; workload?: number; corpus?: number; kind?: number; handlers?: number; pure?: number; maxSteps?: number; deadlineMs?: number; steps?: number; sample?: number; operations?: number; successfulOperations?: number; failedOperations?: number; unexecutedOperations?: number; stepsPerOperation?: number; batchMs?: number; msPerOperation?: number; failedBatchMs?: number; warmup?: number; warmups?: number; successfulSamples?: number; failedSamples?: number; journalReservations?: number; journalUndoRecords?: number; hostReservations?: number; runtimeBirthSerialDelta?: number; blockedCalls?: number; deferredEffects?: number; rootUnchanged?: number; callIndex?: number; inputUnchanged?: number; resultMatchesInputBefore?: number; resultMatchesInputAfter?: number; returnSameRuntimeValue?: number; persistenceFormatValid?: number; stateRoundTripEqual?: number; postStatePureViewChecked?: number; postStatePureViewOutcome?: string; stateSchemaChecked?: number; rollbackSucceeded?: number; checkScope?: string; ownershipAliasCorrectnessChecked?: number; minimumUndo?: number; minimumHost?: number; expectedReservations?: number; reservationExpectationsMet?: number; journalLimit?: number; executionOutcome?: string; rootRestored?: number; rollbackMs?: number; synchronousHostMs?: number; hostCalls?: number; cooperative?: number; elapsedMs?: number; projectsListed?: number; projectsVisited?: number; versionsListed?: number; bytecodesRead?: number; statesRead?: number; versionsSelected?: number; versionsNotSelected?: number; rejected?: number; oversized?: number; versionSelectionCap?: number; seedMode?: number; nodesVisited?: number; traversalLimited?: number; unvisitedNodesCountKnown?: number; handlersDiscovered?: number; handlersSelected?: number; handlersSkipped?: number; twoParameterFunctions?: number; pureEntriesSelected?: number; handlerSelectionCap?: number; pureSelectionCap?: number; explorationPasses?: number; effectCallbacksExercised?: number; samples?: number; widgetMaxSteps?: number; widgetDeadlineMs?: number; runLimitMs?: number; workLimitMs?: number; preflightLimitMs?: number; preflightMaxSteps?: number; referenceMs?: number; stopReason?: string; batchCap?: number; targetBatchMs?: number; baselineCurrentInfrastructure?: number; nativeEffectsExecuted?: number; gcForced?: number; clock?: string; birthSerialIsAllocationBytes?: number; journalPureHandlers?: number; hardPreemption?: number; compileTimed?: number; setupTimed?: number; codecsTimed?: number; fingerprintsTimed?: number; journalBeginExecuteAcceptTimed?: number; rollbackInSamples?: number; budgetEnabled?: number; journalEnabled?: number; executePure?: number; preInfrastructureBaseline?: number; pureOnly?: number; workloadsPlanned?: number; workloadsAttempted?: number; workloadsComplete?: number; inventoryComplete?: number; selectedWorkloadsComplete?: number; workloadsSkipped?: number; }'
+  ],
+  'entry/src/main/ets/vera/VeraSearchBenchmark.ets:P2Host': [
+    'extends UiHostEnvironment', 'hostReservations: number = 0;', 'blockedCalls: number = 0;', 'slowProbe: boolean = false;', 'probeCalls: number = 0;',
+    'beginSafetyTurn(reserve: () => void): VmHostSafetyScope', 'invoke(module: string, name: string, args: RuntimeValue[], awaited: boolean): RuntimeValue'
+  ],
+  'entry/src/main/ets/vera/VeraSearchBenchmark.ets:P2Host.beginSafetyTurn': [
+    'return super.beginSafetyTurn((): void => { reserve(); this.hostReservations += 1; });', 'this.hostReservations += 1;'
+  ],
+  'entry/src/main/ets/vera/VeraSearchBenchmark.ets:P2Host.invoke': [
+    "module === 'std/p2' && name === 'wait' && this.slowProbe", 'this.probeCalls += 1;', 'this.blockedCalls += 1;'
+  ],
+  'entry/src/main/ets/vera/VeraSearchBenchmark.ets:P2Prepared': ['host: P2Host;'],
+  'entry/src/main/ets/vera/VeraSearchBenchmark.ets:P2Prepared.constructor': [
+    'this.host = new P2Host();', 'this.host.effectsAllowed = !work.pure && work.calls[0].kind !== 0;',
+    "this.vm = new VirtualMachine(work.module, this.host, work.maxSteps, mode === 'baseline' ? null : { now: p2Now, deadlineMs: work.deadlineMs }, mode === 'JOURNAL' || mode === 'journal-pure' ? { journalMode: 'JOURNAL', journalMaxEntries: limit } : null);"
+  ],
+  'entry/src/main/ets/vera/VeraSearchBenchmark.ets:p2Fingerprint': [
+    'effects = prepared.host.pendingEffects.map((effect): Object => [effect.id, effect.kind, effect.fn, Array.from(effect.values.entries()), effect.resultHandler, effect.rawTarget, effect.rawParams, effect.rawMode])'
+  ],
+  'entry/src/main/ets/vera/VeraSearchBenchmark.ets:p2Diagnostics': [
+    'host = prepared.host.hostReservations', '(work.pure && !unchanged) || reservations !== undo + host',
+    "p2Log(runId, { event: 'diagnostic', workload: work.index, mode: mode, steps: prepared.steps, journalReservations: reservations, journalUndoRecords: undo, hostReservations: host, runtimeBirthSerialDelta: after.runtimeBirthSerial - before.runtimeBirthSerial, blockedCalls: prepared.host.blockedCalls, deferredEffects: prepared.host.pendingEffects.length, rootUnchanged: unchanged ? 1 : 0, outcome: work.pure && !unchanged ? 'pure-root-changed' : reservations !== undo + host ? 'counter-mismatch' : 'ok' });",
+    'record.hostReservations = prepared.host.hostReservations;', 'record.blockedCalls = prepared.host.blockedCalls;', 'record.deferredEffects = prepared.host.pendingEffects.length;'
+  ],
+  'entry/src/main/ets/vera/VeraSearchBenchmark.ets:p2ReturnedState': [
+    'host = new P2Host()', 'host.effectsAllowed = false;',
+    "vm = new VirtualMachine(work.module, host, 100000, { now: p2Now, deadlineMs: work.deadlineMs }, { journalMode: 'JOURNAL', journalMaxEntries: P2_LIMIT })",
+    'before !== JSON.stringify(encodeRuntimeValue(value)) || host.pendingEffects.length !== 0'
+  ],
+  'entry/src/main/ets/vera/VeraSearchBenchmark.ets:p2Ownership': [
+    'setupCorrect = fresh !== original && fresh.fields !== original.fields && freshArray !== originalArray && freshArray.elements !== originalArray.elements && counters.journalReservations === 0 && counters.journalUndoRecords === 0 && prepared.host.hostReservations === 0;',
+    'record.hostReservations = prepared.host.hostReservations;',
+    'reservationsExpected = counters.journalReservations === expectedUndo && counters.journalUndoRecords === expectedUndo && prepared.host.hostReservations === 0'
+  ],
+  'entry/src/main/ets/vera/VeraSearchBenchmark.ets:p2Settlement': [
+    'restored = before === JSON.stringify(encodeRuntimeValue(prepared.root)) && prepared.host.pendingEffects.length === 0',
+    'reservationsExpected = counters.journalUndoRecords >= minimumUndo && prepared.host.hostReservations >= minimumHost && (expectedReservations < 0 || counters.journalReservations === expectedReservations)',
+    'correct = rolledBack && restored && outcome === expected && reservationsExpected && counters.journalReservations === counters.journalUndoRecords + prepared.host.hostReservations',
+    "record: P2LogRecord = { event: 'settlement', workload: work.index, checkScope: 'serialized-root-and-deferred-effects', ownershipAliasCorrectnessChecked: 0, minimumUndo: minimumUndo, minimumHost: minimumHost, expectedReservations: expectedReservations, reservationExpectationsMet: reservationsExpected ? 1 : 0, mode: 'JOURNAL', journalLimit: limit, steps: prepared.steps, journalReservations: counters.journalReservations, journalUndoRecords: counters.journalUndoRecords, hostReservations: prepared.host.hostReservations, outcome: correct ? 'ok' : 'failed', executionOutcome: outcome, rootRestored: restored ? 1 : 0 }"
+  ],
+  'entry/src/main/ets/vera/VeraSearchBenchmark.ets:p2HostDeadline': [
+    'host = new P2Host()', 'host.slowProbe = true;', 'vm = new VirtualMachine(module, host, 5000000, { now: p2Now, deadlineMs: 4 })',
+    "correct = outcome === 'budget' && host.probeCalls === 1",
+    "record: P2LogRecord = { event: 'host-deadline', mode: 'budget', deadlineMs: 4, synchronousHostMs: 8, hostCalls: host.probeCalls, cooperative: 1, steps: vm.stepsExecuted(), outcome: correct ? 'ok' : 'failed', executionOutcome: outcome }"
+  ],
+  'entry/src/main/ets/vera/VeraSmoke.ets:<module>': ["import { UiHostEnvironment, decodeVeraUi, VeraUiNode } from './VeraUi';"],
+  'entry/src/main/ets/vera/VeraSmoke.ets:smokeRun': ['host = new UiHostEnvironment()', 'vm = new VirtualMachine(deserializeVbc2(compiled.vbc2), host)', 'host.effectsAllowed = true;', 'host.effectsAllowed = false;', 'host.pendingEffects = [];'],
+  'entry/src/main/ets/vera/VeraSourceFind.ets:<module>': ["import { UiHostEnvironment, VeraUiNode, decodeVeraUi, formatVeraNumber } from './VeraUi';"],
+  'entry/src/main/ets/vera/VeraSourceFind.ets:sourceShownError': ['host = new UiHostEnvironment()', 'vm = new VirtualMachine(deserializeVbc2(vbc2), host)', 'host.effectsAllowed = true;', 'host.effectsAllowed = false;'],
+  'entry/src/main/ets/vera/VeraSurfacePlay.ets:<module>': ["import { UiHostEnvironment, decodeVeraUi, VeraUiNode } from './VeraUi';"],
+  'entry/src/main/ets/vera/VeraSurfacePlay.ets:playSurface': ['host = new UiHostEnvironment()', 'vm = new VirtualMachine(module, host)', 'host.effectsAllowed = true;', 'host.effectsAllowed = false;', 'host.pendingEffects = [];'],
+  'entry/src/main/ets/vera/VeraUi.ets:HostEffect.constructor': ['this.id = id;'],
+  'entry/src/main/ets/vera/VeraUi.ets:UiHostSafetyScope': ['private settle: (outcome: string) => void;', 'accept(): void', 'rollback(): void', 'discard(): void'],
+  'entry/src/main/ets/vera/VeraUi.ets:UiHostSafetyScope.constructor': ['this.settle = settle;'],
+  'entry/src/main/ets/vera/VeraUi.ets:UiHostSafetyScope.accept': ["this.settle('accept');"],
+  'entry/src/main/ets/vera/VeraUi.ets:UiHostSafetyScope.rollback': ["this.settle('rollback');"],
+  'entry/src/main/ets/vera/VeraUi.ets:UiHostSafetyScope.discard': ["this.settle('discard');"],
+  'entry/src/main/ets/vera/VeraInterpreter.ets:VirtualMachine.beginTurn': ['hostScope = this.host.beginSafetyTurn(() => this.reserveHost(token));'],
+  'entry/src/main/ets/vera/VeraInterpreter.ets:VirtualMachine.executeSafety': ['this.host.setSafetyPure(true);', 'this.host.setSafetyPure(false);'],
+  'entry/src/main/ets/vera/VeraUi.ets:UiHostEnvironment': [
+    'pendingEffects: HostEffect[] = [];', 'effectsAllowed: boolean = false;', 'private nextEffectId: number = 1;',
+    'private safetyRecord: UiHostSafetyRecord | null = null;', 'private safetyPure: boolean = false;', 'private safetyInvalid: boolean = false;', 'private invoking: boolean = false;',
+    'beginSafetyTurn(reserve: () => void): VmHostSafetyScope', 'setSafetyPure(pure: boolean): void', 'private checkSafetyIdle(): void', 'private settleSafety(record: UiHostSafetyRecord, outcome: string): void',
+    'invoke(module: string, name: string, args: RuntimeValue[], awaited: boolean): RuntimeValue', 'private invokeValue(module: string, name: string, args: RuntimeValue[], awaited: boolean): RuntimeValue', 'private queueSdk(args: RuntimeValue[]): RuntimeValue'
+  ],
+  'entry/src/main/ets/vera/VeraUi.ets:UiHostEnvironment.beginSafetyTurn': [
+    'this.checkSafetyIdle();', 'this.safetyRecord !== null || this.safetyPure', 'this.safetyRecord !== null', 'this.safetyRecord.failed = true;',
+    'record = new UiHostSafetyRecord(this.pendingEffects, this.nextEffectId, this.effectsAllowed, reserve)', 'this.safetyRecord = record;',
+    'this.settleSafety(record, outcome);'
+  ],
+  'entry/src/main/ets/vera/VeraUi.ets:UiHostEnvironment.setSafetyPure': ['this.checkSafetyIdle();', 'this.safetyPure = pure;'],
+  'entry/src/main/ets/vera/VeraUi.ets:UiHostEnvironment.checkSafetyIdle': ['this.invoking', 'this.safetyRecord !== null', 'this.safetyRecord.failed = true;', 'this.safetyInvalid'],
+  'entry/src/main/ets/vera/VeraUi.ets:UiHostEnvironment.settleSafety': [
+    'this.checkSafetyIdle();', 'this.safetyRecord !== record', 'this.safetyRecord !== null', 'this.safetyRecord.failed = true;', 'this.pendingEffects = record.queue;', 'this.nextEffectId = record.nextId;',
+    'this.pendingEffects.length = 0;', 'this.pendingEffects = record.queue;', 'this.safetyInvalid = true;', 'this.effectsAllowed = record.allowed;', 'this.safetyPure = false;', 'this.safetyRecord = null;'
+  ],
+  'entry/src/main/ets/vera/VeraUi.ets:UiHostEnvironment.invoke': [
+    'this.checkSafetyIdle();', 'this.safetyRecord !== null && this.safetyRecord.failed', 'this.invoking = true;',
+    'value = this.invokeValue(module, name, args, awaited)', 'this.safetyRecord !== null && this.safetyRecord.failed', 'this.safetyRecord !== null', 'this.safetyRecord.failed = true;', 'this.invoking = false;'
+  ],
+  'entry/src/main/ets/vera/VeraUi.ets:UiHostEnvironment.invokeValue': ['return this.queueSdk(args);'],
+  'entry/src/main/ets/vera/VeraUi.ets:UiHostEnvironment.queueSdk': [
+    'safety = this.safetyRecord !== null || this.safetyPure', '!safety && !this.effectsAllowed', 'this.safetyPure', 'safety && !this.effectsAllowed',
+    'this.safetyRecord !== null', 'this.safetyRecord.reserve();', 'this.safetyRecord.failed', 'id = this.nextEffectId', 'this.nextEffectId = id + 1;',
+    "effect = new HostEffect(id, 'sdk', 'call', values, safety ? handler : asString(args[2]))", 'this.pendingEffects.push(effect);', 'return new VeraNumberValue(id);'
+  ],
+  'entry/src/main/ets/vera/VeraUi.ets:<module>': ['nextNodeId: number = 0'],
+  'entry/src/main/ets/vera/VeraUi.ets:decodeVeraUi': ['nextNodeId = 0;'],
+  'entry/src/main/ets/vera/VeraUi.ets:decodeNode': ['node.id = nextNodeId;', 'nextNodeId += 1;'],
+  'entry/src/main/ets/vera/VeraWidgetRefine.ets:<module>': ["import { decodeVeraUi, UiHostEnvironment, VeraUiNode } from './VeraUi';"],
+  'entry/src/main/ets/vera/VeraWidgetRefine.ets:checkTaps': ['vm = new VirtualMachine(deserializeVbc2(vbc2), new UiHostEnvironment(), LIVE_MAX_STEPS)'],
+  'entry/src/main/ets/vera/VeraWidgetRefine.ets:deadPicture': ['vm = new VirtualMachine(deserializeVbc2(vbc2), new UiHostEnvironment(), LIVE_MAX_STEPS)'],
+  'entry/src/main/ets/vera/VeraWidgetRefine.ets:checkRefresh': ['host = new UiHostEnvironment()', 'vm = new VirtualMachine(deserializeVbc2(vbc2), host, LIVE_MAX_STEPS)'],
+  'entry/src/main/ets/vera/VeraWorldPlay.ets:<module>': ["import { UiHostEnvironment, decodeVeraUi, VeraUiNode } from './VeraUi';"],
+  'entry/src/main/ets/vera/VeraWorldPlay.ets:WorldPlay': ['readonly host: UiHostEnvironment;'],
+  'entry/src/main/ets/vera/VeraWorldPlay.ets:WorldPlay.constructor': ['host: UiHostEnvironment', 'this.host = host;'],
+  'entry/src/main/ets/vera/VeraWorldPlay.ets:WorldPlay.handle': ['this.host.effectsAllowed = true;', 'this.host.effectsAllowed = false;', 'this.host.pendingEffects = [];'],
+  'entry/src/main/ets/vera/VeraWorldPlay.ets:playWorld': ['host = new UiHostEnvironment()', 'vm = new VirtualMachine(module, host)', 'play = new WorldPlay(world as VeraUiNode, state, vm, host, module)']
+}
+function hostSources() {
+  const sources = new Map()
+  const repo = path.resolve(root, '../../../..')
+  function walk(dir) {
+    if (!fs.existsSync(dir)) return
+    for (const item of fs.readdirSync(dir, { withFileTypes: true })) {
+      const file = path.join(dir, item.name)
+      if (item.isDirectory()) walk(file)
+      else if (item.isFile() && hostGuardCoverage.extensions.includes(path.extname(file))) {
+        sources.set(path.relative(repo, file).split(path.sep).join('/'), fs.readFileSync(file, 'utf8'))
+      }
+    }
+  }
+  for (const dir of hostGuardCoverage.roots) walk(path.join(repo, dir))
+  assert(sources.has('entry/src/main/ets/vera/VeraUi.ets'))
+  return sources
+}
+const hostBodyBaseline = {
+  'entry/src/main/ets/runtime/AppActor.ets:AppActorTurnCoordinator.constructor': `{
+    this.state = state
+    this.vm = vm
+    this.host = host
+    this.mode = mode
+    this.policy = policy
+    this.callbacks = callbacks
+    this.generation = state.status().vmGeneration
+    if (state.status().mode !== mode || host.pendingEffects.length !== 0) {
+      throw new AppActorTurnError('STATE_VALIDATION_FAILED', 'state')
+    }
+    this.assertAvailable()
+    this.host.effectsAllowed = false
+  }`,
+  'entry/src/main/ets/runtime/AppActor.ets:AppActorTurnCoordinator.runTurn': `{
+    this.assertIdle()
+    if (calls.length === 0) { throw new AppActorTurnError('STATE_VALIDATION_FAILED', 'handler') }
+    if (this.mode === 'PREVIEW' && source !== 'INIT' && source !== 'CARRY') {
+      throw new AppActorTurnError('STATE_PREVIEW_SUPPRESSED', 'handler')
+    }
+    let owner = this.owner()
+    let commitClass = this.policy.classify(source, persist)
+    let admitted = calls.map((call: AppActorTurnCall): AppActorTurnCall => {
+      return { entry: call.entry, args: call.args.slice(), useState: call.useState }
+    })
+    this.currentPhase = 'EXECUTING'
+    let release: () => void = (): void => {}
+    this.settlement = new Promise<void>((resolve: () => void): void => { release = resolve })
+    try {
+      if (this.mode === 'LIVE_PERSISTENT' && commitClass === 'IMMEDIATE') {
+        let ready = this.checkpointReady
+        if (ready !== null) { await ready }
+        await this.state.awaitReadyForImmediate()
+        this.assertOwner(owner)
+        this.assertAvailable()
+        if (this.checkpointReload) { await this.publishCheckpointReload(owner) }
+      }
+      let tx: StateTransaction | null = null
+      let submitted = false
+      let result: StateAcceptanceResult
+      let hasEffects = false
+      try {
+        tx = this.state.beginTurn(commitClass, source)
+        this.host.effectsAllowed = this.mode !== 'PREVIEW'
+        for (let call of admitted) {
+          let args = call.useState ? [this.state.getWorkingState()].concat(call.args) : call.args
+          let value = this.vm.execute(call.entry, args)
+          this.assertOwner(owner)
+          this.state.setWorkingState(tx, value)
+          if (this.host.pendingEffects.length > 0) { this.state.markEffects(tx) }
+        }
+        hasEffects = this.host.pendingEffects.length > 0
+        this.host.effectsAllowed = false
+        this.currentPhase = 'COMMIT_PENDING'
+        submitted = true
+        this.recovering++
+        try { result = await this.state.commitTurn(tx) }
+        finally { this.recovering-- }
+      } catch (error) {
+        if (tx !== null && !submitted) {
+          try { this.state.rollbackTurn(tx) }
+          catch (_error) { this.currentPhase = 'FAULTED' }
+        } else if (submitted) {
+          this.currentPhase = 'FAULTED'
+        }
+        this.host.pendingEffects = []
+        throw error as Error
+      } finally {
+        this.host.effectsAllowed = false
+      }
+      if (result.status === 'STALE_REVISION' || result.status === 'FAILED' &&
+          (result.stage === 'turn-base-invalid' || result.stage === 'promotion-base-invalid')) {
+        this.host.pendingEffects = []
+        let refusal = new AppActorTurnError(result.status === 'FAILED' ? result.code : result.status, 'state', result)
+        this.assertLocalOwner(owner)
+        let status = this.state.status()
+        if (!status.needsReload && (status.phase === 'READY' || status.phase === 'DEGRADED')) {
+          owner = this.adoptRecovery(owner)
+          this.currentPhase = 'PUBLISHING'
+          try { await this.publish(null, [], owner) }
+          catch (error) {
+            this.assertOwner(owner)
+            this.issue(error as Error, 'render')
+          }
+        }
+        throw refusal
+      }
+      owner = this.alignOwner(owner)
+      this.observeFault()
+      if (result.status !== 'COMMITTED' && result.status !== 'IN_MEMORY' && result.status !== 'UNCHANGED') {
+        this.host.pendingEffects = []
+        let issue = new AppActorTurnError(result.status === 'FAILED' || result.status === 'COMMIT_UNCERTAIN' ?
+          result.code : result.status, 'state', result)
+        if (result.status === 'COMMIT_UNCERTAIN' || result.status === 'FENCED_COMMIT') {
+          this.currentPhase = 'FAULTED'
+        }
+        if (this.policy.effective(commitClass, hasEffects) !== 'THROTTLED' ||
+            !this.policy.transient(result) || this.currentPhase === 'FAULTED') { throw issue }
+        this.assertAvailable()
+        if (this.mode !== 'PREVIEW') { this.issue(issue as Error, 'state') }
+      }
+      this.assertAvailable()
+      if (this.mode === 'PREVIEW') {
+        this.host.pendingEffects = []
+        return result
+      }
+      if (hasEffects && this.mode === 'LIVE_PERSISTENT' && result.status !== 'COMMITTED') {
+        this.currentPhase = 'FAULTED'
+        this.host.pendingEffects = []
+        throw new AppActorTurnError('STATE_COMMIT_UNCERTAIN', 'state', result)
+      }
+      let effects = this.host.pendingEffects
+      this.host.pendingEffects = []
+      this.currentPhase = 'PUBLISHING'
+      this.flushCheckpoint(owner)
+      await this.publish(result, effects, owner)
+      return result
+    } catch (error) {
+      this.host.pendingEffects = []
+      if (this.mode === 'PREVIEW') { throw error as Error }
+      if (!this.owns(owner)) { throw new AppActorTurnError('STATE_UNAVAILABLE', 'state') }
+      throw this.issue(error as Error, 'handler')
+    } finally {
+      this.host.effectsAllowed = false
+      this.observeFault()
+      if (this.currentPhase !== 'FAULTED') { this.flushCheckpoint(owner) }
+      if (this.phase() !== 'FAULTED') { this.currentPhase = 'READY' }
+      release()
+    }
+  }`,
+  'entry/src/main/ets/runtime/AppActor.ets:AppActorTurnCoordinator.publish': `{
+    this.publications++
+    try { await this.publishOwned(result, effects, owner) }
+    finally { this.publications-- }
+  }`,
+  'entry/src/main/ets/runtime/AppActor.ets:AppActorTurnCoordinator.publishOwned': `{
+    this.assertOwner(owner)
+    let version = this.version()
+    let failure: AppActorTurnError | null = null
+    try {
+      if (this.mode === 'LIVE_EPHEMERAL') {
+        this.deliverSnapshot({
+          mode: version.mode, vmGeneration: version.vmGeneration, stateRevision: 0,
+          encoded: this.state.captureWorkingSnapshot()
+        }, owner)
+      } else if (result === null || result.status === 'COMMITTED' ||
+          result.status === 'UNCHANGED' && result.reason === 'INIT_EQUAL') {
+        this.deliverSnapshot(this.committed(version, result), owner)
+      }
+    } catch (error) {
+      failure = new AppActorTurnError((error as Error).message, 'snapshot', result)
+    }
+    this.assertOwner(owner)
+    if (this.currentPhase === 'FAULTED') { throw failure! }
+    try {
+      if (effects.length > 0) {
+        this.callbacks.effects({
+          mode: version.mode, vmGeneration: version.vmGeneration,
+          stateRevision: version.stateRevision, effects: effects
+        })
+      }
+    } catch (error) {
+      if (failure === null) { failure = new AppActorTurnError((error as Error).message, 'effects', result) }
+    }
+    this.assertOwner(owner)
+    this.assertAvailable()
+    let reading = true
+    let pure = (call: AppActorTurnCall): RuntimeValue => {
+      this.assertOwner(owner)
+      this.assertAvailable()
+      if (!reading) { throw new AppActorTurnError('STATE_TURN_PENDING', 'view') }
+      return this.executePure(call)
+    }
+    try {
+      let delivery: void | Promise<void>
+      try { delivery = this.callbacks.render(version, pure) }
+      finally { reading = false }
+      await delivery
+    } catch (error) {
+      if (failure === null) { failure = new AppActorTurnError((error as Error).message, 'render', result) }
+    }
+    this.assertOwner(owner)
+    if (failure !== null) { throw failure }
+  }`,
+  'entry/src/main/ets/runtime/AppActor.ets:AppActorTurnCoordinator.fence': `{
+    if (this.fenced) { return }
+    this.fenced = true
+    this.epoch++
+    this.currentPhase = 'FAULTED'
+    this.checkpointDelivery = null
+    this.host.effectsAllowed = false
+    this.host.pendingEffects = []
+  }`,
+  'entry/src/main/ets/vera/VeraSearchBenchmark.ets:P2Host.beginSafetyTurn': `{
+    return super.beginSafetyTurn((): void => { reserve(); this.hostReservations += 1 })
+  }`,
+  'entry/src/main/ets/vera/VeraSearchBenchmark.ets:P2Host.invoke': `{
+    if (module === 'std/p2' && name === 'wait' && this.slowProbe) {
+      this.probeCalls += 1
+      let until = p2Now() + 8
+      while (p2Now() < until) {}
+      return NULL_VALUE
+    }
+    if (module === 'std/time') {
+      if (name === 'nowMillis') { return new VeraNumberValue(1700000000000) }
+      if (name === 'nowSeconds') { return new VeraNumberValue(1700000000) }
+      if (name === 'daysSinceEpoch') { return new VeraNumberValue(19675) }
+      if (name === 'millisOfDay') { return new VeraNumberValue(43200000) }
+      if (name === 'hourOfDay') { return new VeraNumberValue(12) }
+      if (name === 'minuteOfHour') { return new VeraNumberValue(0) }
+      if (name === 'weekday') { return new VeraNumberValue(2) }
+      if (name === 'dayOfMonth') { return new VeraNumberValue(14) }
+      if (name === 'monthOfYear') { return new VeraNumberValue(11) }
+      if (name === 'year') { return new VeraNumberValue(2023) }
+    } else if (module === 'std/ui' || module === 'std/math' || module === 'std/strings' ||
+        module === 'std/gfx' || module === 'std/scene' || (module === 'std/sdk' && name === 'call')) {
+      return super.invoke(module, name, args, awaited)
+    }
+    this.blockedCalls += 1
+    throw new RuntimeTrap('R0015', 'P2_BLOCKED')
+  }`,
+  'UiHostSafetyScope.constructor': `{
+    this.settle = settle
+  }`,
+  'UiHostSafetyScope.accept': `{ this.settle('accept') }`,
+  'UiHostSafetyScope.rollback': `{ this.settle('rollback') }`,
+  'UiHostSafetyScope.discard': `{ this.settle('discard') }`,
+  'UiHostSafetyRecord.constructor': `{
+    this.queue = queue
+    this.entries = queue.slice()
+    this.nextId = nextId
+    this.allowed = allowed
+    this.reserve = reserve
+  }`,
+  'UiHostEnvironment.beginSafetyTurn': `{
+    this.checkSafetyIdle()
+    if (this.safetyRecord !== null || this.safetyPure) {
+      if (this.safetyRecord !== null) { this.safetyRecord.failed = true }
+      throw new RuntimeTrap('R-TURN', 'host safety turn already active')
+    }
+    let record = new UiHostSafetyRecord(this.pendingEffects, this.nextEffectId, this.effectsAllowed, reserve)
+    this.safetyRecord = record
+    return new UiHostSafetyScope((outcome: string): void => { this.settleSafety(record, outcome) })
+  }`,
+  'UiHostEnvironment.setSafetyPure': `{
+    this.checkSafetyIdle()
+    this.safetyPure = pure
+  }`,
+  'UiHostEnvironment.checkSafetyIdle': `{
+    if (this.invoking) {
+      if (this.safetyRecord !== null) { this.safetyRecord.failed = true }
+      throw new RuntimeTrap('R-TURN', 'host invoke is active')
+    }
+    if (this.safetyInvalid) { throw new RuntimeTrap('R-TURN', 'host safety instance discarded') }
+  }`,
+  'UiHostEnvironment.settleSafety': `{
+    this.checkSafetyIdle()
+    if (this.safetyRecord !== record) {
+      if (this.safetyRecord !== null) { this.safetyRecord.failed = true }
+      throw new RuntimeTrap('R-TURN', 'host safety scope already settled')
+    }
+    if (outcome === 'accept' && record.failed) { throw new RuntimeTrap('R-TURN', 'host safety scope failed') }
+    if (outcome === 'rollback') {
+      record.queue.length = 0
+      for (let effect of record.entries) { record.queue.push(effect) }
+      this.pendingEffects = record.queue
+      this.nextEffectId = record.nextId
+    }
+    if (outcome === 'discard') {
+      this.pendingEffects.length = 0
+      record.queue.length = 0
+      this.pendingEffects = record.queue
+      this.safetyInvalid = true
+    }
+    this.effectsAllowed = record.allowed
+    this.safetyPure = false
+    this.safetyRecord = null
+    record.queue = []
+    record.entries = []
+    record.reserve = (): void => {}
+  }`,
+  'UiHostEnvironment.invoke': `{
+    this.checkSafetyIdle()
+    if (this.safetyRecord !== null && this.safetyRecord.failed) {
+      throw new RuntimeTrap('R-TURN', 'host safety scope failed')
+    }
+    this.invoking = true
+    try {
+      let value = this.invokeValue(module, name, args, awaited)
+      if (this.safetyRecord !== null && this.safetyRecord.failed) {
+        throw new RuntimeTrap('R-TURN', 'host safety scope failed')
+      }
+      return value
+    } catch (e) {
+      if (this.safetyRecord !== null) { this.safetyRecord.failed = true }
+      throw e as Error
+    } finally {
+      this.invoking = false
+    }
+  }`,
+  'UiHostEnvironment.queueSdk': `{
+    let safety = this.safetyRecord !== null || this.safetyPure
+    if (!safety && !this.effectsAllowed) {
+      throw new RuntimeTrap('R0026', 'sdk.call may only be called from a handler, not from view')
+    }
+    let target = asString(args[0]).trim()
+    let pairs = asArray(args[1]).elements
+    if (pairs.length % 2 !== 0) {
+      throw new RuntimeTrap('R0027', 'sdk.call parameters are name and value in pairs; got ' + pairs.length.toString() + ' items')
+    }
+    let values = new Map<string, string>()
+    let order: string[] = []
+    for (let i = 0; i + 1 < pairs.length; i = i + 2) {
+      let key = asString(pairs[i]).trim()
+      if (safety) { asString(pairs[i + 1]) }
+      if (key.length === 0) { continue }
+      values.set(key, asString(pairs[i + 1]))
+      order.push(key)
+    }
+    let mode = args.length > 3 ? asString(args[3]) : 'background'
+    let handler = safety ? asString(args[2]) : ''
+    if (this.safetyPure) { throw new RuntimeTrap('R-PURE', 'sdk.call is unavailable during pure execution') }
+    if (safety && !this.effectsAllowed) {
+      throw new RuntimeTrap('R0026', 'sdk.call may only be called from a handler, not from view')
+    }
+    if (this.safetyRecord !== null) {
+      this.safetyRecord.reserve()
+      if (this.safetyRecord.failed) { throw new RuntimeTrap('R-TURN', 'host safety scope failed') }
+    }
+    let id = this.nextEffectId
+    this.nextEffectId = id + 1
+    let effect = new HostEffect(id, 'sdk', 'call', values, safety ? handler : asString(args[2]))
+    effect.rawTarget = target
+    effect.rawParams = order.join(' ')
+    effect.rawMode = mode
+    this.pendingEffects.push(effect)
+    return new VeraNumberValue(id)
+  }`,
+  decodeVeraUi: `{
+    nextNodeId = 0
+    if (value instanceof VeraObjectValue) {
+      return [decodeNode(value as VeraObjectValue, 0)]
+    }
+    return []
+  }`,
+  decodeNode: `{
+    if (depth > 8) { throw new RuntimeTrap('R0021', 'view tree too deep (max 8)') }
+    let node = new VeraUiNode()
+    node.id = nextNodeId
+    nextNodeId += 1
+    for (let entry of obj.fields.entries()) {
+      let key: string = entry[0]
+      let v: RuntimeValue = entry[1]
+      switch (key) {
+        case 'type':
+          if (v instanceof VeraStringValue) { node.kind = (v as VeraStringValue).value }
+          break
+        case 'style':
+          if (v instanceof VeraStringValue) { node.style = (v as VeraStringValue).value }
+          break
+        case 'text':
+          if (v instanceof VeraStringValue) { node.text = (v as VeraStringValue).value }
+          break
+        case 'src':
+          if (v instanceof VeraStringValue) { node.source = (v as VeraStringValue).value }
+          break
+        case 'alt':
+          if (v instanceof VeraStringValue) { node.alt = (v as VeraStringValue).value }
+          break
+        case 'action':
+          if (v instanceof VeraStringValue) { node.action = (v as VeraStringValue).value }
+          break
+        case 'label':
+          if (v instanceof VeraStringValue) { node.label = (v as VeraStringValue).value }
+          break
+        case 'tickerId':
+          if (v instanceof VeraStringValue) { node.tickerId = (v as VeraStringValue).value }
+          break
+        case 'commands':
+          if (v instanceof VeraStringValue) { node.commands = (v as VeraStringValue).value }
+          break
+        case 'prefix':
+          if (v instanceof VeraStringValue) { node.prefix = (v as VeraStringValue).value }
+          break
+        case 'icon':
+          if (v instanceof VeraStringValue) { node.icon = (v as VeraStringValue).value }
+          break
+        case 'suffix':
+          if (v instanceof VeraStringValue) { node.suffix = (v as VeraStringValue).value }
+          break
+        case 'value':
+          if (v instanceof VeraNumberValue) { node.eventValue = (v as VeraNumberValue).value }
+          else if (v instanceof VeraStringValue) { node.value = (v as VeraStringValue).value }
+          break
+        case 'eventValue':
+          if (v instanceof VeraNumberValue) { node.eventValue = (v as VeraNumberValue).value }
+          break
+        case 'numberValue':
+          if (v instanceof VeraNumberValue) { node.numberValue = (v as VeraNumberValue).value }
+          break
+        case 'minimumDigits':
+          if (v instanceof VeraNumberValue) { node.minimumDigits = (v as VeraNumberValue).value }
+          break
+        case 'decimals':
+          if (v instanceof VeraNumberValue) { node.decimals = (v as VeraNumberValue).value }
+          break
+        case 'step':
+          if (v instanceof VeraNumberValue) { node.step = (v as VeraNumberValue).value }
+          break
+        case 'spinPeriodMs':
+          if (v instanceof VeraNumberValue) { node.spinPeriodMs = (v as VeraNumberValue).value }
+          break
+        case 'columns':
+          if (v instanceof VeraNumberValue) { node.columns = (v as VeraNumberValue).value }
+          break
+        case 'minimum':
+          if (v instanceof VeraNumberValue) { node.minimum = (v as VeraNumberValue).value }
+          break
+        case 'maximum':
+          if (v instanceof VeraNumberValue) { node.maximum = (v as VeraNumberValue).value }
+          break
+        case 'checked':
+          if (v instanceof VeraBooleanValue) { node.checked = (v as VeraBooleanValue).value }
+          break
+        case 'enabled':
+          if (v instanceof VeraBooleanValue) { node.enabled = (v as VeraBooleanValue).value }
+          break
+        case 'bars':
+          if (v instanceof VeraBooleanValue) { node.bars = (v as VeraBooleanValue).value }
+          break
+        case 'options':
+          if (v instanceof VeraArrayValue) {
+            let opts: string[] = []
+            for (let o of (v as VeraArrayValue).elements) {
+              if (o instanceof VeraStringValue) { opts.push((o as VeraStringValue).value) }
+            }
+            node.options = opts
+          }
+          break
+        case 'series':
+          if (v instanceof VeraArrayValue) {
+            let nums: number[] = []
+            for (let n of (v as VeraArrayValue).elements) {
+              if (n instanceof VeraNumberValue) { nums.push((n as VeraNumberValue).value) }
+            }
+            node.series = nums
+          }
+          break
+        case 'series2':
+          if (v instanceof VeraArrayValue) {
+            let nums2: number[] = []
+            for (let n of (v as VeraArrayValue).elements) {
+              if (n instanceof VeraNumberValue) { nums2.push((n as VeraNumberValue).value) }
+            }
+            node.series2 = nums2
+          }
+          break
+        case 'series2Style':
+          if (v instanceof VeraStringValue) { node.series2Style = (v as VeraStringValue).value }
+          break
+        case 'seriesLabel':
+          if (v instanceof VeraStringValue) { node.seriesLabel = (v as VeraStringValue).value }
+          break
+        case 'series2Label':
+          if (v instanceof VeraStringValue) { node.series2Label = (v as VeraStringValue).value }
+          break
+        case 'categories':
+          if (v instanceof VeraArrayValue) {
+            let cats: string[] = []
+            for (let c of (v as VeraArrayValue).elements) {
+              if (c instanceof VeraStringValue) { cats.push((c as VeraStringValue).value) }
+            }
+            node.categories = cats
+          }
+          break
+        case 'keyboardType':
+          if (v instanceof VeraStringValue) { node.keyboardType = (v as VeraStringValue).value }
+          break
+        case 'required':
+          if (v instanceof VeraBooleanValue) { node.required = (v as VeraBooleanValue).value }
+          break
+        case 'requiredMessage':
+          if (v instanceof VeraStringValue) { node.requiredMessage = (v as VeraStringValue).value }
+          break
+        case 'minLength':
+          if (v instanceof VeraNumberValue) { node.minLength = (v as VeraNumberValue).value }
+          break
+        case 'minLengthMessage':
+          if (v instanceof VeraStringValue) { node.minLengthMessage = (v as VeraStringValue).value }
+          break
+        case 'maxLength':
+          if (v instanceof VeraNumberValue) { node.maxLength = (v as VeraNumberValue).value }
+          break
+        case 'maxLengthMessage':
+          if (v instanceof VeraStringValue) { node.maxLengthMessage = (v as VeraStringValue).value }
+          break
+        case 'pattern':
+          if (v instanceof VeraStringValue) { node.pattern = (v as VeraStringValue).value }
+          break
+        case 'patternMessage':
+          if (v instanceof VeraStringValue) { node.patternMessage = (v as VeraStringValue).value }
+          break
+        case 'email':
+          if (v instanceof VeraBooleanValue) { node.email = (v as VeraBooleanValue).value }
+          break
+        case 'emailMessage':
+          if (v instanceof VeraStringValue) { node.emailMessage = (v as VeraStringValue).value }
+          break
+        case 'children':
+          if (v instanceof VeraArrayValue) {
+            for (let child of (v as VeraArrayValue).elements) {
+              if (child instanceof VeraObjectValue) {
+                node.children.push(decodeNode(child as VeraObjectValue, depth + 1))
+              }
+            }
+          }
+          break
+        default:
+          break
+      }
+    }
+    node.style = resolveStyle(node.kind, node.style)
+    if (node.series2Style.length > 0) { node.series2Style = resolveStyle(node.kind, node.series2Style) }
+    return node
+  }`
+}
+function hostCanonical(text) {
+  const source = ts.createSourceFile('host-site.ts', text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+  const tokens = []
+  function visit(node) {
+    if (node.kind >= ts.SyntaxKind.FirstToken && node.kind <= ts.SyntaxKind.LastToken) tokens.push(node)
+    else for (const child of node.getChildren(source)) visit(child)
+  }
+  visit(source)
+  let end = 0, result = ''
+  for (const token of tokens) {
+    const start = token.getStart(source)
+    result += text.slice(end, start).replace(/\s+/g, ' ') + text.slice(start, token.end)
+    end = token.end
+  }
+  return (result + text.slice(end).replace(/\s+/g, ' ')).trim()
+}
+function hostInventory(sources) {
+  const inventory = {}
+  const printer = ts.createPrinter({ removeComments: true, newLine: ts.NewLineKind.LineFeed })
+  for (const [file, text] of [...sources].sort(([a], [b]) => a.localeCompare(b))) {
+    const source = ts.createSourceFile(file.replace(/\.ets$/, '.ts'), text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+    const nodes = []
+    function visit(node) { nodes.push(node); ts.forEachChild(node, visit) }
+    visit(source)
+    const print = node => hostCanonical(printer.printNode(ts.EmitHint.Unspecified, node, source))
+    const hostTypes = new Set(['UiHostEnvironment', 'UiHost'])
+    for (const node of nodes) {
+      if (ts.isImportSpecifier(node) && hostTypes.has((node.propertyName || node.name).text)) hostTypes.add(node.name.text)
+    }
+    for (let changed = true; changed;) {
+      const size = hostTypes.size
+      for (const node of nodes) {
+        if (ts.isClassDeclaration(node) && node.name && node.heritageClauses?.some(clause =>
+          clause.token === ts.SyntaxKind.ExtendsKeyword && clause.types.some(type => ts.isIdentifier(type.expression) && hostTypes.has(type.expression.text)))) hostTypes.add(node.name.text)
+      }
+      changed = size !== hostTypes.size
+    }
+    const aliases = new Set(hostTypes)
+    const sensitive = new Set(['pendingEffects', 'effectsAllowed', 'nextEffectId', 'nextNodeId', 'beginSafetyTurn', 'setSafetyPure'])
+    const unwrap = node => {
+      while (node && (ts.isParenthesizedExpression(node) || ts.isAsExpression(node) || ts.isTypeAssertionExpression(node) || ts.isNonNullExpression(node))) node = node.expression
+      return node
+    }
+    const owner = node => {
+      const names = []
+      for (let at = node.parent; at && at !== source; at = at.parent) {
+        if (ts.isClassDeclaration(at) || ts.isFunctionDeclaration(at) || ts.isMethodDeclaration(at)) names.unshift(at.name ? print(at.name) : '<anonymous>')
+        else if (ts.isConstructorDeclaration(at)) names.unshift('constructor')
+      }
+      return names.join('.') || '<module>'
+    }
+    const internal = node => hostTypes.has(owner(node).split('.')[0]) || owner(node).split('.')[0] === 'UiHostSafetyScope'
+    const nameOf = node => ts.isPropertyAccessExpression(node) ? node.name.text : ts.isElementAccessExpression(node) && node.argumentExpression && ts.isStringLiteralLike(node.argumentExpression) ? node.argumentExpression.text : ''
+    const hostType = node => node && print(node).split(/\W+/).some(name => hostTypes.has(name))
+    const hostLike = raw => {
+      if (raw && (ts.isAsExpression(raw) || ts.isTypeAssertionExpression(raw)) && hostType(raw.type)) return true
+      if (raw && (ts.isParenthesizedExpression(raw) || ts.isNonNullExpression(raw) || ts.isAsExpression(raw) || ts.isTypeAssertionExpression(raw))) return hostLike(raw.expression)
+      const node = unwrap(raw)
+      if (!node) return false
+      if (ts.isIdentifier(node)) return aliases.has(node.text)
+      if (node.kind === ts.SyntaxKind.ThisKeyword) return internal(node)
+      if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) return aliases.has(nameOf(node)) || hostLike(node.expression)
+      if (ts.isNewExpression(node)) return hostLike(node.expression)
+      return false
+    }
+    function bind(name) {
+      if (ts.isIdentifier(name)) aliases.add(name.text)
+      else if (ts.isObjectBindingPattern(name) || ts.isArrayBindingPattern(name)) for (const element of name.elements) if (ts.isBindingElement(element)) bind(element.name)
+    }
+    function bindTarget(raw) {
+      const node = unwrap(raw)
+      if (!node) return
+      if (ts.isIdentifier(node)) aliases.add(node.text)
+      else if (ts.isPropertyAccessExpression(node)) aliases.add(node.name.text)
+      else if (ts.isElementAccessExpression(node) && nameOf(node)) aliases.add(nameOf(node))
+      else if (ts.isObjectLiteralExpression(node)) {
+        for (const item of node.properties) {
+          if (ts.isPropertyAssignment(item)) bindTarget(item.initializer)
+          else if (ts.isShorthandPropertyAssignment(item)) bindTarget(item.name)
+          else if (ts.isSpreadAssignment(item)) bindTarget(item.expression)
+        }
+      } else if (ts.isArrayLiteralExpression(node)) {
+        for (const item of node.elements) bindTarget(ts.isSpreadElement(item) ? item.expression : item)
+      } else if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) bindTarget(node.left)
+    }
+    const sensitiveKey = node => node && (ts.isIdentifier(node) || ts.isStringLiteralLike(node) ? sensitive.has(node.text) : ts.isComputedPropertyName(node) && sensitiveKey(node.expression))
+    for (const node of nodes) {
+      if (ts.isBindingElement(node) && sensitiveKey(node.propertyName || node.name)) bind(node.name)
+      if (ts.isPropertyAssignment(node) && sensitiveKey(node.name)) bindTarget(node.initializer)
+      if (ts.isShorthandPropertyAssignment(node) && sensitiveKey(node.name)) bindTarget(node.name)
+      if (ts.isImportSpecifier(node) && ['UiHostEnvironment', 'UiHost'].includes((node.propertyName || node.name).text)) aliases.add(node.name.text)
+      if ((ts.isVariableDeclaration(node) || ts.isParameter(node) || ts.isPropertyDeclaration(node)) && hostType(node.type)) bind(node.name)
+    }
+    for (let changed = true; changed;) {
+      const size = aliases.size
+      for (const node of nodes) {
+        if (ts.isVariableDeclaration(node) && hostLike(node.initializer)) bind(node.name)
+        if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken && hostLike(node.right)) {
+          bindTarget(node.left)
+        }
+      }
+      changed = size !== aliases.size
+    }
+    const sites = new Set()
+    for (const node of nodes) {
+      const property = ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)
+      const identifier = ts.isIdentifier(node)
+      const declaration = (ts.isPropertyDeclaration(node) || ts.isMethodDeclaration(node)) && internal(node)
+      const hit = declaration || (property && (sensitive.has(nameOf(node)) || aliases.has(nameOf(node)) || hostLike(node.expression))) ||
+        (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === 'nextNodeId') ||
+        ((ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) && node.moduleSpecifier && /(?:^|\/)VeraUi$/.test(node.moduleSpecifier.text)) ||
+        (identifier && (node.text === 'nextNodeId' || aliases.has(node.text))) || (node.kind === ts.SyntaxKind.ThisKeyword && internal(node) && !ts.isPropertyAccessExpression(node.parent))
+      if (!hit) continue
+      if (identifier && ((ts.isPropertyAccessExpression(node.parent) && node.parent.name === node) ||
+          ((ts.isVariableDeclaration(node.parent) || ts.isParameter(node.parent) || ts.isPropertyDeclaration(node.parent) || ts.isClassDeclaration(node.parent)) && node.parent.name === node))) continue
+      let site = node
+      while (site.parent && site.parent !== source && !ts.isStatement(site) && !ts.isVariableDeclaration(site) && !ts.isParameter(site) && !ts.isPropertyDeclaration(site) && !ts.isMethodDeclaration(site) && !ts.isHeritageClause(site) && !ts.isImportDeclaration(site) &&
+          !ts.isIfStatement(site.parent) && !ts.isForOfStatement(site.parent) && !ts.isForStatement(site.parent) && !ts.isWhileStatement(site.parent)) site = site.parent
+      if (ts.isMethodDeclaration(site)) {
+        const signature = print(site).split(' {')[0]
+        const key = file + ':' + owner(site)
+        if (!inventory[key]) inventory[key] = []
+        if (!sites.has(site)) inventory[key].push(signature)
+      } else {
+        const key = file + ':' + owner(site)
+        if (!inventory[key]) inventory[key] = []
+        if (!sites.has(site)) inventory[key].push(print(site))
+      }
+      sites.add(site)
+    }
+  }
+  return inventory
+}
+function checkHostBodies(sources) {
+  const uiFile = 'entry/src/main/ets/vera/VeraUi.ets'
+  const files = new Set([uiFile, ...Object.keys(hostBodyBaseline).filter(name => name.includes(':')).map(name => name.split(':')[0])])
+  const printer = ts.createPrinter({ removeComments: true, newLine: ts.NewLineKind.LineFeed })
+  const print = (body, parsed) => hostCanonical(printer.printNode(ts.EmitHint.Unspecified, body, parsed))
+  const actual = {}, expected = {}
+  for (const file of files) {
+    assert(sources.has(file), 'missing pinned host source: ' + file)
+    const source = ts.createSourceFile(file, sources.get(file), ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+    function visit(node) {
+      let name = ''
+      if (node.parent && ts.isClassDeclaration(node.parent)) {
+        const owner = node.parent.name?.text
+        const member = ts.isConstructorDeclaration(node) ? 'constructor' : ts.isMethodDeclaration(node) ? node.name.getText(source) : ''
+        const key = (file === uiFile ? '' : file + ':') + owner + '.' + member
+        if (member && Object.hasOwn(hostBodyBaseline, key)) name = key
+      }
+      if (file === uiFile && ts.isFunctionDeclaration(node) && ['decodeVeraUi', 'decodeNode'].includes(node.name?.text)) name = node.name.text
+      if (name) {
+        assert(!Object.hasOwn(actual, name), 'duplicate pinned host body: ' + name)
+        assert(node.body, 'missing pinned host body: ' + name)
+        actual[name] = print(node.body, source)
+      }
+      ts.forEachChild(node, visit)
+    }
+    visit(source)
+  }
+  for (const [name, body] of Object.entries(hostBodyBaseline)) {
+    const parsed = ts.createSourceFile('approved.ts', 'function approved() ' + body, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+    assert.equal(parsed.parseDiagnostics.length, 0)
+    expected[name] = print(parsed.statements[0].body, parsed)
+  }
+  assert.deepEqual(actual, expected, 'P3 approved host mutation bodies/control changed')
+}
+function checkHostInventory(sources) {
+  assert.deepEqual(hostInventory(sources), hostBaseline, 'P3 host access inventory changed; review owner-scoped normalized sites, order and escapes')
+  checkHostBodies(sources)
+}
+test('P3 future C contracts, implemented B root rollback and D decode scratch stay distinct from legacy characterization', () => {
+  assert.equal(hostBookkeeping.filter(row => row.class === 'C').length, 11)
+  assert.equal(hostBookkeeping.filter(row => row.class === 'B').length, 1)
+  assert.equal(hostBookkeeping.filter(row => row.class === 'D').length, 2)
+  for (const row of hostBookkeeping) assert(row.owner && row.legacy && row.required)
+})
+test('P3 bounded actual-source host inventory', () => {
+  const sources = hostSources()
+  checkHostInventory(sources)
+  console.log('P3 inventory: ' + sources.size + ' source files scanned; ' + Object.keys(hostBaseline).length +
+    ' owner scopes; ' + Object.values(hostBaseline).reduce((count, sites) => count + sites.length, 0) + ' ordered baseline sites; ' + Object.keys(hostBodyBaseline).length + ' approved mutation bodies; 11 C future contracts / 1 B implemented root rollback / 2 D decode-only contracts')
+  console.log('P3 limits: ' + hostGuardCoverage.limits)
+})
+const hostProbeFile = 'entry/src/main/ets/vera/VeraUi.ets'
+const hostNegativeProbes = [
+  ['extra pendingEffects.push', hostProbeFile, 'this.pendingEffects.push(effect)', 'this.pendingEffects.push(effect); this.pendingEffects.push(effect)'],
+  ['review queue loop duplication', hostProbeFile, 'this.pendingEffects.push(effect)', 'for (let repeat=0;repeat<(values.has("repeat")?2:1);repeat++){this.pendingEffects.push(effect)}'],
+  ['review conditional decode increment', hostProbeFile, 'nextNodeId += 1', 'if(depth<2){nextNodeId+=1}'],
+  ['conditional decode reset', hostProbeFile, 'nextNodeId = 0\n', 'if (value instanceof VeraObjectValue) { nextNodeId = 0 }\n'],
+  ['queue literal whitespace', hostProbeFile, "order.join(' ')", "order.join('  ')"],
+  ['review untyped JS sensitive binding', 'entry/src/main/ets/runtime/P3Probe.js', '', 'export function drop(input) {const { pendingEffects: queue } = input; queue.length=0;}'],
+  ['computed sensitive binding alias', 'entry/src/main/ets/runtime/P3Probe.js', '', 'export function drop(input) { const { ["pendingEffects"]: queue } = input; const later = queue; later.length = 0; }'],
+  ['cast-only UiHost alias', 'entry/src/main/ets/runtime/P3Probe.ts', '', 'function drop(input: unknown) { const receiver = input as UiHost; const later = receiver; consume(later.unreviewed); }'],
+  ['angle cast-only host alias', 'entry/src/main/ets/runtime/P3Probe.ts', '', 'function drop(input: unknown) { const receiver = <UiHostEnvironment>input; const later = receiver; consume(later.unreviewed); }'],
+  ['sensitive destructuring assignment', 'entry/src/main/ets/runtime/P3Probe.js', '', 'export function drop(input) { let queue; ({ pendingEffects: queue } = input); const later = queue; later.length = 0; }'],
+  ['host destructuring assignment', 'entry/src/main/ets/runtime/P3Probe.ts', '', 'function drop(input: UiHost) { let queue; ({ unreviewed: queue } = input); const later = queue; consume(later); }'],
+  ['ID write', hostProbeFile, 'this.nextEffectId = id + 1', 'this.nextEffectId = id + 2'],
+  ['ID reservation reorder', hostProbeFile, "this.nextEffectId = id + 1\n    let effect = new HostEffect(id, 'sdk', 'call', values, safety ? handler : asString(args[2]))", "let effect = new HostEffect(id, 'sdk', 'call', values, safety ? handler : asString(args[2]))\n    this.nextEffectId = id + 1"],
+  ['nextNodeId extra increment', hostProbeFile, 'nextNodeId += 1', 'nextNodeId += 1; nextNodeId += 1'],
+  ['erased Object.assign host escape', hostProbeFile, 'let id = this.nextEffectId', 'Object.assign({} as Object, this as Object); let id = this.nextEffectId'],
+  ['typed differently named receiver', 'entry/src/main/ets/runtime/AppActor.ets', 'this.host!.pendingEffects = []', 'let receiver: UiHostEnvironment = this.host!; receiver.pendingEffects.push(null); this.host!.pendingEffects = []'],
+  ['cast erased alias and dynamic access', 'entry/src/main/ets/runtime/AppActor.ets', 'this.host!.pendingEffects = []', 'let opaque = this.host as Object; let alias = opaque; alias[key] = []; this.host!.pendingEffects = []'],
+  ['destructured queue alias', 'entry/src/main/ets/runtime/AppActor.ets', 'this.host!.pendingEffects = []', 'let { pendingEffects: queue } = this.host!; queue.push(null); this.host!.pendingEffects = []'],
+  ['computed property unknown receiver', hostProbeFile, 'nextNodeId += 1', "opaque['pendingEffects'].push(null); nextNodeId += 1"],
+  ['unknown host member escape', 'entry/src/main/ets/runtime/AppActor.ets', 'this.host!.pendingEffects = []', 'consume(this.host!.unreviewed); this.host!.pendingEffects = []'],
+  ['internal unknown member', hostProbeFile, 'let id = this.nextEffectId', 'this.unreviewed = 1; let id = this.nextEffectId'],
+  ['new file access', 'entry/src/main/ets/runtime/P3Probe.ets', '', "export function inspect(receiver: UiHostEnvironment): void { receiver.pendingEffects.push(null); }"],
+  ['new file erased escape', 'entry/src/main/ets/runtime/P3Probe.ets', '', 'export function escape(receiver: UiHostEnvironment): Object { const hidden = receiver as Object; return Object.assign({}, hidden); }'],
+  ['new import consumer', 'entry/src/main/ets/runtime/P3Probe.ets', '', "import * as declarations from '../vera/VeraUi';"],
+  ['renamed import constructor', 'entry/src/main/ets/runtime/P3Probe.ets', '', "import { UiHostEnvironment as Renamed } from '../vera/VeraUi'; const receiver = new Renamed(); consume(receiver);"],
+  ['UiHost internal alias escape', 'entry/src/main/ets/runtime/P3Probe.ets', '', 'class UiHost { run(): void { const erased = this as Object; consume(erased); } }'],
+  ['receiver-independent safety begin alias', 'entry/src/main/ets/runtime/P3Probe.js', '', 'function hook(input) { const { beginSafetyTurn: begin } = input; const later = begin; consume(later); }'],
+  ['receiver-independent safety pure alias', 'entry/src/main/ets/runtime/P3Probe.js', '', 'function hook(input) { let pure; ({ setSafetyPure: pure } = input); const later = pure; consume(later); }'],
+  ['safety reserve bypass', hostProbeFile, 'this.safetyRecord.reserve()', 'if (false) { this.safetyRecord.reserve() }'],
+  ['safety pure bypass', hostProbeFile, 'if (this.safetyPure) { throw', 'if (false && this.safetyPure) { throw'],
+  ['safety rollback content bypass', hostProbeFile, 'record.queue.push(effect)', 'if (false) { record.queue.push(effect) }'],
+  ['safety permission restore bypass', hostProbeFile, 'this.effectsAllowed = record.allowed', 'if (false) { this.effectsAllowed = record.allowed }'],
+  ['safety settlement active bypass', hostProbeFile, 'if (this.invoking)', 'if (false && this.invoking)'],
+  ['safety snapshot content bypass', hostProbeFile, 'this.entries = queue.slice()', 'this.entries = []'],
+  ['safety invoke failure stickiness bypass', hostProbeFile, "} catch (e) {\n      if (this.safetyRecord !== null) { this.safetyRecord.failed = true }", "} catch (e) {\n      if (false && this.safetyRecord !== null) { this.safetyRecord.failed = true }"],
+  ['safety overlap failure stickiness bypass', hostProbeFile, 'if (this.safetyRecord !== null || this.safetyPure)', 'if (false && (this.safetyRecord !== null || this.safetyPure))'],
+  ['safety stale settlement stickiness bypass', hostProbeFile, 'if (this.safetyRecord !== record)', 'if (false && this.safetyRecord !== record)'],
+  ['safety scope callback replacement', hostProbeFile, 'this.settle = settle', 'this.settle = (outcome: string): void => {}'],
+  ['safety scope accept bypass', hostProbeFile, "this.settle('accept')", "if (false) { this.settle('accept') }"],
+  ['safety scope rollback reroute', hostProbeFile, "this.settle('rollback')", "this.settle('accept')"],
+  ['safety scope discard bypass', hostProbeFile, "this.settle('discard')", "if (false) { this.settle('discard') }"],
+  ['safety scope construction bypass', hostProbeFile, 'this.settleSafety(record, outcome)', 'if (false) { this.settleSafety(record, outcome) }']
+]
+for (const [name, file, before, after] of hostNegativeProbes) {
+  test('P3 static guard rejects ' + name + ' in memory', () => {
+    const sources = hostSources()
+    if (before) {
+      assert(sources.get(file).includes(before), 'probe anchor missing: ' + name)
+      sources.set(file, sources.get(file).replace(before, after))
+    } else {
+      assert(!sources.has(file))
+      sources.set(file, after)
+    }
+    assert.throws(() => checkHostInventory(sources), { code: 'ERR_ASSERTION' }, name)
+  })
+}
+test('P3 alias scan inventories erased and destructured uses beyond their seed declarations', () => {
+  const file = 'entry/src/main/ets/runtime/P3Probe.ets'
+  const inventory = hostInventory(new Map([[file, `function inspect(receiver: UiHostEnvironment): void {
+    const opaque = receiver as Object;
+    const second = opaque;
+    Object.assign({}, second);
+    second[key] = 1;
+    const { pendingEffects: queue } = receiver;
+    queue.push(null);
+    consume(receiver.unreviewed);
+  }`]]))
+  assert.deepEqual(inventory[file + ':inspect'], [
+    'receiver: UiHostEnvironment', 'opaque = receiver as Object', 'second = opaque',
+    'Object.assign({}, second);', 'second[key] = 1;', '{ pendingEffects: queue } = receiver',
+    'queue.push(null);', 'consume(receiver.unreviewed);'
+  ])
+})
+for (const [name, text, uses] of [
+  ['untyped sensitive binding', 'export function drop(input) {const { pendingEffects: queue } = input; const later = queue; later.length=0;}', ['later = queue', 'later.length = 0;']],
+  ['cast-only UiHost', 'function drop(input: unknown) { const receiver = input as UiHost; const later = receiver; consume(later.unreviewed); }', ['later = receiver', 'consume(later.unreviewed);']],
+  ['angle cast-only host', 'function drop(input: unknown) { const receiver = <UiHostEnvironment>input; const later = receiver; consume(later.unreviewed); }', ['later = receiver', 'consume(later.unreviewed);']],
+  ['computed sensitive binding', 'function drop(input) { const { ["pendingEffects"]: queue } = input; const later = queue; later.length=0; }', ['later = queue', 'later.length = 0;']],
+  ['shorthand sensitive assignment', 'function drop(input) { let pendingEffects; ({ pendingEffects } = input); const later = pendingEffects; later.length=0; }', ['later = pendingEffects', 'later.length = 0;']],
+  ['sensitive assignment', 'function drop(input) { let queue; ({ pendingEffects: queue } = input); const later = queue; later.length=0; }', ['later = queue', 'later.length = 0;']],
+  ['host assignment', 'function drop(input: UiHost) { let queue; ({ unreviewed: queue } = input); const later = queue; consume(later); }', ['later = queue', 'consume(later);']]
+]) {
+  test('P3 beyond-seed aliases remain inventoried for ' + name, () => {
+    const file = 'entry/src/main/ets/runtime/P3Probe.ts'
+    const sites = hostInventory(new Map([[file, text]]))[file + ':drop']
+    for (const use of uses) assert(sites.includes(use), 'missing beyond-seed use: ' + use)
+  })
+}
+test('P3 body pins reject review loop and conditional bypasses even with unchanged access sites', () => {
+  for (const [before, after] of [
+    ['this.pendingEffects.push(effect)', 'for (let repeat=0;repeat<(values.has("repeat")?2:1);repeat++){this.pendingEffects.push(effect)}'],
+    ['nextNodeId += 1', 'if(depth<2){nextNodeId+=1}']
+  ]) {
+    const sources = hostSources()
+    sources.set(hostProbeFile, sources.get(hostProbeFile).replace(before, after))
+    assert.deepEqual(hostInventory(sources), hostBaseline)
+    assert.throws(() => checkHostBodies(sources), /approved host mutation bodies\/control changed/)
+  }
+})
+test('P3 token canonicalization preserves string, template and regex literal whitespace', () => {
+  for (const [before, after] of [
+    ["host.pendingEffects.push('a b');", "host.pendingEffects.push('a  b');"],
+    ['host.pendingEffects.push(`a b`);', 'host.pendingEffects.push(`a  b`);'],
+    ['host.pendingEffects.push(`a b${value}c d`);', 'host.pendingEffects.push(`a  b${value}c  d`);'],
+    ['host.pendingEffects.push(/a b/);', 'host.pendingEffects.push(/a  b/);']
+  ]) {
+    const file = 'entry/src/main/ets/runtime/P3Probe.ts'
+    assert.notDeepEqual(hostInventory(new Map([[file, before]])), hostInventory(new Map([[file, after]])))
+  }
+  assert.equal(hostCanonical("{\n  call('a  b');\n}"), "{ call('a  b'); }")
+})
+test('P3 static guard ignores whitespace without whole-source hashes', () => {
+  const sources = hostSources()
+  sources.set(hostProbeFile, sources.get(hostProbeFile).replace('this.nextEffectId = id + 1', 'this.nextEffectId\n = id + 1').replace('this.pendingEffects.push(effect)', 'this.pendingEffects.push( effect )').replace('if (depth > 8)', 'if ( depth\n > 8 )').replace('order.join(\' \')', 'order.join( \' \' )'))
+  checkHostInventory(sources)
+})
+function legacyHostFixture() {
+  const { UiHostEnvironment, decodeVeraUi } = vera('VeraUi')
+  const values = vera('VeraInterpreter')
+  const host = new UiHostEnvironment()
+  const str = value => new values.VeraStringValue(value)
+  const args = () => [str('  ' + sdkTarget + '  '), new values.VeraArrayValue([str('z'), str('first'), str('z'), str('last')]), str('answered')]
+  return { host, args, str, values, decodeVeraUi, call: input => host.invoke('std/sdk', 'call', input || args(), false) }
+}
+test('P3 legacy queueSdk returns two immediate IDs with visible queued effects and no adapter dispatch', () => {
+  const p = legacyHostFixture(), queue = p.host.pendingEffects
+  assert.equal(p.host.effectsAllowed, false)
+  assert.equal(p.host.nextEffectId, 1)
+  p.host.effectsAllowed = true
+  assert.equal(p.call().value, 1)
+  assert.equal(p.host.pendingEffects, queue)
+  assert.deepEqual(queue.map(effect => effect.id), [1])
+  assert.equal(p.call().value, 2)
+  assert.deepEqual(queue.map(effect => effect.id), [1, 2])
+  assert.equal(p.host.nextEffectId, 3)
+  assert.deepEqual([...queue[0].values], [['z', 'last']])
+  assert.equal(queue[0].rawTarget, sdkTarget)
+  assert.equal(queue[0].rawParams, 'z z')
+  assert.equal(queue[0].rawMode, 'background')
+  assert.equal(queue[0].resultHandler, 'answered')
+  assert.deepEqual(calls, [])
+})
+test('P3 legacy compiled VM trap leaves queued IDs consumed and clearing the queue does not rewind them', () => {
+  const p = legacyHostFixture()
+  const program = compile(fixture() + `function fail(state: AppState, value: number): AppState { sdk.call("${sdkTarget}", [], "answered"); sdk.call("${sdkTarget}", [], "answered"); let empty: number[] = []; state.n = empty[0]; return state; }`)
+  const vm = new p.values.VirtualMachine(p.values.deserializeVbc2(program.vbc2), p.host)
+  const state = vm.execute('init')
+  p.host.effectsAllowed = true
+  assert.throws(() => vm.execute('fail', [state, new p.values.VeraNumberValue(0)]), error => error instanceof p.values.RuntimeTrap)
+  assert.deepEqual(p.host.pendingEffects.map(effect => effect.id), [1, 2])
+  assert.equal(p.host.nextEffectId, 3)
+  assert.equal(p.host.effectsAllowed, true)
+  p.host.pendingEffects = []
+  assert.equal(p.call().value, 3)
+  assert.deepEqual(calls, [])
+})
+for (const invalid of ['permission', 'target', 'array', 'odd pairs', 'key', 'value', 'mode', 'late handler']) {
+  test('P3 legacy invalid SDK ' + invalid + ' preserves existing behavior', () => {
+    const p = legacyHostFixture()
+    p.host.effectsAllowed = true
+    p.call()
+    const queue = p.host.pendingEffects, first = queue[0], args = p.args(), number = new p.values.VeraNumberValue(7)
+    let code = 'R0020'
+    if (invalid === 'permission') { p.host.effectsAllowed = false; code = 'R0026' }
+    if (invalid === 'target') args[0] = number
+    if (invalid === 'array') args[1] = number
+    if (invalid === 'odd pairs') { args[1] = new p.values.VeraArrayValue([p.str('key')]); code = 'R0027' }
+    if (invalid === 'key') args[1].elements[0] = number
+    if (invalid === 'value') args[1].elements[1] = number
+    if (invalid === 'mode') args[3] = number
+    if (invalid === 'late handler') args[2] = number
+    const allowed = p.host.effectsAllowed
+    assert.throws(() => p.call(args), error => error.trapCode === code)
+    assert.equal(p.host.pendingEffects, queue)
+    assert.deepEqual(queue, [first])
+    assert.equal(p.host.effectsAllowed, allowed)
+    assert.equal(p.host.nextEffectId, invalid === 'late handler' ? 3 : 2)
+    p.host.effectsAllowed = true
+    assert.equal(p.call().value, invalid === 'late handler' ? 3 : 2)
+    assert.deepEqual(calls, [])
+  })
+}
+test('P3 legacy UI registry declarations are values and decode IDs reset independently of SDK IDs', () => {
+  const p = legacyHostFixture(), n = value => new p.values.VeraNumberValue(value)
+  const declaration = (name, args) => p.host.invoke('std/ui', name, args, false)
+  const nodes = [declaration('Surface', [p.str('default'), n(100), n(200), p.str('draw'), p.str('frame'), p.str('pointer')]),
+    declaration('World', [p.str('default'), n(100), p.str('build'), p.str('event')]),
+    declaration('Ticker', [p.str('default'), p.str('tick'), n(1000), new p.values.VeraBooleanValue(true), p.str('tickHandler')]),
+    declaration('BackHandler', [p.str('back')])]
+  const tree = declaration('Column', [p.str('default'), new p.values.VeraArrayValue(nodes)])
+  for (let i = 0; i < 2; i++) {
+    const decoded = p.decodeVeraUi(tree)
+    assert.equal(decoded[0].id, 0)
+    assert.deepEqual(decoded[0].children.map(node => node.id), [1, 2, 3, 4])
+    assert.deepEqual(decoded[0].children.map(node => node.kind), ['surface', 'world', 'ticker', 'backhandler'])
+  }
+  assert.deepEqual(Object.keys(p.host).sort(), ['effectsAllowed', 'invoking', 'nextEffectId', 'pendingEffects', 'safetyInvalid', 'safetyPure', 'safetyRecord'])
+  assert.equal(p.host.nextEffectId, 1)
+  assert.deepEqual(p.host.pendingEffects, [])
+  assert.deepEqual(calls, [])
+})
+
+for (const allowed of [false, true]) {
+  for (const outcome of ['accept', 'rollback', 'discard']) {
+    test('Step5 opt-in host ' + outcome + ' restores actual entry permission ' + allowed, () => {
+      const p = legacyHostFixture()
+      p.host.effectsAllowed = true
+      p.call()
+      const queue = p.host.pendingEffects, first = queue[0]
+      p.host.effectsAllowed = allowed
+      let reserved = 0
+      const scope = p.host.beginSafetyTurn(() => {
+        assert.equal(p.host.nextEffectId, 2 + reserved)
+        assert.equal(queue.length, 1 + reserved)
+        reserved++
+      })
+      p.host.effectsAllowed = true
+      assert.equal(p.call().value, 2)
+      assert.equal(p.call().value, 3)
+      assert.equal(reserved, 2)
+      const queued = queue.slice(), record = p.host.safetyRecord
+      p.host.effectsAllowed = !allowed
+      scope[outcome]()
+      assert.equal(p.host.effectsAllowed, allowed)
+      assert.equal(p.host.pendingEffects, queue)
+      assert.equal(p.host.safetyRecord, null)
+      assert.equal(p.host.safetyPure, false)
+      assert.deepEqual(record.queue, [])
+      assert.deepEqual(record.entries, [])
+      assert.deepEqual(queue, outcome === 'rollback' ? [first] : outcome === 'accept' ? queued : [])
+      assert.deepEqual(queue.map(effect => effect.id), outcome === 'accept' ? [1, 2, 3] : outcome === 'rollback' ? [1] : [])
+      assert.equal(p.host.nextEffectId, outcome === 'rollback' ? 2 : 4)
+      for (const again of ['accept', 'rollback', 'discard']) {
+        assert.throws(() => scope[again](), error => error instanceof p.values.RuntimeTrap)
+      }
+      if (outcome === 'discard') {
+        for (const invoke of [() => p.call(), () => p.host.invoke('std/ui', 'Text', [p.str('body'), p.str('text')], false),
+          () => p.host.beginSafetyTurn(() => {}), () => p.host.setSafetyPure(false)]) {
+          assert.throws(invoke, error => error instanceof p.values.RuntimeTrap)
+        }
+      } else {
+        p.host.effectsAllowed = true
+        const next = p.host.beginSafetyTurn(() => {})
+        assert.equal(p.call().value, outcome === 'rollback' ? 2 : 4)
+        assert.throws(() => scope.accept(), error => error instanceof p.values.RuntimeTrap)
+        next.rollback()
+      }
+      assert.deepEqual(calls, [])
+      assert.deepEqual(traces, [])
+      assert.equal(timers.size, 0)
+    })
+  }
+}
+test('Step5 host rollback restores original array identity and entry content after owner replacement', () => {
+  const p = legacyHostFixture()
+  p.host.effectsAllowed = true
+  p.call()
+  p.call()
+  const queue = p.host.pendingEffects, entries = queue.slice(), nextId = p.host.nextEffectId
+  const scope = p.host.beginSafetyTurn(() => {})
+  p.call()
+  queue.reverse()
+  queue.shift()
+  const replacement = []
+  p.host.pendingEffects = replacement
+  p.call()
+  scope.rollback()
+  assert.equal(p.host.pendingEffects, queue)
+  assert.deepEqual(queue, entries)
+  assert.equal(queue[0], entries[0])
+  assert.equal(queue[1], entries[1])
+  assert.equal(p.host.nextEffectId, nextId)
+  assert.equal(p.host.effectsAllowed, true)
+})
+test('Step5 host discard clears both captured and replaced queues and cannot be revived', () => {
+  const p = legacyHostFixture()
+  const queue = p.host.pendingEffects
+  const scope = p.host.beginSafetyTurn(() => {})
+  p.host.effectsAllowed = true
+  p.call()
+  const replacement = []
+  p.host.pendingEffects = replacement
+  p.call()
+  scope.discard()
+  assert.deepEqual(queue, [])
+  assert.deepEqual(replacement, [])
+  p.host.pendingEffects = []
+  p.host.effectsAllowed = true
+  assert.throws(() => p.call(), error => error instanceof p.values.RuntimeTrap)
+})
+for (const allowed of [false, true]) {
+  for (const scoped of [false, true]) {
+    test('Step5 pure SDK barrier precedes ID/queue mutation with permission=' + allowed + ', scope=' + scoped, () => {
+      const p = legacyHostFixture(), queue = p.host.pendingEffects
+      p.host.effectsAllowed = allowed
+      let reserved = 0
+      const scope = scoped ? p.host.beginSafetyTurn(() => { reserved++ }) : null
+      p.host.setSafetyPure(true)
+      try {
+        assert.throws(() => p.call(), error => error.trapCode === 'R-PURE')
+        assert.equal(p.host.nextEffectId, 1)
+        assert.equal(p.host.pendingEffects, queue)
+        assert.deepEqual(queue, [])
+        assert.equal(p.host.effectsAllowed, allowed)
+        assert.equal(reserved, 0)
+        if (scoped) {
+          assert.throws(() => p.host.invoke('std/ui', 'Text', [p.str('body'), p.str('pure')], false), error => error.trapCode === 'R-TURN')
+          assert.throws(() => scope.accept(), error => error.trapCode === 'R-TURN')
+        } else {
+          assert.equal(p.host.invoke('std/ui', 'Text', [p.str('body'), p.str('pure')], false).fields.get('text').value, 'pure')
+        }
+      } finally {
+        p.host.setSafetyPure(false)
+      }
+      if (scope) scope.rollback()
+      p.host.effectsAllowed = true
+      assert.equal(p.call().value, 1)
+      assert.deepEqual(calls, [])
+    })
+  }
+}
+for (const pure of [false, true]) {
+  for (const invalid of ['target', 'array', 'odd pairs', 'key', 'value', 'blank key value', 'mode', 'handler']) {
+    test('Step5 safety validates SDK ' + invalid + ' before reserve/pure barrier with pure=' + pure, () => {
+      const p = legacyHostFixture(), queue = p.host.pendingEffects, args = p.args()
+      const number = new p.values.VeraNumberValue(7)
+      let reserved = 0, code = 'R0020'
+      const scope = p.host.beginSafetyTurn(() => { reserved++ })
+      p.host.effectsAllowed = !pure
+      p.host.setSafetyPure(pure)
+      if (invalid === 'target') args[0] = number
+      if (invalid === 'array') args[1] = number
+      if (invalid === 'odd pairs') { args[1] = new p.values.VeraArrayValue([p.str('key')]); code = 'R0027' }
+      if (invalid === 'key') args[1].elements[0] = number
+      if (invalid === 'value') args[1].elements[1] = number
+      if (invalid === 'blank key value') { args[1].elements[0] = p.str(' '); args[1].elements[1] = number }
+      if (invalid === 'mode') args[3] = number
+      if (invalid === 'handler') args[2] = number
+      try {
+        assert.throws(() => p.call(args), error => error.trapCode === code)
+        assert.equal(reserved, 0)
+        assert.equal(p.host.nextEffectId, 1)
+        assert.equal(p.host.pendingEffects, queue)
+        assert.deepEqual(queue, [])
+        assert.equal(p.host.safetyRecord.failed, true)
+        assert.throws(() => scope.accept(), error => error.trapCode === 'R-TURN')
+        assert.throws(() => p.call(), error => error.trapCode === 'R-TURN')
+      } finally {
+        p.host.setSafetyPure(false)
+        scope.rollback()
+      }
+    })
+  }
+}
+test('Step5 safety disallowed SDK reserves nothing and validation remains first', () => {
+  const p = legacyHostFixture()
+  let reserved = 0
+  const scope = p.host.beginSafetyTurn(() => { reserved++ })
+  assert.throws(() => p.call(), error => error.trapCode === 'R0026')
+  assert.throws(() => scope.accept(), error => error.trapCode === 'R-TURN')
+  scope.rollback()
+  const next = p.host.beginSafetyTurn(() => { reserved++ })
+  const args = p.args()
+  args[2] = new p.values.VeraNumberValue(1)
+  assert.throws(() => p.call(args), error => error.trapCode === 'R0020')
+  assert.equal(reserved, 0)
+  assert.equal(p.host.nextEffectId, 1)
+  assert.throws(() => next.accept(), error => error.trapCode === 'R-TURN')
+  next.rollback()
+})
+test('Step5 failed reservation cannot allocate an ID or append an effect', () => {
+  const p = legacyHostFixture(), refusal = new Error('full journal')
+  p.host.effectsAllowed = true
+  p.call()
+  const queue = p.host.pendingEffects, entries = queue.slice()
+  let reserved = 0
+  const scope = p.host.beginSafetyTurn(() => { reserved++; throw refusal })
+  assert.throws(() => p.call(), error => error === refusal)
+  assert.equal(reserved, 1)
+  assert.equal(p.host.nextEffectId, 2)
+  assert.equal(p.host.pendingEffects, queue)
+  assert.deepEqual(queue, entries)
+  assert.equal(p.host.invoking, false)
+  assert.throws(() => scope.accept(), error => error.trapCode === 'R-TURN')
+  assert.throws(() => p.call(), error => error.trapCode === 'R-TURN')
+  assert.equal(reserved, 1)
+  scope.rollback()
+})
+for (const hook of ['invoke', 'begin', 'pure', 'accept', 'rollback', 'discard']) {
+  test('Step5 reentrant host ' + hook + ' fails closed even when reservation swallows rejection', () => {
+    const p = legacyHostFixture(), queue = p.host.pendingEffects
+    p.host.effectsAllowed = true
+    let scope, attempts = 0
+    scope = p.host.beginSafetyTurn(() => {
+      attempts++
+      const nested = hook === 'invoke' ? () => p.host.invoke('std/ui', 'Text', [p.str('body'), p.str('nested')], false)
+        : hook === 'begin' ? () => p.host.beginSafetyTurn(() => {})
+        : hook === 'pure' ? () => p.host.setSafetyPure(true) : () => scope[hook]()
+      assert.throws(nested, error => error instanceof p.values.RuntimeTrap)
+    })
+    assert.throws(() => p.call(), error => error instanceof p.values.RuntimeTrap)
+    assert.equal(attempts, 1)
+    assert.equal(p.host.nextEffectId, 1)
+    assert.equal(p.host.pendingEffects, queue)
+    assert.deepEqual(queue, [])
+    assert.equal(p.host.invoking, false)
+    assert.throws(() => scope.accept(), error => error instanceof p.values.RuntimeTrap)
+    assert.throws(() => p.call(), error => error instanceof p.values.RuntimeTrap)
+    scope.rollback()
+    assert.equal(p.call().value, 1)
+  })
+}
+test('Step5 scope cannot overlap or settle an unrelated live scope', () => {
+  const p = legacyHostFixture()
+  const first = p.host.beginSafetyTurn(() => {})
+  assert.throws(() => p.host.beginSafetyTurn(() => {}), error => error instanceof p.values.RuntimeTrap)
+  assert.throws(() => first.accept(), error => error.trapCode === 'R-TURN')
+  first.rollback()
+  const second = p.host.beginSafetyTurn(() => {})
+  assert.throws(() => first.discard(), error => error instanceof p.values.RuntimeTrap)
+  assert.throws(() => second.accept(), error => error.trapCode === 'R-TURN')
+  second.rollback()
+})
+
+function safetyVmFixture(limit = 32) {
+  const p = legacyHostFixture()
+  const program = compile(fixture() + `
+function queued(state: AppState): AppState {
+  sdk.call("${sdkTarget}", [], "answered");
+  sdk.call("${sdkTarget}", [], "answered");
+  return state;
+}
+function mutateQueued(state: AppState): AppState {
+  state.n = state.n + 1;
+  sdk.call("${sdkTarget}", [], "answered");
+  return state;
+}
+function queuedTrap(state: AppState): AppState {
+  sdk.call("${sdkTarget}", [], "answered");
+  state.n = state.n + 1;
+  let empty: number[] = [];
+  state.n = empty[0];
+  return state;
+}
+function draw(state: AppState): gfx.Shape[] { return []; }
+function frame(state: AppState, elapsedMs: number): AppState { return state; }
+function pointer(state: AppState, p: gfx.Pointer): AppState { return state; }
+function build(state: AppState): scene.Thing[] { return []; }
+function event(state: AppState, e: scene.Event): AppState { return state; }
+function tickHandler(state: AppState, value: number): AppState { return state; }
+function back(state: AppState, value: number): AppState { return state; }
+function declared(state: AppState): ui.View {
+  return ui.Column("default", [ui.Surface("default", 100, 200, "draw", "frame", "pointer"),
+    ui.World("default", 100, "build", "event"), ui.Ticker("default", "tick", 1000, true, "tickHandler"), ui.BackHandler("back")]);
+}`)
+  const module = p.values.deserializeVbc2(program.vbc2)
+  const state = new p.values.VirtualMachine(module, p.host).execute('init')
+  const external = new p.values.Instruction('load-external')
+  external.module = 'std/sdk'
+  external.name = 'call'
+  const instructions = [external]
+  for (let slot = 0; slot < 4; slot++) {
+    const local = new p.values.Instruction('load-local')
+    local.slot = slot
+    instructions.push(local)
+  }
+  const call = new p.values.Instruction('call')
+  call.count = 4
+  instructions.push(call, new p.values.Instruction('return'))
+  module.functions.push(new p.values.BytecodeFunction('rawSdk', 4, 4, false, instructions))
+  const vm = new p.values.VirtualMachine(module, p.host, 100000, { now: () => now, deadlineMs: 1000 }, { journalMaxEntries: limit })
+  return { ...p, vm, state }
+}
+for (const limit of [0, 1, 2]) {
+  test('Step5 real VM shares journal capacity with one reservation per effect, limit=' + limit, () => {
+    const p = safetyVmFixture(limit), queue = p.host.pendingEffects
+    const scope = p.vm.beginTurn({}, p.state)
+    p.host.effectsAllowed = true
+    if (limit < 2) {
+      assert.throws(() => p.vm.execute('queued', [p.state]), error => error.trapCode === 'R-JOURNAL')
+      assert.throws(() => scope.accept(), error => error instanceof p.values.RuntimeTrap)
+    } else {
+      assert.equal(p.vm.execute('queued', [p.state]), p.state)
+    }
+    assert.deepEqual(queue.map(effect => effect.id), Array.from({ length: limit }, (_, i) => i + 1))
+    assert.equal(p.host.nextEffectId, limit + 1)
+    scope.rollback()
+    assert.equal(p.host.pendingEffects, queue)
+    assert.deepEqual(queue, [])
+    assert.equal(p.host.nextEffectId, 1)
+    assert.equal(p.host.effectsAllowed, false)
+    assert.deepEqual(calls, [])
+  })
+}
+test('Step5 real VM effect reservation and graph writes consume the same journal capacity', () => {
+  const p = safetyVmFixture(1)
+  const scope = p.vm.beginTurn({}, p.state)
+  p.host.effectsAllowed = true
+  assert.throws(() => p.vm.execute('mutateQueued', [p.state]), error => error.trapCode === 'R-JOURNAL')
+  assert.equal(p.state.fields.get('n').value, 2)
+  assert.deepEqual(p.host.pendingEffects, [])
+  assert.equal(p.host.nextEffectId, 1)
+  scope.rollback()
+  assert.equal(p.state.fields.get('n').value, 1)
+  assert.equal(p.host.effectsAllowed, false)
+})
+for (const allowed of [false, true]) {
+  test('Step5 real VM pure SDK fails R-PURE before reservation with entry permission=' + allowed, () => {
+    const p = safetyVmFixture(0), queue = p.host.pendingEffects
+    p.host.effectsAllowed = allowed
+    const scope = p.vm.beginTurn({}, p.state)
+    assert.throws(() => p.vm.executePure('queued', [p.state]), error => error.trapCode === 'R-PURE')
+    assert.equal(p.host.safetyPure, false)
+    assert.equal(p.host.effectsAllowed, allowed)
+    assert.equal(p.host.nextEffectId, 1)
+    assert.equal(p.host.pendingEffects, queue)
+    assert.deepEqual(queue, [])
+    assert.throws(() => scope.accept(), error => error instanceof p.values.RuntimeTrap)
+    scope.rollback()
+    const next = p.vm.beginTurn({}, p.state)
+    assert.equal(p.vm.executePure('view', [p.state]).fields.get('text').value, 'initial')
+    next.accept()
+  })
+}
+test('Step5 real VM acceptance retains whole-turn effects without dispatch or callbacks', () => {
+  const p = safetyVmFixture(3), queue = p.host.pendingEffects
+  p.host.effectsAllowed = true
+  p.call()
+  p.host.effectsAllowed = false
+  const scope = p.vm.beginTurn({}, p.state)
+  p.host.effectsAllowed = true
+  p.vm.execute('queued', [p.state])
+  p.vm.execute('sdkFire', [p.state, new p.values.VeraNumberValue(0)])
+  const effects = queue.slice()
+  p.vm.executePure('view', [p.state])
+  scope.accept()
+  assert.equal(p.host.pendingEffects, queue)
+  assert.deepEqual(queue, effects)
+  assert.deepEqual(queue.map(effect => effect.id), [1, 2, 3, 4])
+  assert.equal(p.host.nextEffectId, 5)
+  assert.equal(p.host.effectsAllowed, false)
+  assert.deepEqual(calls, [])
+  assert.deepEqual(traces, [])
+  assert.equal(timers.size, 0)
+})
+test('Step5 real VM trap rollback restores graph and host queue baseline together', () => {
+  const p = safetyVmFixture(), queue = p.host.pendingEffects
+  p.host.effectsAllowed = true
+  p.call()
+  const first = queue[0]
+  const scope = p.vm.beginTurn({}, p.state)
+  p.vm.execute('queued', [p.state])
+  assert.throws(() => p.vm.execute('queuedTrap', [p.state]), error => error instanceof p.values.RuntimeTrap)
+  assert.equal(p.state.fields.get('n').value, 2)
+  assert.deepEqual(queue.map(effect => effect.id), [1, 2, 3, 4])
+  scope.rollback()
+  assert.equal(p.state.fields.get('n').value, 1)
+  assert.equal(p.host.pendingEffects, queue)
+  assert.deepEqual(queue, [first])
+  assert.equal(p.host.nextEffectId, 2)
+  assert.equal(p.host.effectsAllowed, true)
+})
+test('Step5 real VM discard invalidates VM and host and removes unaccepted requests', () => {
+  const p = safetyVmFixture()
+  const scope = p.vm.beginTurn({}, p.state)
+  p.host.effectsAllowed = true
+  p.vm.execute('queued', [p.state])
+  scope.discard()
+  assert.deepEqual(p.host.pendingEffects, [])
+  assert.equal(p.host.effectsAllowed, false)
+  assert.throws(() => p.vm.execute('view', [p.state]), error => error instanceof p.values.RuntimeTrap)
+  assert.throws(() => p.call(), error => error instanceof p.values.RuntimeTrap)
+  assert.throws(() => p.vm.beginTurn({}, p.state), error => error instanceof p.values.RuntimeTrap)
+})
+test('Step5 real VM pure UI registry declarations remain decode-only data', () => {
+  const p = safetyVmFixture(0)
+  const scope = p.vm.beginTurn({}, p.state)
+  const tree = p.vm.executePure('declared', [p.state])
+  assert.deepEqual(p.decodeVeraUi(tree)[0].children.map(node => node.kind), ['surface', 'world', 'ticker', 'backhandler'])
+  assert.deepEqual(p.host.pendingEffects, [])
+  assert.equal(p.host.nextEffectId, 1)
+  scope.accept()
+  assert.deepEqual(calls, [])
+})
+
+for (const allowed of [false, true]) {
+  for (const outcome of ['accept', 'rollback', 'discard']) {
+    test('Step5 real VM ' + outcome + ' preserves nonempty baseline and entry permission=' + allowed, () => {
+      const p = safetyVmFixture(), queue = p.host.pendingEffects
+      p.host.effectsAllowed = true
+      p.call()
+      p.call()
+      const baseline = queue.slice()
+      p.host.effectsAllowed = allowed
+      const scope = p.vm.beginTurn({}, p.state)
+      p.host.effectsAllowed = true
+      p.vm.execute('mutateQueued', [p.state])
+      p.vm.execute('queued', [p.state])
+      p.vm.executePure('view', [p.state])
+      assert.equal(p.host.safetyPure, false)
+      let replacement
+      if (outcome !== 'accept') {
+        queue.reverse()
+        queue.shift()
+        replacement = []
+        p.host.pendingEffects = replacement
+        p.vm.execute('queued', [p.state])
+      }
+      const accepted = queue.slice(), record = p.host.safetyRecord
+      p.host.effectsAllowed = !allowed
+      scope[outcome]()
+      assert.equal(p.host.pendingEffects, queue)
+      assert.equal(p.host.effectsAllowed, allowed)
+      assert.equal(p.host.safetyPure, false)
+      assert.equal(p.host.safetyRecord, null)
+      assert.deepEqual(record.queue, [])
+      assert.deepEqual(record.entries, [])
+      assert.deepEqual(queue, outcome === 'accept' ? accepted : outcome === 'rollback' ? baseline : [])
+      assert.equal(p.host.nextEffectId, outcome === 'accept' ? 6 : outcome === 'rollback' ? 3 : 8)
+      assert.equal(p.state.fields.get('n').value, outcome === 'rollback' ? 1 : 2)
+      if (outcome === 'discard') {
+        assert.deepEqual(replacement, [])
+        assert.throws(() => p.vm.beginTurn({}, p.state), error => error instanceof p.values.RuntimeTrap)
+        assert.throws(() => p.host.setSafetyPure(false), error => error.trapCode === 'R-TURN')
+        assert.throws(() => p.call(), error => error.trapCode === 'R-TURN')
+      } else {
+        const next = p.vm.beginTurn({}, p.state)
+        p.host.effectsAllowed = true
+        p.vm.execute('sdkFire', [p.state, new p.values.VeraNumberValue(0)])
+        assert.equal(queue[queue.length - 1].id, outcome === 'accept' ? 6 : 3)
+        next.rollback()
+        assert.equal(p.host.effectsAllowed, allowed)
+      }
+      for (const again of ['accept', 'rollback', 'discard']) {
+        assert.throws(() => scope[again](), error => error instanceof p.values.RuntimeTrap)
+      }
+      assert.deepEqual(calls, [])
+      assert.deepEqual(traces, [])
+      assert.equal(timers.size, 0)
+    })
+  }
+}
+for (const pure of [false, true]) {
+  for (const invalid of ['mode', 'handler', 'blank key value']) {
+    test('Step5 real VM validates late SDK ' + invalid + ' before journal/pure barrier, pure=' + pure, () => {
+      const p = safetyVmFixture(0), queue = p.host.pendingEffects
+      p.host.effectsAllowed = true
+      p.call()
+      const baseline = queue.slice(), args = p.args(), number = new p.values.VeraNumberValue(7)
+      args.push(p.str('background'))
+      if (invalid === 'mode') args[3] = number
+      if (invalid === 'handler') args[2] = number
+      if (invalid === 'blank key value') args[1] = new p.values.VeraArrayValue([p.str(' '), number])
+      p.host.effectsAllowed = false
+      const scope = p.vm.beginTurn({}, p.state)
+      p.host.effectsAllowed = !pure
+      assert.throws(() => pure ? p.vm.executePure('rawSdk', args) : p.vm.execute('rawSdk', args), error => error.trapCode === 'R0020')
+      assert.equal(p.host.safetyPure, false)
+      assert.equal(p.host.safetyRecord.failed, true)
+      assert.equal(p.host.pendingEffects, queue)
+      assert.deepEqual(queue, baseline)
+      assert.equal(p.host.nextEffectId, 2)
+      assert.throws(() => scope.accept(), error => error instanceof p.values.RuntimeTrap)
+      assert.throws(() => p.vm.executePure('view', [p.state]), error => error instanceof p.values.RuntimeTrap)
+      assert.throws(() => p.call(), error => error.trapCode === 'R-TURN')
+      scope.rollback()
+      assert.equal(p.host.effectsAllowed, false)
+      const next = p.vm.beginTurn({}, p.state)
+      assert.equal(p.vm.executePure('view', [p.state]).fields.get('text').value, 'initial')
+      next.accept()
+      assert.deepEqual(queue, baseline)
+      assert.deepEqual(calls, [])
+    })
+  }
+}
+for (const failure of ['capacity', 'permission', 'pure', 'validation']) {
+  for (const outcome of ['rollback', 'discard']) {
+    test('Step5 real VM sticky ' + failure + ' failure allows only ' + outcome + ' settlement', () => {
+      const p = safetyVmFixture(failure === 'capacity' ? 1 : 32), queue = p.host.pendingEffects
+      p.host.effectsAllowed = true
+      p.call()
+      const baseline = queue.slice(), args = p.args()
+      args.push(p.str('background'))
+      if (failure === 'validation') args[2] = new p.values.VeraNumberValue(7)
+      p.host.effectsAllowed = false
+      const scope = p.vm.beginTurn({}, p.state)
+      p.host.effectsAllowed = failure !== 'permission'
+      const code = { capacity: 'R-JOURNAL', permission: 'R0026', pure: 'R-PURE', validation: 'R0020' }[failure]
+      assert.throws(() => failure === 'pure' ? p.vm.executePure('rawSdk', args)
+        : p.vm.execute(failure === 'capacity' ? 'queued' : 'rawSdk', failure === 'capacity' ? [p.state] : args), error => error.trapCode === code)
+      assert.equal(p.host.safetyRecord.failed, true)
+      assert.equal(p.host.safetyPure, false)
+      const afterFailure = queue.slice(), nextId = p.host.nextEffectId
+      p.host.effectsAllowed = true
+      assert.throws(() => p.call(), error => error.trapCode === 'R-TURN')
+      assert.throws(() => p.vm.execute('queued', [p.state]), error => error instanceof p.values.RuntimeTrap)
+      assert.throws(() => scope.accept(), error => error instanceof p.values.RuntimeTrap)
+      assert.deepEqual(queue, afterFailure)
+      assert.equal(p.host.nextEffectId, nextId)
+      scope[outcome]()
+      assert.equal(p.host.pendingEffects, queue)
+      assert.equal(p.host.effectsAllowed, false)
+      assert.deepEqual(queue, outcome === 'rollback' ? baseline : [])
+      if (outcome === 'rollback') {
+        assert.equal(p.host.nextEffectId, 2)
+        const next = p.vm.beginTurn({}, p.state)
+        p.host.effectsAllowed = true
+        p.vm.execute('rawSdk', p.args().concat(p.str('background')))
+        assert.equal(queue[1].id, 2)
+        next.accept()
+      } else {
+        assert.throws(() => p.call(), error => error.trapCode === 'R-TURN')
+      }
+      assert.deepEqual(calls, [])
+    })
+  }
+}
+for (const hook of ['executePure', 'beginTurn', 'pure hook', 'accept', 'rollback', 'discard']) {
+  test('Step5 real VM swallowed reentrant ' + hook + ' cannot queue an effect or accept', () => {
+    const p = safetyVmFixture(), queue = p.host.pendingEffects
+    const begin = p.host.beginSafetyTurn.bind(p.host)
+    let scope, attempts = 0
+    p.host.beginSafetyTurn = reserve => begin(() => {
+      attempts++
+      const nested = hook === 'executePure' ? () => p.vm.executePure('view', [p.state])
+        : hook === 'beginTurn' ? () => p.vm.beginTurn({}, p.state)
+        : hook === 'pure hook' ? () => p.host.setSafetyPure(true) : () => scope[hook]()
+      assert.throws(nested, error => error instanceof p.values.RuntimeTrap)
+      reserve()
+    })
+    scope = p.vm.beginTurn({}, p.state)
+    p.host.effectsAllowed = true
+    assert.throws(() => p.vm.execute('queued', [p.state]), error => error instanceof p.values.RuntimeTrap)
+    assert.equal(attempts, 1)
+    assert.equal(p.host.pendingEffects, queue)
+    assert.deepEqual(queue, [])
+    assert.equal(p.host.nextEffectId, 1)
+    assert.equal(p.host.invoking, false)
+    assert.throws(() => scope.accept(), error => error instanceof p.values.RuntimeTrap)
+    scope.rollback()
+    assert.equal(p.host.effectsAllowed, false)
+    p.host.beginSafetyTurn = begin
+    const next = p.vm.beginTurn({}, p.state)
+    p.host.effectsAllowed = true
+    p.vm.execute('queued', [p.state])
+    assert.deepEqual(queue.map(effect => effect.id), [1, 2])
+    next.rollback()
+    assert.deepEqual(calls, [])
+  })
+}
+test('Step5 real VM later pure failure preserves an already accepted handler and its queued effects', () => {
+  const p = safetyVmFixture(), queue = p.host.pendingEffects
+  const handler = p.vm.beginTurn({}, p.state)
+  p.host.effectsAllowed = true
+  p.vm.execute('mutateQueued', [p.state])
+  handler.accept()
+  const accepted = queue.slice(), frame = p.vm.beginTurn({}, p.state)
+  assert.throws(() => p.vm.executePure('queued', [p.state]), error => error.trapCode === 'R-PURE')
+  frame.rollback()
+  assert.equal(p.state.fields.get('n').value, 2)
+  assert.equal(p.host.pendingEffects, queue)
+  assert.deepEqual(queue, accepted)
+  assert.equal(p.host.nextEffectId, 2)
+  assert.equal(p.host.effectsAllowed, false)
+  const next = p.vm.beginTurn({}, p.state)
+  assert.equal(p.vm.executePure('view', [p.state]).fields.get('text').value, 'initial')
+  next.accept()
+  assert.deepEqual(calls, [])
+})
+test('Step5 legacy blank-key values remain skipped and a failed call does not poison the host', () => {
+  const p = legacyHostFixture(), args = p.args()
+  p.host.effectsAllowed = true
+  args[1] = new p.values.VeraArrayValue([p.str(' '), new p.values.VeraNumberValue(7)])
+  assert.equal(p.call(args).value, 1)
+  assert.deepEqual([...p.host.pendingEffects[0].values], [])
+  args[2] = new p.values.VeraNumberValue(7)
+  assert.throws(() => p.call(args), error => error.trapCode === 'R0020')
+  assert.equal(p.call().value, 3)
+  assert.equal(p.host.safetyRecord, null)
+})
+
 const originals = {
   now: Date.now, random: Math.random, setTimeout: global.setTimeout, clearTimeout: global.clearTimeout,
   setInterval: global.setInterval, clearInterval: global.clearInterval,

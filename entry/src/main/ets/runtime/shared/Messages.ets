@@ -92,6 +92,16 @@ export interface FrameEnvelope {
   scenes?: SceneDraw[]
 }
 
+export interface HostStateVersion {
+  readonly runtimeMode: RuntimeMode
+  readonly vmGeneration: number
+  readonly stateRevision: number
+}
+
+export interface RevisionedFrameEnvelope extends FrameEnvelope, HostStateVersion {
+  readonly vmGeneration: number
+}
+
 export interface EffectRequest {
   appId: string
   vmGeneration: number
@@ -101,6 +111,15 @@ export interface EffectRequest {
   params: string[]
   resultHandler: string
   mode: string
+}
+
+export interface RevisionedEffectRequest extends EffectRequest, HostStateVersion {
+  readonly vmGeneration: number
+}
+
+export interface StateSnapshotEnvelope extends HostStateVersion {
+  readonly appId: string
+  readonly encoded: string
 }
 
 export interface AppSubscriber {

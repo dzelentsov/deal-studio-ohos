@@ -7,6 +7,125 @@
 const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const path = require('node:path')
+const {retainedPayloadChecks, retainedOwnership, retainedLimits} = require('./gfx-check')
+const worldRetained = {
+  name: 'scene retained payload',
+  types: ['SceneThing', 'SceneThingValue', 'SceneOrbit', 'SceneKick', 'ScenePath', 'SceneWander', 'ScenePlayer',
+    'SceneFollow', 'SceneSwing', 'BodySpec', 'WorldSpec', 'WorldDiff', 'CameraSpec', 'FloorSpec', 'TableSpec', 'SkySpec', 'ZoneSpec', 'FollowSpec'],
+  keys: ['thing', 'points', 'parts', 'orbit', 'bodies'], payloadKeys: ['thing'],
+  modules: ['VeraScene', 'VeraPhysics', 'VeraWorldPlay'],
+  files: ['components/VeraWorld3D.ets', 'vera/VeraScene.ets', 'vera/VeraPhysics.ets', 'vera/VeraWorldPlay.ets'],
+  ownership: retainedOwnership, limits: retainedLimits,
+  synchronous: [
+    {file: 'vera/VeraScene.ets', owner: 'asNumbers', reachability: 'VM synchronous',
+      cost: 'Checks caller-provided most before primitive copy; shape/hull/path callers select finite geometry caps',
+      budget: 'Host boundary elapsed time only; geometry validation and hull construction run synchronously',
+      evidence: ['let out: number[] = []', "if (items.length > most) { throw new RuntimeTrap('R0029', 'scene: ' + what + ' holds at most ' + most.toString() + ' numbers; got ' + items.length.toString()) }"]},
+    {file: 'vera/VeraScene.ets', owner: 'asParts', reachability: 'VM synchronous',
+      cost: 'MAX_GROUP_PARTS=16 checked before traversal; MAX_BODY_PARTS=32 checked after partCount geometry work',
+      budget: 'Host pre/post samples, no preemption within geometry computation',
+      evidence: ['let out: SceneThing[] = []', "if (items.length < 1 || items.length > MAX_GROUP_PARTS) { throw new RuntimeTrap('R0029', where + ' holds 1 to ' + MAX_GROUP_PARTS.toString() + ' parts; got ' + items.length.toString()) }"]},
+    {file: 'vera/VeraScene.ets', owner: 'decodeScene', reachability: 'outside VM',
+      cost: 'Post-build decoding scans supplied elements; body/zone caps do not cap skipped inputs',
+      budget: 'Caller wall time, not interpreter instruction or host-boundary sampling',
+      evidence: ['let world = new WorldSpec()', 'if (!(value instanceof VeraArrayValue)) { return world }']}
+  ],
+  review: {
+    SceneThing: 'D copy is shallow: points, parts, kick, orbit, path, wander, player, follow, swing remain borrowed immutable aliases',
+    bodySpec: 'D fresh BodySpec tree and pose/dimension arrays; points and motion metadata alias retained SceneThing',
+    MotionCarry: 'D fresh-decoded BodySpec mutation before retention: travelStart/rotation replacement and copied orbit, never orbit.phaseDeg in place',
+    consumers: 'Physics/WorldPlay/World3D/Preview/runtime/locomotion/look read payloads; renderer caches/nodes/maps and carried motion records are owned separately; makeRevisionedFrame reads borrowed scene specs into JSON-detached output without mutating source payloads',
+    benchmark: 'D p2Validate reads SceneThing payloads into a fresh decoded world and discards it; p2Fingerprint serializes VM fields and queued effect metadata, not retained thing fields. Synthetic scene events are fresh local VM allocations; no borrowed payload writes, native effect dispatch, effect callback execution or native lifetime changes',
+    nativeAudit: 'Completed native-source review: physics copies typed-array input synchronously into native-owned data; step job captures dt/substeps by value and uses owned world pointers; USB workers join; llama copies inputs. No VM-graph aliases retained; this harness does not execute NAPI or prove native lifetimes',
+    nativeBudget: 'Physics step/stepEnd/Idle waits are renderer/simulation paths outside UiHostEnvironment VM dispatch; USB join and model/search work are not VM synchronous host routes. Native waits remain non-preemptible caller costs, not VM budget coverage',
+    unresolved: 'WorldBox next !== prev is an identity gate, not universal freshness proof; retry/publication ordering remains separate from native ownership audit'
+  },
+  discovery: {
+    'components/VeraPreview.ets': '353361b29bac4b170dcfca4bf6f2a8d120f646a1a8ec7a7f3f44b6369d55cfa4',
+    'components/VeraWorld3D.ets': '300ecbf4f0e948f361970f6698cb13061d909b837d78edefd3c83373ee1b4047',
+    'runtime/AppActor.ets': '68ad123b5f1fa109b1ea2327eb21723bc16d4f10205a16b596411496b2041830',
+    'runtime/InProcessHost.ets': '5a18779450ce883361fab52a1a0abf58696f4f74b5624f1429e9a099f5b5e9cf',
+    'runtime/shared/Messages.ets': 'ae8f8e064d357d7a761386023b204a0900d6b391246106a088a18b0851d6752e',
+    'vera/agent/AgentSurface.ets': '35e117360d2c8a754c8c887fc9bd2ab9abfe5487ab3e6d64951e2d04c4a216c4',
+    'vera/VeraCompiler.ets': '67de636f4ce1cc7649ff653a8783915b1e909e17b71d6616bc02aaecad32b0fb',
+    'vera/VeraLocomotion.ets': 'c84270ffc984e7c9c3c6fd8b9ed9fbc8ba62ea595906d605f01eb1acadaecd67',
+    'vera/VeraLook3D.ets': '97a287ab41223edf8c13b95da2db4f869bd33060069a85425c719c561cbc5ce3',
+    'vera/VeraPhysics.ets': 'ca8b7ab69e51e59e38725bfaa82cc11c6d2956450a4483ab80511ae3d00d5fb4',
+    'vera/VeraScene.ets': '53b3e4e23b92a4c740f3d1b8fe69e48518cfb8ca2ffda6746a14b5cadc2c08ad',
+    'vera/VeraSearchBenchmark.ets': '48e5717398ea44d70369f6ca4d3d575a59604b2a12775f4eebb49378331e4582',
+    'vera/VeraSmoke.ets': '95624e72708e34cc302286aae108552f5d3ba453b44ff2681a70d6219aca9605',
+    'vera/VeraUi.ets': 'f063c2f2dfaa7cade58dbf2237c99c2ae92792d223c18ba55eee87bea67f0acc',
+    'vera/VeraUiCatalog.ets': '4c2462c94dfc193398837d23303a0e6aa212849e5b0e884f3a55602753a1c587',
+    'vera/VeraWorldPlay.ets': 'ebb49161a017750dfba277b94ad74f372e37410f27510bf50326d499ad015c11'
+  },
+  inventory: {
+    'components/VeraPreview.ets': [5, 34, '6a10718813efee20c3e7edca2a29010ef3620435e41af5e42b9ce86e9d8b8ad0'],
+    'components/VeraWorld3D.ets': [38, 412, '7e03d4a8f8b76bf0cc2fd2804dc0d52a769eef72d501382ac100f3f060980c45'],
+    'runtime/AppActor.ets': [1, 4, '5e5190dd00eeeb21c09f5ebe4a3be7f6c68f1642c770d04d77f7af93c13e993e'],
+    'runtime/InProcessHost.ets': [2, 19, '047babf1892945cdfc3adc8cb943ea08596c5fd39c83684d861dd1c7f58bc9b2'],
+    'vera/VeraLocomotion.ets': [8, 54, 'acf5f400277924ed50c2dd3571b530af50a04cb5be55acad6fe79e1cfc45dc0e'],
+    'vera/VeraLook3D.ets': [16, 162, 'e125634e115f70fe2be82b0f22ec71d0d90366b7c4dfc9c13a310263ee4e35e7'],
+    'vera/VeraPhysics.ets': [14, 217, '6215ec5a44dbf1305ac8b41d147a32832efb0d991210d7a45ebf9b9541163e75'],
+    'vera/VeraScene.ets': [37, 725, '07d5b072c42b5729bc4a10c21c59be32351293be144442f79945851a005d2c29'],
+    'vera/VeraSearchBenchmark.ets': [1, 1, '98445d56d4e2e79ddd789eeecf629942212acf7475306e65929b8aa8679307e8'],
+    'vera/VeraSmoke.ets': [1, 1, 'd474d5c5007bd78b14332d52db0dcaa6f9d2472184eb9cc1224b29c8beb6b57b'],
+    'vera/VeraWorldPlay.ets': [25, 342, '1eaf828fc366b6ccb6d8f5a97120c7190e8c9a411c6001386a5b17632508b004']
+  },
+  bodies: {
+    'vera/VeraScene.ets:asNumbers': ['7d8acf21d9c9375fa89bb561420c2b2c611f98ff4cf54d5edaf24b2a82fc51ab', 'A borrowed VM primitives extracted into D per-call fresh output; no module-shared reused array; hash is a bounded review gate, not semantic freshness proof'],
+    'vera/VeraScene.ets:SceneThing': ['7edd55bdfe61cd1aa1f668dee327ec5799a0a33a0261c2f9d0048f7f8ca52c9a', 'D defaults and shallow functional copy preserve immutable descendants'],
+    'vera/VeraScene.ets:SceneThingValue': ['5e0783d2aecb2ef36a6c62a46171cb0135d21239673bdeb113f121cff184c16c', 'A fresh wrapper map via freshObjectValue provenance with D retained thing alias'],
+    'vera/VeraScene.ets:BodySpec': ['001de72e0fa2852f33698523315edc5be98a52d9e5d4ddfd380b00ec1e83cbb3', 'D per-instance arrays and shared immutable metadata'],
+    'vera/VeraScene.ets:WorldSpec': ['8320097d4c313e8df9fede49a749b3eef181b73a08da4ea65a223a580ccb322b', 'D fresh body/zone collections'],
+    'vera/VeraScene.ets:asParts': ['b40082ed82d061f3c92ef1b86b2c929763bf94a4d0878b54c581ffab559787c4', 'D copies parts before recentering, retains nested immutable aliases'],
+    'vera/VeraScene.ets:asBody': ['db842b3e05fbff8b67580c9457e5b3b42b02702f8122f49dec92e2dd70f597a0', 'D wrappers receive shallow fresh copy, not original thing'],
+    'vera/VeraScene.ets:bodySpec': ['308c59ebf76fdd64c2307724e829cd66eafc4b52462d504b58c9b1341008ecbd', 'D fresh body/parts tree, dimensions and poses; points and metadata remain aliases'],
+    'vera/VeraScene.ets:decodeScene': ['bc803ee6de10319e5676f56379aecf11a9ab807948b356d700a4394defe1f09a', 'D fresh world validated before return'],
+    'vera/VeraScene.ets:MotionCarry.apply': ['feb55b596a9d2692f7a71c672549167dc67b57a014abcf5c4cc1cff83249db5e', 'D fresh body rotation/orbit replaced, old aliased orbit never mutated'],
+    'vera/VeraWorldPlay.ets:WorldPlay.rebuild': ['5a761ca891787cf6e40db92bf87f9f792ee23131ad442978783178e783c9ae62', 'D carry applied to fresh decode before diff/sim/retention'],
+    'components/VeraWorld3D.ets:BodyNode.constructor': ['8b8492db53d5cb8995fe7b5f5fc0dc13ea28b10b5de3b193d678a3be812d361d', 'D renderer node retains borrowed spec separately'],
+    'components/VeraWorld3D.ets:WorldBox.applyOne': ['396c2bedb97c9e3424efde29a98f38eb168c748517ec28e7a2be192a82431f87', 'D carry identity gate and spec publication/renderer updates pinned']
+  },
+  probes: [
+    ['scene primitive extraction reuses module-shared output', 'vera/VeraScene.ets',
+      `function asNumbers(args: RuntimeValue[], i: number, what: string, most: number): number[] {
+  let v = i < args.length ? args[i] : null
+  if (!(v instanceof VeraArrayValue)) { throw new RuntimeTrap('R0020', 'scene: ' + what + ' must be a number[]') }
+  let items = (v as VeraArrayValue).elements
+  if (items.length > most) {
+    throw new RuntimeTrap('R0029', 'scene: ' + what + ' holds at most ' + most.toString() + ' numbers; got ' + items.length.toString())
+  }
+  let out: number[] = []`,
+      `const sharedNumericOutput: number[] = []
+function asNumbers(args: RuntimeValue[], i: number, what: string, most: number): number[] {
+  let v = i < args.length ? args[i] : null
+  if (!(v instanceof VeraArrayValue)) { throw new RuntimeTrap('R0020', 'scene: ' + what + ' must be a number[]') }
+  let items = (v as VeraArrayValue).elements
+  if (items.length > most) {
+    throw new RuntimeTrap('R0029', 'scene: ' + what + ' holds at most ' + most.toString() + ' numbers; got ' + items.length.toString())
+  }
+  let out: number[] = sharedNumericOutput
+  out.length = 0`, null, null, true],
+    ['shape.thing.orbit.phaseDeg mutation', 'vera/VeraScene.ets', 'this.thing = thing', 'this.thing = thing; this.thing.orbit.phaseDeg = 99'],
+    ['bodySpec shared alias mutation', 'vera/VeraScene.ets', 'b.points = t.points', 'b.points = t.points; const shared = b.points; shared.push(99);', 'shared.push(99)'],
+    ['erased consumer alias', 'vera/VeraPhysics.ets', 'apply(diff: WorldDiff, next: WorldSpec): void {',
+      'apply(diff: WorldDiff, next: WorldSpec): void { const hidden = next as Object; consume(hidden);', 'consume(hidden)'],
+    ['destructured unknown receiver', 'vera/VeraScene.ets', 'function bodySpec(t: SceneThing): BodySpec {',
+      'function bodySpec(t: SceneThing): BodySpec { const {orbit: motion} = input; motion.phaseDeg = 99;', 'motion.phaseDeg = 99'],
+    ['erased destructured consumer alias', 'components/VeraWorld3D.ets', 'let prev = this.applied',
+      'let prev = this.applied; const erased = next as Object; const {bodies: parts} = erased; consume(parts);', 'consume(parts)'],
+    ['MotionCarry shared orbit write', 'vera/VeraScene.ets', 'b.orbit = c', 'o.phaseDeg = m.phaseUsed; b.orbit = c'],
+    ['MotionCarry fresh orbit weakened', 'vera/VeraScene.ets', 'let c = new SceneOrbit()', 'let c = o'],
+    ['functional copy weakened', 'vera/VeraScene.ets', 'return t.copy()', 'return t'],
+    ['group part copy weakened', 'vera/VeraScene.ets', 'out.push(t.copy())', 'out.push(t)'],
+    ['approved carry write repeated by loop', 'vera/VeraScene.ets', 'b.travelStart = m.travelUsed',
+      'for (let repeat = 0; repeat < 2; repeat++) { b.travelStart = m.travelUsed }'],
+    ['approved carry conditional bypass', 'vera/VeraScene.ets', 'b.travelStart = m.travelUsed', 'if (false) { b.travelStart = m.travelUsed }'],
+    ['new source consumer', 'runtime/P3SceneProbe.ets', '', "import {BodySpec as Body} from '../vera/VeraScene'; export function steal(b: Body): void { const erased = b as Object; consume(erased); }", 'consume(erased)'],
+    ['new unknown thing destructuring', 'runtime/P3SceneProbe.ets', '', 'export function steal(input: Object): void { const {thing: shape} = input; shape.orbit.phaseDeg = 9; }', 'shape.orbit.phaseDeg = 9']
+  ]
+}
+retainedPayloadChecks(worldRetained)
 const {loadVera} = require('./source-loader')
 const {compileVeraSource} = loadVera('VeraCompiler')
 const {VirtualMachine, deserializeVbc2, VeraNumberValue, VeraStringValue, VeraBooleanValue, VeraArrayValue} = loadVera('VeraInterpreter')
@@ -216,6 +335,253 @@ traps(() => host.invoke('std/scene', 'teleport', [], false), 'R0015')
   const plain = box('p'); call('glow', plain); assert.equal(plain.thing.glow, false)
   // Not a thing in the list: left out, as gfx leaves out what is not a shape.
   assert.equal(world([box('x'), new VeraNumberValue(1)]).bodies.length, 1)
+}
+
+{
+  const guardedMaps = new WeakSet()
+  const rejectMapMutation = () => { throw new TypeError('retained Map mutation') }
+  const freeze = (value, seen = new WeakSet()) => {
+    if (value === null || typeof value !== 'object' || seen.has(value)) return value
+    seen.add(value)
+    if (value instanceof Map) {
+      for (const [key, item] of Map.prototype.entries.call(value)) { freeze(key, seen); freeze(item, seen) }
+      if (!guardedMaps.has(value)) {
+        for (const name of ['set', 'delete', 'clear']) Object.defineProperty(value, name, {value: rejectMapMutation})
+        guardedMaps.add(value)
+      }
+    }
+    for (const key of Reflect.ownKeys(value)) freeze(value[key], seen)
+    return Object.freeze(value)
+  }
+  const identities = new WeakMap()
+  let nextIdentity = 0
+  const identity = value => {
+    if (!identities.has(value)) identities.set(value, ++nextIdentity)
+    return identities.get(value)
+  }
+  const snapshot = value => {
+    const seen = new WeakSet()
+    const visit = item => {
+      if (item === null || (typeof item !== 'object' && typeof item !== 'function')) return ['value', item]
+      const id = identity(item)
+      if (seen.has(item) || typeof item === 'function') return ['ref', id]
+      seen.add(item)
+      return ['object', id, Object.getPrototypeOf(item),
+        item instanceof Map ? [...Map.prototype.entries.call(item)].map(([key, entry]) => [visit(key), visit(entry)]) : null,
+        Reflect.ownKeys(item).map(key => [key, visit(item[key])])]
+    }
+    return visit(value)
+  }
+  const retained = []
+  const retain = value => {
+    freeze(value)
+    retained.push([value, snapshot(value)])
+    return value
+  }
+  const unchanged = () => {
+    for (const [value, before] of retained) assert.deepEqual(snapshot(value), before, 'retained scene payload and identities are unchanged')
+  }
+  const probeThing = box('ownership-probe')
+  const probeKey = {key: 'retained'}
+  const probeValue = {nested: new Map([['value', new VeraNumberValue(7)]])}
+  probeThing.fields.set(probeKey, probeValue)
+  const probeInput = retain(new VeraArrayValue([probeThing]))
+  assert.equal(probeInput.elements[0].fields, probeThing.fields)
+  for (const map of [probeThing.fields, probeValue.nested]) {
+    const [key, value] = map.entries().next().value
+    const before = snapshot(map)
+    for (const mutate of [() => map.set(key, value), () => map.set('new', value), () => map.delete(key), () => map.clear()]) {
+      assert.throws(mutate, {name: 'TypeError', message: 'retained Map mutation'})
+      assert.deepEqual(snapshot(map), before, 'rejected Map mutations leave entries and identities intact')
+    }
+    assert.ok(Object.isFrozen(map))
+  }
+  assert.ok(Object.isFrozen(probeKey))
+  assert.ok(Object.isFrozen(probeValue))
+  assert.ok(Object.isFrozen(probeValue.nested.get('value')))
+  assert.equal(S.decodeScene(probeInput).bodies[0].id, 'ownership-probe')
+  unchanged()
+  const snapshotProbe = freeze(new Map([[probeKey, probeValue]]))
+  const probeBefore = snapshot(snapshotProbe)
+  assert.deepEqual(snapshot(snapshotProbe), probeBefore, 'Map snapshots are deterministic')
+  Map.prototype.set.call(snapshotProbe, probeKey, {nested: probeValue.nested})
+  assert.notDeepEqual(snapshot(snapshotProbe), probeBefore, 'snapshots detect equal-content value replacement by identity')
+  Map.prototype.delete.call(snapshotProbe, probeKey)
+  Map.prototype.set.call(snapshotProbe, {key: 'retained'}, probeValue)
+  assert.notDeepEqual(snapshot(snapshotProbe), probeBefore, 'snapshots detect equal-content key replacement by identity')
+  Map.prototype.clear.call(snapshotProbe)
+  assert.notDeepEqual(snapshot(snapshotProbe), probeBefore, 'snapshots include Map entries')
+  Map.prototype.set.call(snapshotProbe, probeKey, probeValue)
+  assert.deepEqual(snapshot(snapshotProbe), probeBefore, 'restoring the original entries restores the snapshot')
+  const nums = values => retain(new VeraArrayValue(values.map(n => new VeraNumberValue(n))))
+  const outline = nums([0, 0, 4, 0, 0, 2])
+  const vertices = nums([0, 0, 0, 2, 0, 0, 0, 4, 0, 0, 0, 6])
+  const route = nums([0, 0, 4, 0, 4, 4])
+  const otherRoute = nums([-3, 1, -3, 6])
+  const firstPath = retain(call('path', box('fresh-path-one'), route, 1, false))
+  const secondPath = retain(call('path', box('fresh-path-two'), otherRoute, 2, false))
+  assert.notEqual(firstPath.thing.path.points, secondPath.thing.path.points, 'successive retained paths own per-call extracted arrays')
+  assert.notEqual(firstPath.thing.path.points, route.elements, 'first path does not borrow VM storage')
+  assert.notEqual(secondPath.thing.path.points, otherRoute.elements, 'second path does not borrow VM storage')
+  assert.deepEqual(firstPath.thing.path.points, [0, 0, 4, 0, 4, 4], 'second extraction leaves first retained route unchanged')
+  assert.deepEqual(secondPath.thing.path.points, [-3, 1, -3, 6])
+  assert.ok(secondPath.thing.path.points.every(n => typeof n === 'number'), 'scene extraction stores primitives, not VM wrappers')
+  unchanged()
+  const sheet = retain(call('shape', 'sheet', 1, 2, 3, outline, 'accent'))
+  const hull = retain(call('hull', 'hull', 8, 0, 0, vertices, 'warning'))
+  assert.deepEqual([sheet.thing.x, sheet.thing.y, sheet.thing.z, sheet.thing.w, sheet.thing.h, sheet.thing.d], [3, 2, 4, 4, 0.04, 2])
+  assert.deepEqual(sheet.thing.points, [-2, -1, 2, -1, -2, 1])
+  assert.deepEqual([hull.thing.x, hull.thing.y, hull.thing.z, hull.thing.w, hull.thing.h, hull.thing.d], [9, 2, 3, 2, 4, 6])
+  assert.deepEqual(hull.thing.points, [-1, -2, -3, 1, -2, -3, -1, 2, -3, -1, -2, 3])
+  const transform = (name, input, args, expected) => {
+    retain(input)
+    const output = call(name, input, ...args)
+    assert.notEqual(output, input, name + ' returns a new opaque value')
+    assert.notEqual(output.thing, input.thing, name + ' copies the thing')
+    for (const [key, value] of Object.entries(expected)) assert.deepEqual(output.thing[key], value, name + ' sets ' + key)
+    unchanged()
+    return retain(output)
+  }
+  const thick = transform('thick', sheet, [0.5], {h: 0.5})
+  const leg = transform('swing', thick, [20, 2, 90], {swing: Object.assign(new S.SceneSwing(), {deg: 20, periodS: 2, phaseDeg: 90})})
+  const parts = retain(new VeraArrayValue([leg, box('foot', 5, 2, 4)]))
+  const group = retain(call('group', 'walker', 0, 0, 0, parts))
+  assert.deepEqual([group.thing.x, group.thing.y, group.thing.z, group.thing.w, group.thing.h, group.thing.d], [3.25, 2, 4, 4.5, 1, 2])
+  assert.deepEqual(group.thing.parts.map(p => [p.id, p.x, p.y, p.z]), [['sheet', -0.25, 0, 0], ['foot', 1.75, 0, 0]])
+  assert.notEqual(group.thing.parts, parts.elements)
+  assert.notEqual(group.thing.parts[0], leg.thing)
+  assert.equal(group.thing.parts[0].points, leg.thing.points)
+  assert.equal(group.thing.parts[0].swing, leg.thing.swing)
+  const walking = transform('path', group, [route, 1, false], {motion: 'kinematic', path: Object.assign(new S.ScenePath(), {points: [0, 0, 4, 0, 4, 4], speed: 1, loop: false})})
+  const roaming = transform('wander', box('roamer', -8), [3, 1], {motion: 'kinematic', wander: Object.assign(new S.SceneWander(), {radius: 3, speed: 1})})
+  const orbiting = transform('orbit', call('sphere', 'planet', 0, 1, 0, 0.5, 'accent'), ['centre', 3, 8, 0],
+    {motion: 'kinematic', orbit: Object.assign(new S.SceneOrbit(), {centre: 'centre', radius: 3, periodS: 8, phaseDeg: 0})})
+  const spinning = transform('spin', orbiting, [8], {spinPeriodS: 8})
+  const painted = transform('paint', spinning, ['bands', 'warning'], {pattern: 'bands', color2: 'warning'})
+  const ringed = transform('rings', painted, [0.7, 1, 'ink'], {ringInner: 0.7, ringOuter: 1, ringColor: 'ink'})
+  const loose = transform('loose', box('pilot', 12), [2], {motion: 'loose', mass: 2})
+  const kicked = transform('kick', loose, [1, 2, 3, 4, 0.5], {kick: Object.assign(new S.SceneKick(), {trigger: 1, vx: 2, vy: 3, vz: 4, spin: 0.5})})
+  const player = transform('player', kicked, [3, 'Jump'], {player: Object.assign(new S.ScenePlayer(), {speed: 3, action: 'Jump'})})
+  const followed = transform('follow', player, [5, 2], {follow: Object.assign(new S.SceneFollow(), {distance: 5, height: 2})})
+  for (const input of [walking, roaming, ringed, followed, hull]) {
+    const copy = input.thing.copy()
+    assert.notEqual(copy, input.thing)
+    assert.deepEqual(copy, input.thing)
+    for (const key of ['points', 'parts', 'kick', 'orbit', 'path', 'wander', 'player', 'follow', 'swing']) assert.equal(copy[key], input.thing[key], 'copy retains ' + key)
+    transform('turn', input, [10, 20, 30], {rx: 10, ry: 20, rz: 30})
+    transform('glow', input, [], {glow: true})
+    transform('mark', input, ['warning'], {mark: 'warning'})
+    transform('trail', input, [], {trail: true})
+    transform('bounce', input, [-1, 2], {restitution: 0, friction: 1})
+  }
+  for (const [name, input, args, key, field, expected] of [
+    ['kick', followed, [2, 4, 5, 6, 1], 'kick', 'trigger', 2],
+    ['orbit', ringed, ['centre', 4, 4, 45], 'orbit', 'phaseDeg', 45],
+    ['player', followed, [4, 'Run'], 'player', 'action', 'Run'],
+    ['follow', followed, [6, 3], 'follow', 'distance', 6],
+    ['swing', leg, [30, 4, 180], 'swing', 'phaseDeg', 180]
+  ]) {
+    const output = call(name, input, ...args)
+    assert.notEqual(output.thing[key], input.thing[key], name + ' replaces rather than edits a retained config')
+    assert.equal(output.thing[key][field], expected)
+    unchanged()
+  }
+  const input = retain(new VeraArrayValue([box('centre', 0, 1), ringed, walking, roaming, followed, hull,
+    call('floor', 'surface'), call('sky', 'ink', 42), call('zone', 'goal', 2, 3, 1, 'accent')]))
+  const decoded = S.decodeScene(input)
+  assert.deepEqual(decoded.bodies.map(b => b.id), ['centre', 'planet', 'walker', 'roamer', 'pilot', 'hull'])
+  assert.deepEqual({...decoded.floor}, {color: 'surface'})
+  assert.deepEqual({...decoded.sky}, {color: 'ink', stars: 42})
+  assert.deepEqual({...decoded.follow}, {target: 'pilot', distance: 5, height: 2})
+  assert.deepEqual(decoded.zones.map(z => ({...z})), [{id: 'goal', x: 2, z: 3, r: 1, color: 'accent'}])
+  for (const value of [ringed, walking, roaming, followed, hull]) {
+    const b = decoded.bodies.find(b => b.id === value.thing.id)
+    for (const key of ['points', 'kick', 'orbit', 'path', 'wander', 'player']) assert.equal(b[key], value.thing[key], 'decode shares read-only ' + key)
+    assert.notEqual(b.parts, value.thing.parts)
+    assert.deepEqual(b.position, [value.thing.x, value.thing.y, value.thing.z])
+    assert.deepEqual(b.dims, [value.thing.w, value.thing.h, value.thing.d])
+  }
+  const child = decoded.bodies.find(b => b.id === 'walker').parts[0]
+  assert.notEqual(child, group.thing.parts[0])
+  assert.equal(child.points, leg.thing.points)
+  assert.equal(child.swing, leg.thing.swing)
+  assert.deepEqual(child.position, [-0.25, 0, 0])
+  child.position[0] = 99
+  assert.equal(group.thing.parts[0].x, -0.25)
+  const setup = retain(new VeraArrayValue([call('table', 8, 6, 'surface'), call('camera', 0, 4, 8, 0, 0, 0, true)]))
+  const setupSpec = S.decodeScene(setup)
+  assert.deepEqual({...setupSpec.table}, {width: 8, depth: 6, color: 'surface'})
+  assert.deepEqual({...setupSpec.camera}, {x: 0, y: 4, z: 8, lookX: 0, lookY: 0, lookZ: 0, orbit: true})
+  const motion = multiplier => retain(new VeraArrayValue([
+    call('spin', box('centre', 0, 1), 8 / multiplier),
+    call('spin', call('orbit', box('planet'), 'centre', 3, 8 / multiplier, 0), 8 / multiplier),
+    call('path', group, route, multiplier, false), call('wander', box('roamer', -8), 3, multiplier)
+  ]))
+  const carry = new S.MotionCarry()
+  const slowInput = motion(1), fastInput = motion(2)
+  const slow = S.decodeScene(slowInput)
+  carry.apply(slow, 0)
+  retain(slow)
+  const before = S.orbitPositions(slow, 1)
+  const fast = S.decodeScene(fastInput)
+  carry.apply(fast, 1)
+  const planet = fast.bodies.find(b => b.id === 'planet')
+  assert.equal(planet.orbit.phaseDeg, 315)
+  assert.equal(planet.rotation[1], 315)
+  assert.notEqual(planet.orbit, fastInput.elements[1].thing.orbit)
+  assert.equal(fastInput.elements[1].thing.orbit.phaseDeg, 0)
+  assert.deepEqual(fast.bodies.filter(b => b.path || b.wander).map(b => b.travelStart), [-1, -1])
+  const after = S.orbitPositions(fast, 1)
+  assert.deepEqual([...after.keys()], ['centre', 'planet', 'walker', 'roamer'])
+  for (const [id, pose] of before) {
+    const got = after.get(id)
+    for (let k = 0; k < 6; k++) assert.ok(Math.abs(k === 4 ? Math.sin((got[k] - pose[k]) * Math.PI / 360) : got[k] - pose[k]) < 1e-9, id + ' carries pose ' + k)
+  }
+  assert.equal(S.orbitPositions(fast, 1.5).get('walker')[0], 2, 'the carried path advances at its new speed')
+  retain(fast)
+  assert.ok(S.diffWorld(fast, S.decodeScene(fastInput)).setPose.some(b => b.id === 'planet'), 'the carried pose differs from the raw build')
+  const P = loadVera('VeraPhysics')
+  const sim = new P.WorldSim(new P.FakePhys())
+  const simulated = retain(Object.assign(new S.WorldSpec(), {bodies: [...fast.bodies, decoded.bodies.find(b => b.id === 'pilot')]}))
+  sim.apply(S.diffWorld(null, simulated), simulated)
+  sim.step(1000 / 60, 1.5)
+  assert.deepEqual(sim.poseOf('walker').slice(0, 3), [2, 2, 0], 'the frozen path moves its group in FakePhys')
+  const livePlanet = sim.poseOf('planet'), wantPlanet = S.orbitPositions(fast, 1.5).get('planet')
+  for (let k = 0; k < 3; k++) assert.ok(Math.abs(livePlanet[k] - wantPlanet[k]) < 1e-6, 'the frozen orbit moves in FakePhys')
+  assert.ok(sim.poseOf('pilot')[1] > 0.5, 'the frozen player kick is consumed by FakePhys')
+  const records = P.bodyRecords(fast.bodies.find(b => b.id === 'walker'))
+  assert.equal(records.records.length, 24)
+  assert.equal(records.points.length, 18)
+  assert.deepEqual(records.records.slice(0, 4), [3, -0.25, 0, 0], 'the outline part is packed at its group-local position')
+  unchanged()
+
+  const {playWorld, WorldPlayReport} = loadVera('VeraWorldPlay')
+  const compiled = compileVeraSource(program(`
+    things.push(scene.spin(scene.sphere("centre", 0, 1, 0, 0.5, "ink"), 8 / (state.n + 1)));
+    things.push(scene.spin(scene.orbit(scene.sphere("planet", 0, 1, 0, 0.4, "accent"), "centre", 2, 8 / (state.n + 1), 0), 8 / (state.n + 1)));
+    things.push(scene.path(scene.group("walker", 0, 0, 0, [scene.swing(scene.thick(scene.shape("leg", 0, 1, 0, [-0.5, -0.5, 0.5, -0.5, 0, 0.5], "accent"), 0.5), 20, 2, 0)]), [4, 0, 6, 0], state.n + 1, false));
+  `, 'function onWorld(state: AppState, e: scene.Event): AppState { return {n: state.n + 1}; }', eventWorld))
+  const execute = VirtualMachine.prototype.execute
+  const builds = []
+  VirtualMachine.prototype.execute = function(name, ...args) {
+    const result = execute.call(this, name, ...args)
+    if (name === 'build') builds.push(retain(result))
+    return result
+  }
+  const report = new WorldPlayReport()
+  try {
+    assert.equal(playWorld(compiled, true, report, 'self'), '', 'production WorldPlay consumes frozen VM builds through rebuilds and frames')
+  } finally {
+    VirtualMachine.prototype.execute = execute
+  }
+  assert.equal(builds.length, 5, 'initial build, three body taps and one empty-space tap all rebuild')
+  assert.deepEqual(builds.map(v => v.elements[1].thing.orbit.periodS), [8, 4, 8 / 3, 2, 8 / 5])
+  assert.deepEqual(builds.map(v => v.elements[2].thing.path.speed), [1, 2, 3, 4, 5])
+  assert.equal(report.bodies, 3)
+  assert.equal(report.stateChanged, true)
+  assert.ok(report.slowestSteps > 0)
+  assert.equal(VirtualMachine.prototype.execute, execute)
+  unchanged()
 }
 
 // ---- diff

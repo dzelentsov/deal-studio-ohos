@@ -981,6 +981,297 @@ for (const stage of ['create', 'update1', 'update2', 'digest']) test('crypto / o
   noWrites()
 })
 
+const quarantines = () => [...active.nodes.keys()].filter(file => file.endsWith('.quarantine'))
+const lostSeed = () => { active.put(MAIN, '{main'); active.put(BAK, '{backup'); return active.put(LOCK, 'stable lock') }
+
+for (const variant of ['both corrupt', 'main only', 'backup only', 'invalid utf8', 'absent']) test('lost reset / durable quarantine ' + variant, io => {
+  const lock = active.put(LOCK, 'stable lock')
+  const originals = new Map()
+  if (variant === 'both corrupt' || variant === 'main only') originals.set(MAIN, active.put(MAIN, '{main'))
+  if (variant === 'both corrupt' || variant === 'backup only') originals.set(BAK, active.put(BAK, '{backup'))
+  if (variant === 'invalid utf8') originals.set(MAIN, active.put(MAIN, Buffer.from([0xff, 0xfe])))
+  const foreign = MAIN + '.foreign.quarantine'
+  const foreignNode = active.put(foreign, 'older evidence')
+  const temp = MAIN + '.' + crypto.randomUUID() + '.tmp'
+  const tempNode = active.put(temp, 'orphan evidence', 'file', 120000)
+  assert.deepEqual(io.recoverLost(APP, STAMP), { kind: 'ABSENT' })
+  assert(!active.nodes.has(MAIN))
+  assert(!active.nodes.has(BAK))
+  assert.equal(active.nodes.get(LOCK), lock)
+  assert.equal(active.text(LOCK), 'stable lock')
+  assert.equal(active.nodes.get(foreign), foreignNode)
+  assert.equal(active.nodes.get(temp), tempNode)
+  for (const [original, node] of originals) {
+    const names = quarantines().filter(file => file.startsWith(original + '.') && active.nodes.get(file) === node)
+    assert.equal(names.length, 1)
+    assert(/\.[0-9a-f-]{36}\.quarantine$/.test(names[0]))
+  }
+  const locked = active.trace.findIndex(event => event.op === 'locked')
+  const unlocked = active.trace.findIndex(event => event.op === 'unlock')
+  const renames = active.trace.filter(event => event.op === 'rename')
+  assert.equal(renames.length, originals.size)
+  for (const event of renames) {
+    const index = active.trace.indexOf(event)
+    assert(index > locked && index < unlocked)
+    assert(active.trace.slice(locked + 1, index).some(item => item.op === 'read' && item.path === event.path))
+    assert(active.trace.slice(index + 1, unlocked).some(item => item.op === 'fsync' && item.path === DIR))
+    const reservation = active.trace.find(item => item.op === 'open' && item.path === event.to)
+    assert(reservation.legacy && (reservation.flags & EXCL) && (reservation.flags & modes.NOFOLLOW))
+    assert.equal(reservation.mode, 0o600)
+  }
+  assert(!active.trace.some(event => event.op === 'unlink' || event.op === 'write'))
+  assert.deepEqual(io.recoverLost(APP, STAMP), { kind: 'ABSENT' })
+  assert.equal(active.nodes.get(LOCK), lock)
+  assert.equal(quarantines().length, originals.size + 1)
+  assert.equal(io.commit(request({ pre: { appId: APP, vmGeneration: 1, baseRevision: 0 } })).status, 'COMMITTED')
+  assert.equal(active.nodes.get(LOCK), lock)
+  assert.equal(quarantines().length, originals.size + 1)
+})
+
+for (const legacy of [false, true]) for (const matching of [false, true]) test('lost reset / restored main wins under lock legacy=' + legacy + ' matching=' + matching, io => {
+  const lock = lostSeed()
+  assert.equal(io.load(APP, STAMP).kind, 'LOST')
+  const text = legacy ? JSON.stringify({ stamp: STAMP, value: JSON.parse(LARGE) }) : fileText({}, LARGE)
+  let restored
+  active.trace = []
+  active.once(event => event.op === 'locked', () => { restored = active.put(MAIN, text) })
+  const result = io.recoverLost(APP, matching ? STAMP : 'other')
+  assert.equal(result.kind, 'READY')
+  assert.equal(result.source, 'MAIN')
+  assert.equal(result.format, legacy ? 'LEGACY' : 'FORMAT2')
+  assert.equal(result.matchingStamp, matching)
+  assert.equal(result.encodedState, matching ? LARGE : undefined)
+  assert.equal(active.nodes.get(MAIN), restored)
+  assert.equal(active.text(BAK), '{backup')
+  assert.equal(active.nodes.get(LOCK), lock)
+  assert(active.trace.filter(event => event.op === 'read').reduce((sum, event) => sum + event.count, 0) >= Buffer.byteLength(text))
+  assert(!active.trace.some(event => event.path === BAK))
+  noWrites()
+})
+
+for (const matching of [false, true]) test('lost reset / restored valid backup recovered never quarantined matching=' + matching, io => {
+  const lock = lostSeed()
+  assert.equal(io.load(APP, STAMP).kind, 'LOST')
+  const text = fileText({ revision: 44, vmGeneration: 18 }, LARGE)
+  let restored
+  active.once(event => event.op === 'locked', () => { restored = active.put(BAK, text) })
+  const result = io.recoverLost(APP, matching ? STAMP : 'other')
+  assert.equal(result.kind, 'READY')
+  assert.equal(result.source, 'BAK')
+  assert.equal(result.recovered, true)
+  assert.equal(result.header.revision, 44)
+  assert.equal(result.header.vmGeneration, 18)
+  assert.equal(result.matchingStamp, matching)
+  assert.equal(result.encodedState, matching ? LARGE : undefined)
+  assert.equal(active.text(MAIN), text)
+  assert.equal(active.nodes.get(BAK), restored)
+  assert.equal(active.nodes.get(LOCK), lock)
+  assert.deepEqual(quarantines(), [])
+  noTemps()
+})
+
+for (const target of [MAIN, BAK]) for (const op of ['open', 'read', 'stat']) {
+  for (const code of [13900005, 13900001, 13900012]) test('lost reset / operational ' + path.basename(target) + ' ' + op + ' ' + code, io => {
+    const lock = lostSeed()
+    const before = new Map(active.nodes)
+    active.fail(op, event => event.path === target, code)
+    const result = io.recoverLost(APP, STAMP)
+    assert.equal(result.kind, 'UNAVAILABLE')
+    assert.equal(result.code, code === 13900005 ? 'STATE_READ_FAILED' : 'STATE_UNAVAILABLE')
+    for (const [file, node] of before) assert.equal(active.nodes.get(file), node)
+    assert.equal(active.nodes.get(LOCK), lock)
+    assert.deepEqual(quarantines(), [])
+    noWrites()
+  })
+}
+
+for (const target of [MAIN, BAK]) for (const stage of ['create', 'update1', 'update2', 'digest']) test('lost reset / hash operational failure ' + path.basename(target) + ' ' + stage, io => {
+  lostSeed()
+  const node = active.put(target, fileText())
+  cryptoFailure = { stage, error: nativeError('CRYPTO_OPERATION_FAILED') }
+  const result = io.recoverLost(APP, STAMP)
+  assert.equal(result.kind, 'UNAVAILABLE')
+  assert.equal(result.code, 'STATE_READ_FAILED')
+  assert.equal(active.nodes.get(target), node)
+  assert.deepEqual(quarantines(), [])
+  noWrites()
+})
+
+for (const target of [MAIN, BAK]) for (const kind of ['dir', 'symlink']) test('lost reset / nonregular corrupt target refused ' + path.basename(target) + ' ' + kind, io => {
+  lostSeed()
+  active.put(target, '', kind)
+  assert.equal(io.recoverLost(APP, STAMP).kind, 'UNAVAILABLE')
+  assert.deepEqual(quarantines(), [])
+  noWrites()
+})
+
+for (const target of [MAIN, BAK]) for (const [name, damage] of [
+  ['hash', text => text.replace('hello', 'jello')],
+  ['length', text => text.replace(/"payloadLength":\d+/, '"payloadLength":1')],
+  ['identity', () => fileText({ appId: 'other/app' })],
+  ['schema', () => fileText({ schemaVersion: 2 })],
+  ['stamp', text => text.replace('fixture:状态', 'altered:状态')],
+  ['trailing garbage', text => text + 'garbage']
+]) test('lost reset / full validation quarantines ' + name + ' ' + path.basename(target), io => {
+  lostSeed()
+  const evidence = active.put(target, damage(fileText()))
+  assert.deepEqual(io.recoverLost(APP, STAMP), { kind: 'ABSENT' })
+  assert.equal(quarantines().filter(file => active.nodes.get(file) === evidence).length, 1)
+  assert(!active.nodes.has(MAIN))
+  assert(!active.nodes.has(BAK))
+})
+
+for (const target of [MAIN, BAK]) test('lost reset / quarantine stat failure preserves all evidence ' + path.basename(target), io => {
+  lostSeed()
+  const before = new Map(active.nodes)
+  let stats = 0
+  active.always(event => event.op === 'stat' && event.path === target, event => {
+    if (event.fd === undefined) { stats++; throw nativeError(13900001) }
+  })
+  const result = io.recoverLost(APP, STAMP)
+  assert.equal(result.kind, 'UNAVAILABLE')
+  assert.equal(result.code, 'STATE_UNAVAILABLE')
+  assert.equal(stats, 1)
+  for (const [file, node] of before) assert.equal(active.nodes.get(file), node)
+  noWrites()
+})
+
+for (const kind of ['dir', 'symlink']) test('lost reset / nonregular stable lock refused ' + kind, io => {
+  lostSeed()
+  const lock = active.put(LOCK, '', kind)
+  assert.equal(io.recoverLost(APP, STAMP).kind, 'UNAVAILABLE')
+  assert.equal(active.nodes.get(LOCK), lock)
+  assert(!active.trace.some(event => event.op === 'read'))
+  noWrites()
+})
+
+for (const mode of ['invalid uuid', 'uuid failure', 'reservation open', 'reservation close']) test('lost reset / pre-rename failure preserves corrupt sources ' + mode, io => {
+  lostSeed()
+  const main = active.nodes.get(MAIN)
+  const backup = active.nodes.get(BAK)
+  const originalUuid = util.generateRandomUUID
+  if (mode === 'invalid uuid') util.generateRandomUUID = () => '../unsafe'
+  if (mode === 'uuid failure') util.generateRandomUUID = () => { throw nativeError() }
+  if (mode === 'reservation open') active.fail('open', event => event.path.endsWith('.quarantine'))
+  if (mode === 'reservation close') active.fail('close', event => event.path.endsWith('.quarantine'))
+  try {
+    const result = io.recoverLost(APP, STAMP)
+    assert.equal(result.kind, 'UNAVAILABLE')
+    assert.notEqual(result.code, 'STATE_COMMIT_UNCERTAIN')
+    assert.equal(active.nodes.get(MAIN), main)
+    assert.equal(active.nodes.get(BAK), backup)
+    assert(!active.trace.some(event => ['rename', 'unlink', 'write'].includes(event.op)))
+  } finally { util.generateRandomUUID = originalUuid }
+})
+
+for (const stage of ['main read', 'backup read', 'main rename', 'backup rename', 'final sync']) test('lost reset / stable lock excludes competing writer during ' + stage, io => {
+  const lock = lostSeed()
+  const peer = new StateIo(ROOT, { directoryFsync: 'REQUIRED', lockTimeoutMs: 0 })
+  const op = stage.endsWith('read') ? 'read' : stage.endsWith('rename') ? 'rename' : 'fsync'
+  const target = stage.startsWith('main') ? MAIN : stage.startsWith('backup') ? BAK : DIR
+  let syncs = 0
+  active.once(event => event.op === op && event.path === target && (stage !== 'final sync' || ++syncs === 2), () => {
+    assert.equal(lock.owner === null, false)
+    assert.deepEqual(peer.commit(request({ pre: { appId: APP, vmGeneration: 1, baseRevision: 0 } })), { status: 'STALE' })
+  })
+  assert.deepEqual(io.recoverLost(APP, STAMP), { kind: 'ABSENT' })
+  assert.equal(active.nodes.get(LOCK), lock)
+  assert.equal(lock.owner, null)
+  assert.equal(quarantines().length, 2)
+})
+
+test('lost reset / valid legacy backup remains LOST and untouched', io => {
+  lostSeed()
+  const backup = active.put(BAK, JSON.stringify({ stamp: STAMP, value: JSON.parse(SMALL) }))
+  assert.deepEqual(io.recoverLost(APP, STAMP), { kind: 'LOST', code: 'STATE_CORRUPTED', stage: 'lost-backup-format' })
+  assert.equal(active.nodes.get(BAK), backup)
+  assert.equal(active.text(MAIN), '{main')
+  noWrites()
+})
+
+test('lost reset / busy stable lock timeout no reads or mutation', io => {
+  const lock = lostSeed()
+  const held = filesystem.openSync(LOCK, modes.READ_WRITE)
+  held.tryLock(true)
+  active.trace = []
+  try {
+    assert.deepEqual(io.recoverLost(APP, STAMP), { kind: 'UNAVAILABLE', code: 'STATE_LOCK_UNAVAILABLE', stage: 'lost-lock' })
+    assert.equal(active.nodes.get(LOCK), lock)
+    assert(!active.trace.some(event => event.op === 'read'))
+    noWrites()
+  } finally { held.unlock(); filesystem.closeSync(held) }
+})
+
+for (const mode of ['root', 'project', 'missing project', 'lock', 'preflight', 'unsupported', 'invalid stamp', 'invalid identity']) test('lost reset / precondition refusal ' + mode, io => {
+  const lock = lostSeed()
+  if (mode === 'root') active.fail('open', event => event.path === ROOT, 13900012)
+  if (mode === 'project') active.fail('open', event => event.path === DIR, 13900001)
+  if (mode === 'missing project') active.nodes.delete(DIR)
+  if (mode === 'lock') active.fail('open', event => event.path === LOCK)
+  if (mode === 'preflight') active.fail('fsync', event => event.path === DIR)
+  if (mode === 'unsupported') io = new StateIo(ROOT, { directoryFsync: 'UNSUPPORTED' })
+  const result = io.recoverLost(mode === 'invalid identity' ? '../app' : APP, mode === 'invalid stamp' ? 'bad\0stamp' : STAMP)
+  assert.equal(result.kind, 'UNAVAILABLE')
+  assert.notEqual(result.code, 'STATE_COMMIT_UNCERTAIN')
+  assert.equal(active.nodes.get(LOCK), lock)
+  assert.equal(active.text(MAIN), '{main')
+  assert.equal(active.text(BAK), '{backup')
+  noWrites()
+})
+
+test('lost reset / exclusive quarantine collision preserves foreign evidence and corrupt sources', io => {
+  lostSeed()
+  let collision
+  active.once(event => event.op === 'open' && event.path.endsWith('.quarantine'), event => {
+    collision = event.path
+    active.put(collision, 'foreign evidence')
+  })
+  assert.equal(io.recoverLost(APP, STAMP).kind, 'UNAVAILABLE')
+  assert.equal(active.text(collision), 'foreign evidence')
+  assert.equal(active.text(MAIN), '{main')
+  assert.equal(active.text(BAK), '{backup')
+  assert(!active.trace.some(event => ['rename', 'unlink', 'write'].includes(event.op)))
+})
+
+for (const mode of ['first rename', 'rename then throw', 'second rename', 'second reservation', 'final sync', 'unlock', 'close']) test('lost reset / partial or unconfirmed mutation ' + mode + ' is uncertain', io => {
+  const lock = lostSeed()
+  if (mode === 'first rename') active.fail('rename', event => event.path === MAIN)
+  if (mode === 'rename then throw') active.once(event => event.op === 'rename', event => {
+    active.nodes.set(event.to, active.nodes.get(event.path))
+    active.nodes.delete(event.path)
+    throw nativeError()
+  })
+  if (mode === 'second rename') active.fail('rename', event => event.path === BAK)
+  if (mode === 'second reservation') active.fail('open', event => event.path.startsWith(BAK + '.') && event.path.endsWith('.quarantine'))
+  if (mode === 'final sync') active.once(event => event.op === 'rename', () => { active.fail('fsync', event => event.path === DIR) })
+  if (mode === 'unlock') active.fail('unlock', event => event.path === LOCK)
+  if (mode === 'close') active.fail('close', event => event.path === LOCK)
+  const result = io.recoverLost(APP, STAMP)
+  assert.equal(result.kind, 'UNAVAILABLE')
+  assert.equal(result.code, 'STATE_COMMIT_UNCERTAIN')
+  assert.equal(active.nodes.get(LOCK), lock)
+  for (const value of ['{main', '{backup']) assert([...active.nodes.values()].some(node => node.data.toString() === value))
+  assert(!active.trace.some(event => event.op === 'unlink'))
+  if (mode === 'close') for (const fd of [...active.fds.keys()]) filesystem.closeSync(fd)
+})
+
+for (const mode of ['rename', 'rename then throw', 'sync']) test('lost reset / valid backup restore unconfirmed ' + mode + ' stays uncertain', io => {
+  const lock = lostSeed()
+  const backup = active.put(BAK, fileText())
+  if (mode === 'rename') active.fail('rename', event => event.to === MAIN)
+  if (mode === 'rename then throw') active.once(event => event.op === 'rename' && event.to === MAIN, event => {
+    active.nodes.set(event.to, active.nodes.get(event.path))
+    active.nodes.delete(event.path)
+    throw nativeError()
+  })
+  if (mode === 'sync') active.fail('fsync', event => event.path === DIR)
+  assert.equal(io.recoverLost(APP, STAMP).code, 'STATE_COMMIT_UNCERTAIN')
+  assert.equal(active.nodes.get(BAK), backup)
+  assert.equal(active.nodes.get(LOCK), lock)
+  assert.deepEqual(quarantines(), [])
+  noTemps()
+})
+
 const storagePassed = passed
 const { StateIoTaskPool } = load(path.join(root, 'StateIoTaskPool.ets'))
 const OPTIONS = { directoryFsync: 'REQUIRED', lockTimeoutMs: 0, tmpOrphanAgeMs: 60000 }
@@ -1013,6 +1304,150 @@ async function asyncTest(name, run) {
 }
 
 async function checkTaskPool() {
+  await asyncTest('pool / low-level recovery dispatches correlated worker and close waits', async () => {
+    const lock = lostSeed()
+    const lane = pool()
+    poolAdapter.plans.push({ hold: true })
+    const resetting = lane.recoverLost(APP, STAMP)
+    let closed = false
+    const closing = lane.close().then(() => { closed = true })
+    await tick()
+    assert.equal(poolAdapter.executions.length, 1)
+    assert.equal(active.trace.length, 0)
+    assert.equal(closed, false)
+    const execution = poolAdapter.executions[0]
+    assert.equal(execution.args[2].kind, 'recoverLost')
+    assert.equal(execution.args[2].appId, APP)
+    assert.equal(execution.args[2].expectedStamp, STAMP)
+    assert(!('authority' in execution.args[2]))
+    poolAdapter.finish()
+    assert.deepEqual(await resetting, { kind: 'ABSENT' })
+    await closing
+    assert(closed)
+    assert.equal(active.nodes.get(LOCK), lock)
+    assert.equal(quarantines().length, 2)
+    assert.equal((await lane.recoverLost(APP, STAMP)).code, 'STATE_UNAVAILABLE')
+  })
+
+  for (const variant of ['main', 'mismatched main', 'backup', 'mismatched backup', 'legacy backup', 'operational', 'timeout', 'partial rename', 'sync']) {
+    await asyncTest('pool / recovery actual-source result ' + variant, async () => {
+      const lock = lostSeed()
+      if (variant.includes('backup')) active.put(BAK, variant === 'legacy backup' ? JSON.stringify({ stamp: STAMP, value: JSON.parse(SMALL) }) : fileText())
+      else if (variant.includes('main')) seed()
+      if (variant === 'operational') active.fail('read', event => event.path === BAK)
+      if (variant === 'timeout') active.fail('tryLock', () => true, 13900034)
+      if (variant === 'partial rename') active.fail('rename', event => event.path === BAK)
+      if (variant === 'sync') active.once(event => event.op === 'rename', () => active.fail('fsync', event => event.path === DIR))
+      const lane = pool()
+      const result = await lane.recoverLost(APP, variant.startsWith('mismatched') ? 'other' : STAMP)
+      if (variant.includes('main') || (variant.includes('backup') && variant !== 'legacy backup')) {
+        assert.equal(result.kind, 'READY')
+        assert.equal(result.source, variant.includes('main') ? 'MAIN' : 'BAK')
+        assert.equal(result.matchingStamp, !variant.startsWith('mismatched'))
+        assert.equal(result.encodedState, variant.startsWith('mismatched') ? undefined : SMALL)
+        assert.equal(quarantines().length, 0)
+      } else if (variant === 'legacy backup') assert.equal(result.kind, 'LOST')
+      else assert.equal(result.kind, 'UNAVAILABLE')
+      assert.equal(active.nodes.get(LOCK), lock)
+      if (variant === 'partial rename' || variant === 'sync') {
+        assert.equal(result.code, 'STATE_COMMIT_UNCERTAIN')
+        assert.equal((await lane.load(APP, STAMP)).code, 'STATE_UNAVAILABLE')
+        await assert.rejects(lane.close(), /STATE_COMMIT_UNCERTAIN/)
+      } else await lane.close()
+    })
+  }
+
+  for (const mode of ['createError', 'transferError', 'submitError', 'rejectBefore', 'rejectAfter', 'rejectLate', 'wrong-id', 'wrong-kind', 'malformed', 'serialization']) {
+    await asyncTest('pool / recovery correlated submission ' + mode, async () => {
+      lostSeed()
+      const lane = pool()
+      const plan = ['wrong-id', 'wrong-kind', 'malformed', 'serialization'].includes(mode) ? { reply: reply => {
+        if (mode === 'wrong-id') return { ...reply, operationId: 'stale' }
+        if (mode === 'wrong-kind') return { ...reply, kind: 'load' }
+        if (mode === 'malformed') return { ...reply, load: { kind: 'ABSENT', recovered: true } }
+        return { ...reply, unserializable: () => {} }
+      } } : { [mode]: true }
+      poolAdapter.plans.push(plan)
+      const result = await lane.recoverLost(APP, STAMP)
+      assert.equal(result.kind, 'UNAVAILABLE')
+      if (['createError', 'transferError', 'submitError'].includes(mode)) {
+        assert.equal(result.code, 'STATE_TASK_SUBMIT_FAILED')
+        await lane.close()
+        assert.equal(quarantines().length, 0)
+      } else {
+        assert.equal(result.code, 'STATE_COMMIT_UNCERTAIN')
+        await assert.rejects(lane.close(), /STATE_COMMIT_UNCERTAIN/)
+      }
+      if (mode === 'rejectLate') poolAdapter.finish()
+      assert.equal(poolAdapter.tasks.length, 1)
+    })
+  }
+
+  for (const [identity, stamp] of [['../app', STAMP], [APP, 'bad\0stamp'], [APP, true], [false, STAMP]]) {
+    await asyncTest('pool / recovery rejects invalid metadata ' + JSON.stringify([identity, stamp]), async () => {
+      lostSeed()
+      const lane = pool()
+      assert.deepEqual(await lane.recoverLost(identity, stamp), {
+        kind: 'UNAVAILABLE', code: 'STATE_VALIDATION_FAILED', stage: 'lost-request'
+      })
+      assert.equal(poolAdapter.tasks.length, 0)
+      assert.equal(active.trace.length, 0)
+      await lane.close()
+    })
+  }
+
+  await asyncTest('pool / recovery serializes reset publication and first durable commit', async () => {
+    const lock = lostSeed()
+    const lane = pool()
+    poolAdapter.plans.push({ hold: true })
+    const resetting = lane.recoverLost(APP, STAMP)
+    const publishing = lane.publishGeneration(publication({ expectedSource: 'ABSENT', expectedRevision: 0, nextVmGeneration: 1 }))
+    const saving = lane.commit(request({ pre: { appId: APP, vmGeneration: 1, baseRevision: 0 } }))
+    const closing = lane.close()
+    await tick()
+    assert.equal(poolAdapter.executions.length, 1)
+    assert.equal(active.trace.length, 0)
+    poolAdapter.finish()
+    assert.deepEqual(await resetting, { kind: 'ABSENT' })
+    assert.equal((await publishing).result.status, 'COMMITTED')
+    assert.equal((await saving).result.status, 'COMMITTED')
+    await closing
+    assert.deepEqual(poolAdapter.executions.map(item => item.args[2].kind), ['recoverLost', 'publishGeneration', 'commit'])
+    assert.equal(decode().vmGeneration, 1)
+    assert.equal(decode().revision, 1)
+    assert.equal(active.nodes.get(LOCK), lock)
+    assert.equal(quarantines().length, 2)
+  })
+
+  await asyncTest('pool / confirmed recovery refusal permits retry on same lane', async () => {
+    lostSeed()
+    active.fail('read', event => event.path === MAIN)
+    const lane = pool()
+    const refused = lane.recoverLost(APP, STAMP)
+    const retried = lane.recoverLost(APP, STAMP)
+    assert.equal((await refused).code, 'STATE_READ_FAILED')
+    assert.deepEqual(await retried, { kind: 'ABSENT' })
+    assert.equal(poolAdapter.executions.length, 2)
+    assert.equal(quarantines().length, 2)
+    await lane.close()
+  })
+
+  await asyncTest('pool / uncertain recovery fences already queued publication and commit', async () => {
+    lostSeed()
+    active.fail('rename', event => event.path === BAK)
+    const lane = pool()
+    const resetting = lane.recoverLost(APP, STAMP)
+    const publishing = lane.publishGeneration(publication({ expectedSource: 'ABSENT', expectedRevision: 0, nextVmGeneration: 1 }))
+    const saving = lane.commit(request({ pre: { appId: APP, vmGeneration: 1, baseRevision: 0 } }))
+    assert.equal((await resetting).code, 'STATE_COMMIT_UNCERTAIN')
+    failureIs(await publishing, 'STATE_UNAVAILABLE', 'task-fenced')
+    failureIs(await saving, 'STATE_UNAVAILABLE', 'task-fenced')
+    assert.equal(poolAdapter.executions.length, 1)
+    assert(!active.trace.some(event => event.op === 'write'))
+    await assert.rejects(lane.whenIdle(), /STATE_COMMIT_UNCERTAIN/)
+    await assert.rejects(lane.close(), /STATE_COMMIT_UNCERTAIN/)
+  })
+
   await asyncTest('pool / ArkTS boundary avoids unsupported reflection and freezing', async () => {
     const source = fs.readFileSync(path.join(root, 'StateIoTaskPool.ets'), 'utf8')
     assert(!/Object\.(?:getPrototypeOf|getOwnPropertySymbols|getOwnPropertyDescriptor|getOwnPropertyNames)|\.prototype|\bReflect\b|['"]value['"]\s+in\b/.test(source))
@@ -1373,11 +1808,11 @@ async function checkTaskPool() {
 
   await asyncTest('pool / worker catch returns uncertain structured DTO not thrown class', async () => {
     const { runStateIoTask } = load(path.join(root, 'StateIo.ets'))
-    for (const kind of ['commit', 'publishGeneration', 'load', 'readHeader']) {
+    for (const kind of ['commit', 'publishGeneration', 'load', 'recoverLost', 'readHeader']) {
       const reply = runStateIoTask('invalid-root', OPTIONS, { operationId: 'caught:' + kind, kind, appId: APP })
       assert.deepEqual(structuredClone(reply), reply)
       assert.equal(reply.operationId, 'caught:' + kind)
-      if (kind === 'load') assert.equal(reply.load.code, 'STATE_COMMIT_UNCERTAIN')
+      if (kind === 'load' || kind === 'recoverLost') assert.equal(reply.load.code, 'STATE_COMMIT_UNCERTAIN')
       else if (kind === 'readHeader') assert.equal(reply.error.code, 'STATE_VALIDATION_FAILED')
       else assert.equal(reply.result.status, 'COMMIT_UNCERTAIN')
     }
@@ -1466,7 +1901,7 @@ async function checkTaskPool() {
     await lane.close()
   })
 
-  console.log('state-io-check: ' + passed + ' passed, ' + failures.length + ' failed, ' + (passed + failures.length) + ' total; original storage checks=' + storagePassed + '; source modules=' + cache.size + ', VM modules=0')
+  console.log('state-io-check: ' + passed + ' passed, ' + failures.length + ' failed, ' + (passed + failures.length) + ' total; storage passed=' + storagePassed + '; task-pool passed=' + (passed - storagePassed) + '; source modules=' + cache.size + ', VM modules=0')
   if (failures.length) process.exitCode = 1
 }
 checkTaskPool().catch(error => { console.error(error.stack); process.exitCode = 1 })

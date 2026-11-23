@@ -19,7 +19,7 @@
  */
 
 import { RuntimeValue, VeraNumberValue, VeraStringValue, VeraBooleanValue, VeraArrayValue, VeraObjectValue,
-  RuntimeTrap } from './VeraInterpreter'
+  RuntimeTrap, freshObjectValue } from './VeraInterpreter'
 import { GfxOp, GFX_ROLES, isGfxColor, gfxColor, hex2, DRIFT_DIRECTIONS, DRIFT_SPEEDS, MAX_GFX_REPEAT } from './GfxPaint'
 export { GfxOp, GfxFit, GFX_ROLES, isGfxColor, gfxColor, gfxFit, gfxToSurface, gfxNaturalHeight, encodeGfxOps, decodeGfxOps, paintGfx, DRIFT_DIRECTIONS, DRIFT_SPEEDS, MAX_GFX_REPEAT } from './GfxPaint'
 
@@ -140,7 +140,7 @@ export function gfxFunction(name: string): GfxFunction | null {
 export class GfxShapeValue extends VeraObjectValue {
   op: GfxOp
   constructor(op: GfxOp) {
-    super(GFX_SHAPE, new Map<string, RuntimeValue>())
+    super(GFX_SHAPE, freshObjectValue(GFX_SHAPE, new Map<string, RuntimeValue>()).fields)
     this.op = op
   }
 }
@@ -400,7 +400,7 @@ export function pointerValue(phase: string, id: number, x: number, y: number): R
   fields.set('id', new VeraNumberValue(id))
   fields.set('x', new VeraNumberValue(x))
   fields.set('y', new VeraNumberValue(y))
-  return new VeraObjectValue(GFX_POINTER, fields)
+  return freshObjectValue(GFX_POINTER, fields)
 }
 
 /** What a draw function returned, as the shapes to paint, back to front. */

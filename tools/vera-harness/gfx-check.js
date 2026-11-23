@@ -7,6 +7,460 @@
 const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const path = require('node:path')
+const ts = require(process.env.VERA_TYPESCRIPT_PATH || 'typescript')
+const {createHash} = require('node:crypto')
+
+function retainedSources() {
+  const root = path.resolve(__dirname, '../../entry/src/main/ets')
+  assert.equal(require('./source-loader').sourceRoot, root, 'P3 canonical source root required')
+  assert.equal(fs.realpathSync(root), root, 'P3 source root must not be a symlink')
+  const sources = new Map()
+  let bytes = 0, directories = 0
+  const walk = dir => {
+    assert(++directories <= 128, 'P3 source directory bound')
+    for (const entry of fs.readdirSync(dir, {withFileTypes: true}).sort((a, b) => a.name.localeCompare(b.name))) {
+      const file = path.join(dir, entry.name)
+      assert(!entry.isSymbolicLink(), 'P3 source symlink: ' + file)
+      if (entry.isDirectory()) walk(file)
+      else if (/\.(ets|ts|tsx)$/.test(entry.name)) {
+        const size = fs.statSync(file).size
+        bytes += size
+        assert(size <= 1024 * 1024 && bytes <= 16 * 1024 * 1024 && sources.size < 512, 'P3 source size bound')
+        sources.set(path.relative(root, file).split(path.sep).join('/'), fs.readFileSync(file, 'utf8'))
+      }
+    }
+  }
+  walk(root)
+  return sources
+}
+
+const retainedPrinter = ts.createPrinter({removeComments: true})
+const retainedParse = (file, text) => ts.createSourceFile(file, text.replace(/\bstruct\s+(?=\w)/g, 'class '), ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+const retainedPrint = node => retainedPrinter.printNode(ts.EmitHint.Unspecified, node, node.getSourceFile()).trim()
+const retainedDigest = sites => createHash('sha256').update(JSON.stringify(sites)).digest('hex')
+
+function retainedInventory(sources, config) {
+  const parsed = new Map([...sources].map(([file, text]) => [file, retainedParse(file, text)]))
+  const types = new Set(config.types)
+  const modules = new Set(config.modules)
+  const keys = new Set(config.keys)
+  const protectedBinding = node => ts.isBindingElement(node) && keys.has((node.propertyName || node.name).text)
+  const consumers = []
+  const discovery = {}
+  for (const [file, source] of parsed) {
+    const hits = []
+    const scan = node => {
+      if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
+        if (node.moduleSpecifier && modules.has(path.posix.basename(node.moduleSpecifier.text))) hits.push(retainedPrint(node))
+      }
+      if ((ts.isClassDeclaration(node) || ts.isInterfaceDeclaration(node) || ts.isTypeAliasDeclaration(node)) && node.name && types.has(node.name.text)) {
+        hits.push(retainedPrint(node).split('{')[0].trim())
+      }
+      if (ts.isIdentifier(node) && types.has(node.text)) hits.push('type ' + node.text)
+      if (protectedBinding(node)) hits.push('binding ' + retainedPrint(node))
+      if (ts.isPropertyAccessExpression(node) && config.payloadKeys.includes(node.name.text)) hits.push('payload .' + node.name.text)
+      if (ts.isElementAccessExpression(node) && ts.isStringLiteral(node.argumentExpression) && config.payloadKeys.includes(node.argumentExpression.text)) hits.push('payload [' + node.argumentExpression.text + ']')
+      ts.forEachChild(node, scan)
+    }
+    scan(source)
+    if (hits.length || config.files.includes(file)) {
+      consumers.push(file)
+      discovery[file] = [...new Set(hits)].sort()
+    }
+  }
+  parsed.set('p3-types.ts', retainedParse('p3-types.ts', `
+    interface Array<T> { [n: number]: T; length: number; }
+    interface ReadonlyArray<T> { readonly [n: number]: T; readonly length: number; }
+    interface Map<K, V> { get(key: K): V | undefined; set(key: K, value: V): this; }
+    interface Promise<T> { then<U>(fn: (value: T) => U): Promise<U>; }
+  `))
+  const host = {
+    getSourceFile: file => parsed.get(file), getDefaultLibFileName: () => '', writeFile() {},
+    getCurrentDirectory: () => '', getDirectories: () => [], fileExists: file => parsed.has(file),
+    readFile: file => sources.get(file), getCanonicalFileName: file => file, useCaseSensitiveFileNames: () => true,
+    getNewLine: () => '\n',
+    resolveModuleNames: (names, containing) => names.map(name => {
+      if (!name.startsWith('.')) return undefined
+      const base = path.posix.normalize(path.posix.join(path.posix.dirname(containing), name))
+      const file = ['.ets', '.ts', '.tsx'].map(ext => base + ext).find(candidate => parsed.has(candidate))
+      return file ? {resolvedFileName: file, extension: ts.Extension.Ts} : undefined
+    })
+  }
+  const program = ts.createProgram([...parsed.keys()], {noLib: true, noResolve: false, target: ts.ScriptTarget.Latest,
+    experimentalDecorators: true, allowNonTsExtensions: true}, host)
+  const checker = program.getTypeChecker()
+  const sensitiveType = (type, seen = new Set()) => {
+    if (!type || seen.has(type)) return false
+    seen.add(type)
+    if ([type.aliasSymbol, type.symbol].some(symbol => symbol && types.has(symbol.name))) return true
+    return (type.types || []).some(t => sensitiveType(t, seen)) ||
+      [...(type.aliasTypeArguments || []), ...(type.typeArguments || [])].some(t => sensitiveType(t, seen))
+  }
+  for (const [file, source] of parsed) {
+    if (file === 'p3-types.ts' || consumers.includes(file)) continue
+    let resolved = false
+    const scan = node => {
+      if ((ts.isIdentifier(node) || node.type) && sensitiveType(checker.getTypeAtLocation(node))) resolved = true
+      if (!resolved) ts.forEachChild(node, scan)
+    }
+    scan(source)
+    if (resolved) {
+      consumers.push(file)
+      discovery[file] = ['resolved retained payload alias']
+    }
+  }
+  const inventory = {}
+  const bodies = {}
+  for (const file of consumers) {
+    const source = parsed.get(file)
+    const aliases = new Set()
+    const symbolOf = node => checker.getSymbolAtLocation(node)
+    const origin = node => {
+      if (!node) return false
+      if (ts.isIdentifier(node) && (types.has(node.text) || aliases.has(symbolOf(node)))) return true
+      if (ts.isPropertyAccessExpression(node) && config.payloadKeys.includes(node.name.text)) return true
+      if (ts.isElementAccessExpression(node) && ts.isStringLiteral(node.argumentExpression) && config.payloadKeys.includes(node.argumentExpression.text)) return true
+      if (sensitiveType(checker.getTypeAtLocation(node))) return true
+      if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node) || ts.isAsExpression(node) ||
+          ts.isTypeAssertionExpression(node) || ts.isNonNullExpression(node) || ts.isParenthesizedExpression(node)) return origin(node.expression)
+      return false
+    }
+    const contains = node => {
+      if (protectedBinding(node) || origin(node)) return true
+      let found = false
+      ts.forEachChild(node, child => { if (contains(child)) found = true })
+      return found
+    }
+    const bind = node => {
+      let changed = false
+      const add = name => {
+        if (ts.isIdentifier(name)) {
+          const symbol = symbolOf(name)
+          if (symbol && !aliases.has(symbol)) { aliases.add(symbol); changed = true }
+        } else if (ts.isObjectBindingPattern(name) || ts.isArrayBindingPattern(name)) {
+          for (const item of name.elements) if (ts.isBindingElement(item)) add(item.name)
+        }
+      }
+      if ((ts.isVariableDeclaration(node) || ts.isParameter(node) || ts.isPropertyDeclaration(node)) &&
+          ((node.type && contains(node.type)) || (node.initializer && contains(node.initializer)) || contains(node.name))) add(node.name)
+      if (protectedBinding(node)) add(node.name)
+      if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken && contains(node.right)) add(node.left)
+      if (ts.isForOfStatement(node) && contains(node.expression) && ts.isVariableDeclarationList(node.initializer)) {
+        for (const decl of node.initializer.declarations) add(decl.name)
+      }
+      ts.forEachChild(node, child => { if (bind(child)) changed = true })
+      return changed
+    }
+    let rounds = 0
+    while (bind(source)) assert(++rounds <= 64, 'P3 alias convergence bound: ' + file)
+    const nameOf = node => node.name ? retainedPrint(node.name) : ts.isConstructorDeclaration(node) ? 'constructor' : '<lambda>'
+    const ownerOf = node => {
+      const owners = []
+      for (let at = node; at && at !== source; at = at.parent) {
+        if (ts.isClassDeclaration(at) || ts.isFunctionDeclaration(at) || ts.isMethodDeclaration(at) || ts.isConstructorDeclaration(at)) owners.unshift(nameOf(at))
+      }
+      return file + ':' + (owners.join('.') || '<module>')
+    }
+    const controls = node => {
+      const out = []
+      for (let at = node.parent; at && at !== source; at = at.parent) {
+        if (ts.isIfStatement(at)) out.unshift('if ' + retainedPrint(at.expression) + (at.elseStatement && node.pos >= at.elseStatement.pos ? ' else' : ' then'))
+        else if (ts.isForStatement(at) || ts.isForOfStatement(at) || ts.isForInStatement(at) || ts.isWhileStatement(at) || ts.isDoStatement(at) ||
+          ts.isSwitchStatement(at) || ts.isCaseClause(at) || ts.isConditionalExpression(at) || ts.isTryStatement(at) ||
+          ts.isArrowFunction(at) || ts.isFunctionExpression(at)) {
+          out.unshift(retainedPrint(at).split('{')[0].trim())
+        }
+      }
+      return out
+    }
+    const visit = node => {
+      const owner = ownerOf(node)
+      if ((node.body && (ts.isFunctionDeclaration(node) || ts.isMethodDeclaration(node) || ts.isConstructorDeclaration(node))) ||
+          (ts.isClassDeclaration(node) && node.name && types.has(node.name.text))) bodies[owner] = retainedPrint(node)
+      const site = ts.isCallExpression(node) || ts.isNewExpression(node) || ts.isReturnStatement(node) ||
+        ts.isVariableDeclaration(node) || ts.isPropertyDeclaration(node) || ts.isAsExpression(node) || ts.isTypeAssertionExpression(node) ||
+        ts.isDeleteExpression(node) || ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node) ||
+        (ts.isBinaryExpression(node) && node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && node.operatorToken.kind <= ts.SyntaxKind.LastAssignment)
+      if (site && contains(node)) {
+        if (!inventory[owner]) inventory[owner] = []
+        inventory[owner].push([controls(node), retainedPrint(node)])
+      }
+      ts.forEachChild(node, visit)
+    }
+    visit(source)
+  }
+  return {discovery, inventory, bodies}
+}
+
+function retainedSummary(inventory) {
+  const files = {}
+  for (const [owner, sites] of Object.entries(inventory)) {
+    const file = owner.split(':')[0]
+    if (!files[file]) files[file] = []
+    files[file].push([owner, sites])
+  }
+  return Object.fromEntries(Object.entries(files).map(([file, owners]) =>
+    [file, [owners.length, owners.reduce((sum, [, sites]) => sum + sites.length, 0), retainedDigest(owners)]]))
+}
+
+function synchronousPathChecks(sources, decisions) {
+  assert(decisions.length > 0 && decisions.length <= 64, 'P3 synchronous decision count bound')
+  let probes = 0
+  const owners = new Set()
+  const printer = ts.createPrinter({removeComments: true})
+  const bodies = new Map()
+  for (const file of new Set(decisions.map(d => d.file))) {
+    const text = sources.get(file)
+    assert(typeof text === 'string' && text.length <= 1024 * 1024, 'P3 synchronous source bound: ' + file)
+    const source = retainedParse(file, text)
+    const visit = (node, owner = '') => {
+      if (ts.isClassDeclaration(node)) owner = node.name.text
+      if (ts.isFunctionDeclaration(node)) owner = node.name.text
+      if (ts.isMethodDeclaration(node)) owner += '.' + node.name.getText(source)
+      if (ts.isConstructorDeclaration(node)) owner += '.constructor'
+      if (node.body && (ts.isFunctionDeclaration(node) || ts.isMethodDeclaration(node) || ts.isConstructorDeclaration(node))) {
+        bodies.set(file + ':' + owner, printer.printNode(ts.EmitHint.Unspecified, node, source))
+      }
+      ts.forEachChild(node, child => visit(child, owner))
+    }
+    visit(source)
+  }
+  const normalize = (text, method = false) => {
+    const source = retainedParse('evidence.ts', method ? 'class Evidence { ' + text + ' }' : text)
+    const tokens = []
+    const visit = node => {
+      const children = node.getChildren(source)
+      if (children.length) children.forEach(visit)
+      else if (node.kind !== ts.SyntaxKind.SemicolonToken && node.kind !== ts.SyntaxKind.EndOfFileToken &&
+          node.kind !== ts.SyntaxKind.SyntaxList) tokens.push(node.getText(source))
+    }
+    visit(source)
+    return tokens.join('\u0000')
+  }
+  const check = (body, decision, normalized = false) => {
+    assert(body && body.length <= 128 * 1024, 'P3 synchronous owner bound: ' + decision.owner)
+    const actual = normalized ? body : normalize(body, decision.owner.includes('.'))
+    for (const fragment of decision.evidence) assert(actual.includes(normalize(fragment)),
+      'P3 synchronous evidence changed: ' + decision.owner + ': ' + fragment)
+  }
+  for (const decision of decisions) {
+    const key = decision.file + ':' + decision.owner
+    assert(!owners.has(key), 'P3 synchronous owner repeated: ' + key)
+    owners.add(key)
+    assert(['VM synchronous', 'outside VM'].includes(decision.reachability))
+    assert(decision.cost && decision.budget && decision.evidence.length > 0 && decision.evidence.length <= 16)
+    const body = bodies.get(key)
+    check(body, decision)
+    for (const evidence of decision.evidence) {
+      const fragment = normalize(evidence)
+      assert(fragment.length > 0 && fragment.length <= 16 * 1024, 'P3 synchronous fragment bound: ' + key)
+      assert.throws(() => check(normalize(body, decision.owner.includes('.')).split(fragment).join(''), decision, true), /P3 synchronous evidence changed:/)
+      probes++
+    }
+  }
+  console.log('P3 synchronous paths: ' + decisions.length + ' bounded owner reviews, ' + probes + ' evidence-removal probes; ' +
+    'input cost is not a runtime size cap; no hard preemption or whole-path closure claimed')
+}
+
+function retainedPayloadChecks(config) {
+  const sources = retainedSources()
+  const actual = retainedInventory(sources, config)
+  const check = result => {
+    assert.deepEqual(Object.fromEntries(Object.entries(result.discovery).map(([file, sites]) => [file, retainedDigest(sites)])), config.discovery,
+      'P3 payload types/imports/consumers changed; review finite native inventory')
+    assert.deepEqual(retainedSummary(result.inventory), config.inventory,
+      'P3 normalized payload owner/sites/control flow changed; review construction, mutation and escapes')
+    for (const [owner, [digest, review]] of Object.entries(config.bodies)) {
+      assert(review.length > 0 && result.bodies[owner], 'P3 critical owner present: ' + owner)
+      assert.equal(retainedDigest(result.bodies[owner]), digest, 'P3 construction/copy/control body changed: ' + owner)
+    }
+  }
+  check(actual)
+  for (const [name, file, before, after, tracked, extraSources, bodyOnly] of config.probes) {
+    assert(sources.has(file) ? sources.get(file).includes(before) : before === '', 'P3 probe anchor: ' + name)
+    const changed = new Map(sources)
+    changed.set(file, sources.has(file) ? sources.get(file).replace(before, after) : after)
+    for (const [extraFile, text] of extraSources || []) {
+      assert(!changed.has(extraFile), 'P3 synthetic source must be new: ' + extraFile)
+      changed.set(extraFile, text)
+    }
+    const result = retainedInventory(changed, config)
+    if (tracked) assert(Object.values(result.inventory).flat().some(([, expression]) => expression === tracked),
+      'P3 alias use independently tracked: ' + name)
+    if (bodyOnly) {
+      assert.deepEqual(result.discovery, actual.discovery, 'P3 body-only probe preserves discovery: ' + name)
+      assert.deepEqual(retainedSummary(result.inventory), config.inventory, 'P3 body pin independently necessary: ' + name)
+      assert.throws(() => check(result), /P3 construction\/copy\/control body changed:/, 'P3 critical body rejects ' + name)
+    } else {
+      assert.notDeepEqual(retainedSummary(result.inventory), config.inventory, 'P3 site/context rejects independently of body pins: ' + name)
+      assert.throws(() => check(result), /P3 /, 'P3 rejects ' + name)
+    }
+  }
+  const whitespace = new Map(sources)
+  for (const file of config.files) whitespace.set(file, '\n  ' + sources.get(file) + '\n')
+  check(retainedInventory(whitespace, config))
+  assert.deepEqual(Object.keys(config.ownership), ['A', 'B', 'C', 'D'])
+  assert.equal(config.ownership.B.root, 'authoritative root is a replaceable B slot, not a D payload')
+  assert(config.ownership.B.restoration.includes('originalRoot') && config.ownership.B.cells.includes('escaped'))
+  assert(config.ownership.C.scope.includes('publication'))
+  assert(config.ownership.D.retained && config.ownership.D.construction && config.ownership.D.renderer)
+  if (config.synchronous) synchronousPathChecks(sources, config.synchronous)
+  assert(config.limits.includes('not native pointer proof'))
+  console.log('P3 ' + config.name + ': ' + Object.keys(actual.discovery).length + ' consumers, ' + Object.keys(actual.inventory).length +
+    ' owner inventories; ' + config.probes.length + ' rejection probes; ' + config.limits)
+}
+
+const retainedOwnership = {
+  A: {meaning: 'VM reachable graph storage: wrappers, fields/maps and elements',
+    scope: 'Existing state-carry inventory covers wrapper graph storage, not these native payload fields'},
+  B: {meaning: 'VM slots including Cells, captures and authoritative root replacement',
+    root: 'authoritative root is a replaceable B slot, not a D payload',
+    restoration: 'StateManager captures originalRoot at beginTurn and restores it after guard rollback across all handlers, not only the final call',
+    cells: 'Pre-existing escaped closure Cells use the common reverse-order slot journal; fresh frame-local Cells are scratch until escape'},
+  C: {meaning: 'Deferred host effects and post-accept publication, not root-slot restoration',
+    scope: 'Acceptance/publication and deferred effect rollback remain separate from B originalRoot restoration; coordinated production activation is not claimed'},
+  D: {meaning: 'No VM write: native retained payloads and renderer-owned derived storage',
+    retained: 'Published GfxOp children/points and SceneThing nested metadata are immutable by ownership policy, not runtime freeze',
+    construction: 'Freshness is an additional attribute: D constructors/wrappers may initialize fresh parents, never mutate borrowed descendants',
+    renderer: 'D renderer caches/nodes/poses are mutable renderer-owned data; borrowed payloads must not become writable aliases'}
+}
+const retainedLimits = 'bounded review inventory, not ArkTS typechecking or semantic alias/freshness proof; struct-to-class AST adapter; ' +
+  'synthetic Array/Map/Promise types; opaque any/reflection/computed keys and interprocedural erased flows without visible origin may escape; ' +
+  'structural-only type flows without a recognized retained origin may escape; traversal/control inventories are incomplete outside fully body-pinned owners, including intervening break/continue/early-return statements; ' +
+  'not native pointer proof: C++/NAPI retention and asynchronous callbacks require separate audit if they retain JS payload pointers; ' +
+  'no allocation epochs, journal, pure-mode enforcement, rollback or publication closure'
+
+const gfxRetained = {
+  name: 'gfx retained payload',
+  types: ['GfxOp', 'GfxShapeValue'], keys: ['op', 'points', 'children'], payloadKeys: ['op'],
+  modules: ['VeraGfx', 'GfxPaint', 'VeraMovingPart'],
+  files: ['vera/VeraGfx.ets', 'vera/GfxPaint.ets', 'vera/VeraMovingPart.ets'],
+  ownership: retainedOwnership, limits: retainedLimits,
+  synchronous: [
+    {file: 'vera/VeraGfx.ets', owner: 'asNumbers', reachability: 'VM synchronous',
+      cost: 'At most MAX_GFX_POINTS=2000 primitive extraction iterations; fresh native output',
+      budget: 'Inside host boundary; elapsed duration sampled on return, no inner deadline check',
+      evidence: ['let items = (v as VeraArrayValue).elements', "if (items.length > MAX_GFX_POINTS) { throw new RuntimeTrap('R0028', 'a polyline or polygon holds at most ' + (MAX_GFX_POINTS / 2).toString() + ' points; got ' + Math.floor(items.length / 2).toString()) }"]},
+    {file: 'vera/VeraGfx.ets', owner: 'asStrings', reachability: 'VM synchronous',
+      cost: 'Gradient stop extraction is input-proportional without an explicit stop-count cap',
+      budget: 'Host pre/post samples only; allocation and string-size risk remains',
+      evidence: ['let out: string[] = []', 'for (let item of (v as VeraArrayValue).elements) { if (item instanceof VeraStringValue) { out.push((item as VeraStringValue).value) } }']},
+    {file: 'vera/VeraGfx.ets', owner: 'shapesIn', reachability: 'VM synchronous',
+      cost: 'Scans every supplied array element before holding checks rendered shape/depth totals',
+      budget: 'MAX_GFX_SHAPES does not cap ignored inputs or the initial scan; host pre/post only',
+      evidence: ['let out: GfxOp[] = []', 'for (let item of (value as VeraArrayValue).elements) { if (item instanceof GfxShapeValue) { out.push((item as GfxShapeValue).op) } }']},
+    {file: 'vera/VeraGfx.ets', owner: 'decodeGfx', reachability: 'outside VM',
+      cost: 'Post-draw shapesIn scans all input elements and copies retained op references before checking total drawn shapes',
+      budget: 'Caller wall time outside VM sampling; MAX_GFX_SHAPES bounds rendered output, not skipped input processing',
+      evidence: ['let ops = shapesIn(value)', 'for (let o of ops) { count += o.drawn }']},
+    {file: 'vera/VeraGfx.ets', owner: 'holding', reachability: 'VM synchronous',
+      cost: 'Child-count traversal precedes MAX_GFX_DEPTH=12 and MAX_GFX_SHAPES=4000 rejection',
+      budget: 'Bounded retained result is not a bound on all synchronous input processing',
+      evidence: ['o.children = children', "if (depth > MAX_GFX_DEPTH) { throw new RuntimeTrap('R0028', 'groups nest at most ' + MAX_GFX_DEPTH.toString() + ' deep') }"]}
+  ],
+  review: {
+    benchmark: 'D p2Validate reads decoded ops and discards the fresh outer list; p2Fingerprint serializes VM fields and queued effect metadata, not retained op fields. Synthetic pointer inputs are fresh local VM allocations; no borrowed payload writes, native effect dispatch, effect callback execution or native lifetime changes'
+  },
+  discovery: {
+    'components/VeraPreview.ets': 'aa261fc71c4bf362006f4f86acf13a940da91bf78d9fe62bf6dc285a9e4690e8',
+    'runtime/AppActor.ets': '493a11298735c81823d729a7791788274732ec53f97946f89746b7fe48ee8dc3',
+    'runtime/InProcessHost.ets': 'ca74bd07a578fe62f05ae8a3c506a1b440a5dfb67205a547007c56d04242079f',
+    'vera/GfxPaint.ets': 'f9c697b9f74b0e4feab21291138c372355f1586414194abcb11b6ca8387d63fc',
+    'vera/VeraCompiler.ets': 'f38f16a67164204b49cf03b8116a30b3caaf2c8999c9ac3601df0e71b5225779',
+    'vera/VeraCompose.ets': '76e59ed9333f4cd11e4d1b44e7d659f1ee868b364f43354a2c89d5eb6443916d',
+    'vera/VeraComposition.ets': '76e59ed9333f4cd11e4d1b44e7d659f1ee868b364f43354a2c89d5eb6443916d',
+    'vera/VeraGfx.ets': '54938169d8b30cc18424224429b8091f2669c137ac8590b329d6f0d42a8ec175',
+    'vera/VeraInterpreter.ets': '76e59ed9333f4cd11e4d1b44e7d659f1ee868b364f43354a2c89d5eb6443916d',
+    'vera/VeraLiveWidget.ets': 'c19c080855ab7ae67f729999b945dce7ed255e1de717db5dc02ea3bf66060bef',
+    'vera/VeraLook3D.ets': 'd23f585db49f69dbff43faadceb9b52376623a5284c1efd7812aa31733e174c7',
+    'vera/VeraMovingPart.ets': '3b29c1dcf6e520e37f7a97b8f670bd084a6454b5a247c2fdd46331ba06f0a6ce',
+    'vera/VeraScene.ets': '73f44d5fa1bea1e0beaf7049c95f55a1d62ec274da353bd6b68e0d58bb28ae41',
+    'vera/VeraSearchBenchmark.ets': '7ff4f1176638ac10ed6cdd3cb69d793788cb9dd0f30b6b456aa6ddec8c774bc9',
+    'vera/VeraSmoke.ets': '1b70d3ccb19e4a0eb077f75d5d86fd5f580bc9c48584e78dff1d1040a9115bf4',
+    'vera/VeraSurfacePlay.ets': 'acba5569a8ca3305589fd03a2f64282f065227b9c7a58aad494d2f9d7db3f45d',
+    'vera/VeraUi.ets': '268fd6aef1bb2b55e08663ba4dd50c21f85d66ad541a18751412aa06208a2e26',
+    'vera/VeraUiCatalog.ets': '98148ad19d13898ee56b4ea8f51ff0d500d441cc412d0824603ee0cf675275e5',
+    'vera/VeraWidgetRefine.ets': '86e598c94ca8f364bd2f5b58750169c6a98a07070805966bf2f5d71d99d92ed5',
+    'widget/CardView.ets': 'b30572f2098106e152b3b4736dab6df301739fcc5e0a6fe8e7114679cff8cedf'
+  },
+  inventory: {
+    'components/VeraPreview.ets': [3, 15, '2d20b6c9b6c38109f5ad60d9948967fade431cfeaa71420a2a1c2c0246a53acb'],
+    'runtime/AppActor.ets': [1, 2, 'ac9d4118c946a1c95c193978fbea6e6cd648f6276244f48bc537784a763ed55b'],
+    'runtime/InProcessHost.ets': [1, 16, '0838939d2350242b80c4c14cdfe0a53ba06aedc42210fe518c56a1c04bb67e3c'],
+    'vera/GfxPaint.ets': [11, 175, 'f6e6ff552ed462cb94f2b8c4fd21c7d0158adde6d9e1d72277694737170be346'],
+    'vera/VeraCompiler.ets': [1, 32, '3d6491a196a7c186a4fed829b000f2dea8f5f555ef444db5469aa6881116cc6d'],
+    'vera/VeraCompose.ets': [5, 54, '160d55796dc1936396bfeced71fb52b728a49c28b30263184d0738fe724bde94'],
+    'vera/VeraComposition.ets': [1, 1, '846a331726589eacb8fac53829a43ff473145f99972d2731bde898c9f87b305a'],
+    'vera/VeraGfx.ets': [8, 174, '9a8b7207f8ef42eb4c314e48cc11b58e2cc1d343352e065b8bbb6d49193ef7f7'],
+    'vera/VeraInterpreter.ets': [3, 3, '7783b4022979ebd4b16bf077ce14501d0d89147993716d93af12e02ae87d0965'],
+    'vera/VeraLiveWidget.ets': [2, 109, '5e5d8e50650fe9de0196a45070c4ab04646c8d3cbfa245f90f12f1129e1ae0ec'],
+    'vera/VeraMovingPart.ets': [7, 112, '73a9eb20459b8ea6c1635db9d6428cac1e635b7f22fdb592680397edbfde5cf8'],
+    'vera/VeraSearchBenchmark.ets': [1, 1, '9f687e6b8f612c67a8f14c3afc49e7172d71dcc62c25d71e7abcfa46bf7976f9'],
+    'vera/VeraSmoke.ets': [1, 1, '0f172a3226f3452b8f950f120e7afd326ca6a5bf698764338e8706fe99c6cf11'],
+    'vera/VeraSurfacePlay.ets': [3, 41, 'e06e15036126627df2150eb82a1377762707f90c4e22f71e0905b510e2edfb16'],
+    'vera/VeraWidgetRefine.ets': [4, 39, '9f0f871e19e6ba1c55980f61b703654acd32abd9f6ede426f77352fa6beef612'],
+    'widget/CardView.ets': [2, 4, '11f1b8225192cbfbd8e4245704199ec4cc4502754a58c4d05fbfe8a5d3d45513']
+  },
+  bodies: {
+    'vera/GfxPaint.ets:GfxOp': ['ec4a66072912518e39c55f590eb0507cb27c79463d9f0acb6f442f60ac8a7341', 'D fresh per-instance points/children defaults'],
+    'vera/GfxPaint.ets:unpackGfxOp': ['042c2ecb29b42bacb7ea6c88e0b025970aefdf5ea416f6657a8208e914f6b6ad', 'D wire decode allocates recursively detached arrays and ops'],
+    'vera/VeraGfx.ets:GfxShapeValue': ['ee372ac1a2ff68437eba67efc8b5628bf03f36bc430d37789e9c1ad08b0d2745', 'A fresh empty wrapper map via freshObjectValue provenance, D retained op alias'],
+    'vera/VeraGfx.ets:asNumbers': ['d299b0dd4321a27f7c52ff10bb39844d4433bdc7f413717ae4ae28fd1dde279c', 'A borrowed VM primitives extracted into D per-call fresh output; no module-shared reused array; hash is a bounded review gate, not semantic freshness proof'],
+    'vera/VeraGfx.ets:holding': ['2e0a29ab8b82ca2d61dc6d3bf6e95c0c865c15040b95458c4d2bf539391c8327', 'D fresh parent accounting; borrowed child ops read-only'],
+    'vera/VeraGfx.ets:shapesIn': ['9a08da990374e806b9aed8b30dfe8a44a6ba4c3253b8be45ef3b1ddf23cf621c', 'D fresh outer list retains immutable op aliases'],
+    'vera/VeraGfx.ets:op': ['86f7cd7637e4ea7218bee3ef1ee15b3f90f5e38f8e155ff075ea8b7fc315dc17', 'D fresh op before publication'],
+    'vera/VeraGfx.ets:invokeStdGfx': ['98f9297c8e1e8908aba961bd67b922251ea04f283f70a4ad101da152efaf4119', 'D constructors and functional wrappers only write fresh parents']
+  },
+  probes: [
+    ['gfx primitive extraction reuses module-shared output', 'vera/VeraGfx.ets',
+      `function asNumbers(args: RuntimeValue[], i: number): number[] {
+  if (i >= args.length) { return [] }
+  let v = args[i]
+  if (!(v instanceof VeraArrayValue)) { throw new RuntimeTrap('R0020', 'expected array argument') }
+  let items = (v as VeraArrayValue).elements
+  if (items.length > MAX_GFX_POINTS) {
+    throw new RuntimeTrap('R0028', 'a polyline or polygon holds at most ' + (MAX_GFX_POINTS / 2).toString() +
+      ' points; got ' + Math.floor(items.length / 2).toString())
+  }
+  let out: number[] = []`,
+      `const sharedNumericOutput: number[] = []
+function asNumbers(args: RuntimeValue[], i: number): number[] {
+  if (i >= args.length) { return [] }
+  let v = args[i]
+  if (!(v instanceof VeraArrayValue)) { throw new RuntimeTrap('R0020', 'expected array argument') }
+  let items = (v as VeraArrayValue).elements
+  if (items.length > MAX_GFX_POINTS) {
+    throw new RuntimeTrap('R0028', 'a polyline or polygon holds at most ' + (MAX_GFX_POINTS / 2).toString() +
+      ' points; got ' + Math.floor(items.length / 2).toString())
+  }
+  let out: number[] = sharedNumericOutput
+  out.length = 0`, null, null, true],
+    ['constructor array defaults weakened', 'vera/GfxPaint.ets', 'points: number[] = []', 'points: number[] = sharedPoints', null, null, true],
+    ['numeric copy helper weakened', 'vera/VeraGfx.ets', 'out.push((item as VeraNumberValue).value)', 'out.push(99)', null, null, true],
+    ['shared op.points mutation', 'vera/VeraGfx.ets', 'this.op = op', 'this.op = op; op.points.push(99)'],
+    ['shared child-op mutation', 'vera/VeraGfx.ets', 'count += c.count', 'c.points[0] = 99; count += c.count'],
+    ['erased consumer alias', 'vera/VeraMovingPart.ets', 'export function pointsOf(o: GfxOp, m: number[], out: number[]): void {',
+      'export function pointsOf(o: GfxOp, m: number[], out: number[]): void { const hidden = o as Object; consume(hidden);', 'consume(hidden)'],
+    ['destructured unknown receiver', 'vera/GfxPaint.ets', 'function finite(o: GfxOp): boolean {',
+      'function finite(o: GfxOp): boolean { const {points: queue} = input; queue.push(99);', 'queue.push(99)'],
+    ['erased destructured op alias', 'vera/VeraGfx.ets', 'this.op = op',
+      'this.op = op; const erased = op as Object; const {children: kids} = erased; consume(kids);', 'consume(kids)'],
+    ['approved write repeated by loop', 'vera/VeraGfx.ets', 'o.count = count', 'for (let repeat = 0; repeat < 2; repeat++) { o.count = count }'],
+    ['approved write conditional bypass', 'vera/VeraGfx.ets', 'o.count = count', 'if (false) { o.count = count }'],
+    ['new import consumer', 'runtime/P3GfxProbe.ets', '', "import {GfxOp as Op} from '../vera/GfxPaint'; export function steal(op: Op): Object { const hidden = op as Object; return consume(hidden); }"],
+    ['transitive reexport and type-alias consumer', 'runtime/P3GfxProbe.ets', '',
+      "import {Carry} from './P3AliasBridge'; export function steal(input: Carry): void { const hidden = input as Object; consume(hidden); }", 'consume(hidden)',
+      [['runtime/P3PayloadAlias.ets', "import {GfxOp as Native} from '../vera/GfxPaint'; export type Payload = Native;"],
+        ['runtime/P3AliasBridge.ets', "export {Payload as Carry} from './P3PayloadAlias';"]]],
+    ['fresh points copy weakened', 'vera/VeraGfx.ets', 'o.points = asNumbers(args, 0)', 'o.points = (args[0] as VeraArrayValue).elements as number[]'],
+    ['new unknown destructuring consumer', 'runtime/P3GfxProbe.ets', '', 'export function steal(input: Object): void { const {op: hidden} = input; hidden.points.push(1); }', 'hidden.points.push(1)']
+  ]
+}
+
+module.exports = {retainedSources, retainedInventory, retainedDigest, retainedSummary, retainedPayloadChecks, retainedOwnership, retainedLimits, synchronousPathChecks, gfxRetained}
+
+if (require.main === module) {
+retainedPayloadChecks(gfxRetained)
 const {loadVera} = require('./source-loader')
 const {createRecorder} = require('./gfx-svg')
 const {play} = require('./gfx-run')
@@ -355,4 +809,163 @@ fs.writeFileSync(path.join(__dirname, 'proofs/widget-rich.svg'), svgOf(richOps, 
   fs.writeFileSync(path.join(__dirname, 'proofs/widget-bubbles.svg'), sheet.svg())
 }
 
+{
+  const freezePayload = value => {
+    if (value !== null && typeof value === 'object' && !Object.isFrozen(value)) {
+      for (const child of Object.values(value)) freezePayload(child)
+      Object.freeze(value)
+    }
+    return value
+  }
+  const retained = []
+  const retain = shape => {
+    freezePayload(shape.op)
+    Object.freeze(shape)
+    const nodes = []
+    const visit = op => {
+      assert.ok(Object.isFrozen(op) && Object.isFrozen(op.children) && Object.isFrozen(op.points))
+      nodes.push({op, children: op.children, points: op.points, members: op.children.slice()})
+      for (const child of op.children) visit(child)
+    }
+    visit(shape.op)
+    retained.push({shape, op: shape.op, json: JSON.stringify(shape.op), nodes})
+    return shape
+  }
+  const unchanged = () => {
+    for (const saved of retained) {
+      assert.equal(saved.shape.op, saved.op, 'retained shape keeps its op')
+      assert.equal(JSON.stringify(saved.op), saved.json, 'retained payload including metadata is unchanged')
+      for (const node of saved.nodes) {
+        assert.equal(node.op.children, node.children, 'retained children array keeps its identity')
+        assert.equal(node.op.points, node.points, 'retained points array keeps its identity')
+        assert.equal(node.children.length, node.members.length)
+        node.members.forEach((child, i) => assert.equal(node.children[i], child, 'retained child keeps its identity'))
+      }
+    }
+  }
+  const coordinates = freezePayload(new VeraArrayValue(nums([2, 3, 8, 3, 8, 9])))
+  const coordinatesBefore = JSON.stringify(coordinates)
+  const polygon = retain(fx('polygon', [coordinates, str('accent')]))
+  const otherCoordinates = freezePayload(new VeraArrayValue(nums([-4, 1, 6, 1, 0, 5])))
+  const otherPolygon = retain(fx('polygon', [otherCoordinates, str('ink')]))
+  assert.notEqual(otherPolygon.op.points, polygon.op.points, 'successive retained polygons own per-call extracted arrays')
+  assert.notEqual(otherPolygon.op.points, otherCoordinates.elements, 'second polygon does not borrow VM storage')
+  assert.deepEqual(polygon.op.points, [2, 3, 8, 3, 8, 9], 'second extraction leaves first retained polygon unchanged')
+  assert.deepEqual(otherPolygon.op.points, [-4, 1, 6, 1, 0, 5])
+  assert.ok(otherPolygon.op.points.every(n => typeof n === 'number'), 'polygon extraction stores primitives, not VM wrappers')
+  unchanged()
+  const polyline = retain(fx('polyline', [coordinates, new VeraNumberValue(2), str('ink')]))
+  assert.deepEqual(polygon.op.points, [2, 3, 8, 3, 8, 9])
+  assert.deepEqual(polyline.op.points, [2, 3, 8, 3, 8, 9])
+  assert.equal(polyline.op.lineWidth, 2)
+  assert.notEqual(polygon.op.points, coordinates.elements, 'numeric points are copied out of VM values')
+  assert.notEqual(polyline.op.points, polygon.op.points, 'each point constructor owns its numeric array')
+  const children = Object.freeze(new VeraArrayValue(Object.freeze([polygon, polyline, polygon])))
+  const nested = retain(fx('group', nums([10, 20, 0, 2, 0.5]).concat([children])))
+  assert.deepEqual([nested.op.count, nested.op.drawn, nested.op.depth], [4, 4, 1])
+  assert.notEqual(nested.op.children, children.elements)
+  assert.equal(nested.op.children[0], polygon.op)
+  assert.equal(nested.op.children[1], polyline.op)
+  assert.equal(nested.op.children[2], polygon.op, 'repeated children retain the same op, not clones')
+  const input = Object.freeze(new VeraArrayValue(Object.freeze([nested, polygon])))
+  const cases = [
+    ['group', nums([3, 4, 90, 2, 0.25]), {kind: 'group', x: 3, y: 4, start: 90, r: 2, size: 0.25}, /d="M-49 32 L-49 56 L-73 56 Z"/],
+    ['glow', [new VeraNumberValue(4), str('#22d3ee')], {kind: 'fx', fx: 'glow', lineWidth: 4, color: '#22d3ee'}, /stdDeviation="2"/],
+    ['shadow', nums([1, 3, 2]).concat([str('#00000066')]), {kind: 'fx', fx: 'shadow', w: 1, h: 3, lineWidth: 2, color: '#00000066'}, /<feOffset dx="1" dy="3"/],
+    ['blur', nums([3]), {kind: 'fx', fx: 'blur', lineWidth: 3}, /stdDeviation="1.5"/],
+    ['blend', [str('add')], {kind: 'fx', fx: 'add'}, /mix-blend-mode:plus-lighter/],
+    ['moving', [str('swing')].concat(nums([7, 50, 20])), {kind: 'moving', fx: 'swing', sweep: 7, x: 50, y: 20}, /d="M14 26 L26 26 L26 38 Z"/],
+    ['drift', [str('left'), str('slow')], {kind: 'drift', fx: 'left', text: 'slow'}, /d="M-86 26 L-74 26 L-74 38 Z"/],
+    ['repeat', nums([2, 3, 10, 20]), {kind: 'repeat', w: 2, h: 3, x: 10, y: 20}, /d="M24 66 L36 66 L36 78 Z"/],
+  ]
+  const outputs = cases.map(([name, args, expected, painted]) => {
+    const result = retain(fx(name, args.concat([input])))
+    assert.notEqual(result, nested, name + ' returns a new shape')
+    assert.notEqual(result.op, nested.op, name + ' returns a new parent op')
+    assert.notEqual(result.op.children, input.elements, name + ' makes a new children list')
+    assert.notEqual(result.op.children, nested.op.children)
+    assert.equal(result.op.children.length, 2)
+    assert.equal(result.op.children[0], nested.op, name + ' retains the nested op')
+    assert.equal(result.op.children[1], polygon.op, name + ' retains the leaf op')
+    for (const [key, value] of Object.entries(expected)) assert.equal(result.op[key], value, name + '.' + key)
+    assert.deepEqual([result.op.count, result.op.drawn, result.op.depth], [6, name === 'repeat' ? 31 : 6, 2])
+    const svg = svgOf(Object.freeze([result.op]))
+    assert.match(svg, painted, name + ' paints the expected geometry or effect from frozen retained children')
+    assert.ok(svg.includes('stroke="' + G.gfxColor(light, 'ink') + '"'), name + ' also paints the nested polyline')
+    if (name === 'group') assert.ok(svg.includes('fill-opacity="0.13"'), 'group alpha composes with retained alpha, rounded by the recorder')
+    if (name === 'repeat') assert.equal(svg.split(' Z" fill="' + G.gfxColor(light, 'accent') + '"').length - 1, 18, 'six copies each paint three polygons')
+    const encoded = G.encodeGfxOps(Object.freeze([result.op]))
+    const back = freezePayload(G.decodeGfxOps(encoded))
+    assert.equal(back.length, 1, name + ' survives wire decoding')
+    assert.equal(G.encodeGfxOps(back), encoded, name + ' round trips its packed semantics')
+    assert.equal(svgOf(back), svg, name + ' round trips its painted semantics')
+    unchanged()
+    return result
+  })
+  assert.equal(new Set(outputs.map(shape => shape.op.children)).size, cases.length, 'functional wrappers do not share parent arrays')
+  const frame = Object.freeze(new VeraArrayValue(Object.freeze([nested, new VeraNumberValue(99), polygon])))
+  const decoded = G.decodeGfx(frame)
+  assert.equal(decoded.length, 2, 'decode filters non-shapes without discarding valid retained shapes')
+  assert.equal(decoded[0], nested.op, 'decode aliases the retained group op')
+  assert.equal(decoded[1], polygon.op, 'decode aliases the retained points op')
+  assert.notEqual(decoded, frame.elements)
+  const decodedAgain = G.decodeGfx(frame)
+  assert.notEqual(decodedAgain, decoded, 'each decode allocates its outer list')
+  decodedAgain.pop()
+  assert.equal(frame.elements.length, 3)
+  assert.equal(decoded.length, 2)
+  Object.freeze(decoded)
+  unchanged()
+  const packedPolygon = {k: 'polygon', c: 'accent', p: [2, 3, 8, 3, 8, 9]}
+  const expectedPacked = [{k: 'group', x: 10, y: 20, r: 2, z: 0.5, o: [packedPolygon,
+    {k: 'polyline', l: 2, c: 'ink', p: [2, 3, 8, 3, 8, 9]}, packedPolygon]}, packedPolygon]
+  const encoded = G.encodeGfxOps(decoded)
+  assert.deepEqual(JSON.parse(encoded), expectedPacked, 'serialization carries actual nested geometry, order, style and duplicate children')
+  assert.equal(G.encodeGfxOps(decoded), encoded, 'serialization is deterministic on the retained frame')
+  const back = freezePayload(G.decodeGfxOps(encoded))
+  assert.equal(back.length, 2)
+  const detached = (copy, original) => {
+    assert.notEqual(copy, original, 'wire decoding allocates a new op')
+    assert.notEqual(copy.children, original.children, 'wire decoding allocates children')
+    assert.notEqual(copy.points, original.points, 'wire decoding allocates points')
+    assert.deepEqual(copy.points, original.points)
+    assert.equal(copy.children.length, original.children.length)
+    copy.children.forEach((child, i) => detached(child, original.children[i]))
+  }
+  back.forEach((op, i) => detached(op, decoded[i]))
+  assert.equal(G.encodeGfxOps(back), encoded, 'wire round trip preserves packed drawing semantics')
+  assert.deepEqual([back[0].count, back[0].drawn, back[0].depth], [1, 1, 0], 'wire format does not preserve runtime accounting metadata')
+  assert.equal(svgOf(back), svgOf(decoded), 'wire round trip paints the same frozen nested frame')
+  assert.match(svgOf(back), /d="M14 26 L26 26 L26 38 Z"/, 'round trip is not an empty drawing')
+  const mutableBack = G.decodeGfxOps(encoded)
+  mutableBack[0].children[0].points[0] = 77
+  mutableBack[0].children.pop()
+  assert.equal(mutableBack[0].children[2], undefined)
+  assert.equal(mutableBack[1].points[0], 2, 'wire duplicates are detached from each other')
+  assert.equal(polygon.op.points[0], 2, 'editing wire-decoded points cannot change retained input')
+  assert.equal(nested.op.children.length, 3, 'editing wire-decoded children cannot change retained input')
+  const {pointsOf, coloursOf} = loadVera('VeraMovingPart')
+  const matrix = Object.freeze([0, 1, -1, 0, 100, 5])
+  const transformed = [-1, -2]
+  pointsOf(nested.op, matrix, transformed)
+  assert.deepEqual(transformed, [-1, -2, 80, 15, 74, 19, 74, 31, 62, 31,
+    74, 19, 74, 31, 62, 31, 74, 19, 74, 31, 62, 31], 'pointsOf appends transformed group origin and all retained vertices')
+  assert.deepEqual(matrix, [0, 1, -1, 0, 100, 5], 'pointsOf does not modify its input matrix')
+  const palette = ['surface']
+  assert.equal(coloursOf(decoded, palette), palette, 'coloursOf writes the supplied output accumulator')
+  assert.deepEqual(palette, ['surface', 'accent', 'ink'], 'coloursOf visits nested children and deduplicates colours')
+  const {MotionPose} = loadVera('VeraMotion')
+  const pose = freezePayload(Object.assign(new MotionPose(), {dx: 5, dy: -3, opacity: 0.5}))
+  const posed = createRecorder(100, 100)
+  G.paintGfx(posed.ctx, Object.freeze([outputs[5].op]), light, 100, 100, 100, 100, 1, false, false, Object.freeze([pose]))
+  assert.match(posed.svg(), /d="M19 23 L31 23 L31 35 Z"/, 'a frozen moving payload paints translated retained vertices')
+  assert.ok(posed.svg().includes('fill-opacity="0.25"'), 'moving opacity composes with group alpha')
+  const drifting = createRecorder(100, 100)
+  G.paintGfx(drifting.ctx, Object.freeze([outputs[6].op]), light, 100, 100, 100, 100, 1, false, false, [], 2100)
+  assert.match(drifting.svg(), /d="M-11 26 L1 26 L1 38 Z"/, 'clocked drift paints retained points a quarter tile left')
+  assert.equal(JSON.stringify(coordinates), coordinatesBefore, 'point construction and consumers leave VM coordinate inputs unchanged')
+  unchanged()
+}
+
 console.log('gfx-check ok')
+}
