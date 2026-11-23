@@ -1,5 +1,6 @@
 import { fileIo as fs } from '@kit.CoreFileKit'
 import { BusinessError } from '@kit.BasicServicesKit'
+import { util } from '@kit.ArkTS'
 import { requestHeadline } from './ProjectText'
 import { ProjectMigrationMetadata, ProjectVersionInput } from './ProjectStateMigration'
 
@@ -73,14 +74,24 @@ function ensureDir(path: string): void {
   try { fs.mkdirSync(path, true) } catch (_e) {}
 }
 
-function readJson(path: string): string {
+function readJson(path: string, maxBytes: number = 0, rejectOversized: boolean = false): string {
+  let oversized = false
   try {
     let stat = fs.statSync(path)
     if (stat.size === 0) { return '' }
-    return fs.readTextSync(path)
-  } catch (_e) {
-    return ''
-  }
+    if (maxBytes > 0) {
+      oversized = stat.size > maxBytes
+      if (!oversized) {
+        let text = fs.readTextSync(path, { length: maxBytes + 1 })
+        oversized = text.length > 0 && new util.TextEncoder().encodeInto(text).length > maxBytes
+        if (!oversized) { return text }
+      }
+    } else {
+      return fs.readTextSync(path)
+    }
+  } catch (_e) {}
+  if (oversized && rejectOversized) { throw new Error('PROJECT_READ_LIMIT') }
+  return ''
 }
 
 function writeJson(path: string, content: string): void {
@@ -162,8 +173,8 @@ export class ProjectStore {
   }
 
   /** Returns the encoded value, or '' when there is nothing usable to restore. */
-  loadState(projectId: string, versionId: string, stamp: string): string {
-    let text = readJson(this.statePath(projectId, versionId))
+  loadState(projectId: string, versionId: string, stamp: string, maxBytes: number = 0): string {
+    let text = readJson(this.statePath(projectId, versionId), maxBytes, maxBytes > 0)
     if (text.length === 0) { return '' }
     try {
       let obj = JSON.parse(text) as Record<string, Object>
@@ -178,8 +189,8 @@ export class ProjectStore {
     try { fs.unlinkSync(this.statePath(projectId, versionId)) } catch (_e) {}
   }
 
-  private readIndex(): Project[] {
-    let text = readJson(this.indexPath())
+  private readIndex(maxBytes: number = 0): Project[] {
+    let text = readJson(this.indexPath(), maxBytes)
     if (text.length === 0) { return [] }
     try {
       let arr = JSON.parse(text) as Object[]
@@ -210,8 +221,8 @@ export class ProjectStore {
     writeJson(this.indexPath(), JSON.stringify(arr))
   }
 
-  listProjects(): Project[] {
-    return this.readIndex()
+  listProjects(maxBytes: number = 0): Project[] {
+    return this.readIndex(maxBytes)
   }
 
   /** Per project, read from its versions once and kept until a version is saved or deleted. */
@@ -277,19 +288,21 @@ export class ProjectStore {
     this.writeIndex(filtered)
   }
 
-  listVersions(projectId: string): Version[] {
+  listVersions(projectId: string, maxBytes: number = 0, canRead: (() => boolean) | null = null): Version[] {
     let dir = this.projectDir(projectId)
     let versions: Version[] = []
     try {
+      if (canRead !== null && !canRead()) { return versions }
       let files = fs.listFileSync(dir)
       for (let file of files) {
+        if (canRead !== null && !canRead()) { break }
         // Saved program state lives in this directory too, as
         // `<versionId>.state.json` -- which also ends in `.json`. Without this
         // it was read as a version record, and because parseVersion only
         // returned null on a JSON syntax error, the result was a phantom entry
         // in the version list: no date, no bytecode, badged "needs compile".
         if (!file.endsWith('.json') || file.endsWith('.state.json')) { continue }
-        let text = readJson(dir + '/' + file)
+        let text = readJson(dir + '/' + file, maxBytes)
         if (text.length === 0) { continue }
         let v = this.parseVersion(text)
         if (v !== null) { versions.push(v!) }

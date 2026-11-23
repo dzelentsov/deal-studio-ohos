@@ -1,7 +1,8 @@
 import { AppActor, AppActorCallbacks } from './AppActor'
 import { AcquireOptions, ActorHandle, AdmissionResult, AppSubscriber, DrawRequest,
-  EffectRequest, FrameEnvelope, HostOperationError, InputEvent, InputPayload,
-  ProgramRef, RuntimeMode, SceneDraw, SceneEventPayload, SurfaceFrameEvent, TickEvent } from './shared/Messages'
+  EffectRequest, FrameEnvelope, HostOperationError, HostStateVersion, InputEvent, InputPayload,
+  ProgramRef, RevisionedEffectRequest, RevisionedFrameEnvelope, RuntimeMode, SceneDraw,
+  SceneEventPayload, StateSnapshotEnvelope, SurfaceFrameEvent, TickEvent } from './shared/Messages'
 import { RuntimeValue, VeraNumberValue, VeraStringValue, VeraBooleanValue } from '../vera/VeraInterpreter'
 import { HostEffect, VeraUiNode } from '../vera/VeraUi'
 import { GfxOp, pointerValue } from '../vera/VeraGfx'
@@ -165,6 +166,85 @@ class ActorRecord {
     this.options = options
     this.subscriber = subscriber
   }
+}
+
+export interface HostPublicationFence {
+  readonly incarnation: Object
+  readonly appId: string
+  readonly runtimeMode: RuntimeMode
+  readonly vmGeneration: number
+}
+
+function publicationCounter(value: number): boolean {
+  return Number.isSafeInteger(value) && value >= 0 && value < Number.MAX_SAFE_INTEGER
+}
+
+function publicationMode(mode: RuntimeMode): boolean {
+  return mode === 'PREVIEW' || mode === 'LIVE_EPHEMERAL' || mode === 'LIVE_PERSISTENT'
+}
+
+function validateHostVersion(version: HostStateVersion): void {
+  if (!publicationMode(version.runtimeMode) || !publicationCounter(version.vmGeneration) ||
+      !publicationCounter(version.stateRevision) ||
+      (version.runtimeMode !== 'LIVE_PERSISTENT' && version.stateRevision !== 0)) {
+    throw new Error('Invalid host state version')
+  }
+}
+
+function validatePublicationIdentity(appId: string, generation: number, version: HostStateVersion): void {
+  validateHostVersion(version)
+  if (typeof appId !== 'string' || appId.length === 0 || generation !== version.vmGeneration) {
+    throw new Error('Invalid host publication identity')
+  }
+}
+
+export function makeRevisionedFrame(frame: FrameEnvelope, version: HostStateVersion): RevisionedFrameEnvelope {
+  validatePublicationIdentity(frame.appId, frame.vmGeneration, version)
+  if (!publicationCounter(frame.frameSeq) || !publicationCounter(frame.appliedSeq)) {
+    throw new Error('Invalid frame counters')
+  }
+  let result: RevisionedFrameEnvelope = {
+    appId: frame.appId, vmGeneration: version.vmGeneration, runtimeMode: version.runtimeMode,
+    stateRevision: version.stateRevision, frameSeq: frame.frameSeq, appliedSeq: frame.appliedSeq,
+    reveal: frame.reveal, view: frame.view === null ? null : JSON.parse(JSON.stringify(frame.view)) as Object,
+    gfx: JSON.parse(JSON.stringify(frame.gfx)) as Object[], timing: frame.timing.slice()
+  }
+  if (frame.scenes !== undefined) {
+    result.scenes = frame.scenes.map((scene: SceneDraw): SceneDraw => {
+      return { nodeId: scene.nodeId, spec: JSON.parse(JSON.stringify(scene.spec)) as WorldSpec }
+    })
+  }
+  return result
+}
+
+export function makeRevisionedEffect(effect: EffectRequest,
+    version: HostStateVersion): RevisionedEffectRequest | null {
+  validatePublicationIdentity(effect.appId, effect.vmGeneration, version)
+  if (!publicationCounter(effect.effectId)) { throw new Error('Invalid effect counter') }
+  if (version.runtimeMode === 'PREVIEW') { return null }
+  return {
+    appId: effect.appId, vmGeneration: version.vmGeneration, runtimeMode: version.runtimeMode,
+    stateRevision: version.stateRevision, effectId: effect.effectId, kind: effect.kind,
+    rawTarget: effect.rawTarget, params: effect.params.slice(), resultHandler: effect.resultHandler,
+    mode: effect.mode
+  }
+}
+
+export function makeStateSnapshot(appId: string, encoded: string,
+    version: HostStateVersion): StateSnapshotEnvelope | null {
+  validatePublicationIdentity(appId, version.vmGeneration, version)
+  if (typeof encoded !== 'string' || encoded.length === 0) { throw new Error('Invalid snapshot encoding') }
+  if (version.runtimeMode === 'PREVIEW') { return null }
+  return { appId: appId, encoded: encoded, runtimeMode: version.runtimeMode,
+    vmGeneration: version.vmGeneration, stateRevision: version.stateRevision }
+}
+
+export function sameHostPublication(captured: HostPublicationFence, current: HostPublicationFence): boolean {
+  return typeof captured.incarnation === 'object' && captured.incarnation !== null &&
+    captured.incarnation === current.incarnation && typeof captured.appId === 'string' &&
+    captured.appId.length > 0 && captured.appId === current.appId &&
+    publicationMode(captured.runtimeMode) && captured.runtimeMode === current.runtimeMode &&
+    publicationCounter(captured.vmGeneration) && captured.vmGeneration === current.vmGeneration
 }
 
 export class InProcessHost implements EffectResultHost {

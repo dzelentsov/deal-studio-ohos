@@ -24,6 +24,7 @@ function load(name) {
   const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020, esModuleInterop: true } }).outputText
   new Function('require','module','exports', compiled)(dep => {
     if (dep === '@kit.CoreFileKit') return { fileIo: filesystem }
+    if (dep === '@kit.ArkTS') return {util: {TextEncoder: class {encodeInto(text) {return new TextEncoder().encode(text)}}}}
     if (dep === '@kit.FormKit') return { formProvider, formBindingData: { createFormBindingData: value => value } }
     if (dep.startsWith('./')) return load(dep.slice(2))
     throw Error(dep)

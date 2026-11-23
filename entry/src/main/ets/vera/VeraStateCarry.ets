@@ -14,7 +14,7 @@
  * fails (see VeraPreview.load).
  */
 
-import { RuntimeValue, VeraNumberValue, VeraStringValue, VeraBooleanValue, VeraArrayValue, VeraObjectValue } from './VeraInterpreter'
+import { RuntimeValue, VeraNumberValue, VeraStringValue, VeraBooleanValue, VeraArrayValue, VeraObjectValue, freshObjectValue } from './VeraInterpreter'
 
 export function carryState(fresh: RuntimeValue, old: RuntimeValue, shapes: Map<string, string[]> | null = null): RuntimeValue {
   if (fresh instanceof VeraObjectValue && old instanceof VeraObjectValue) {
@@ -23,7 +23,7 @@ export function carryState(fresh: RuntimeValue, old: RuntimeValue, shapes: Map<s
       let before = old.fields.get(name)
       fields.set(name, before === undefined ? value : carryState(value, before, shapes))
     })
-    return new VeraObjectValue(fresh.classIdentity, fields)
+    return freshObjectValue(fresh.classIdentity, fields)
   }
   if (fresh instanceof VeraArrayValue && old instanceof VeraArrayValue) {
     if (old.elements.length === 0) { return fresh }

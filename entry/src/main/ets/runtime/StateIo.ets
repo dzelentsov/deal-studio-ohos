@@ -146,7 +146,7 @@ export function runStateCleanupTask(root: string, options: StateIoOptions,
 
 export interface StateIoTaskRequest {
   operationId: string
-  kind: 'load' | 'readHeader' | 'commit' | 'publishGeneration'
+  kind: 'load' | 'recoverLost' | 'readHeader' | 'commit' | 'publishGeneration'
   appId?: string
   expectedStamp?: string
   commit?: CommitTaskRequest
@@ -160,7 +160,7 @@ export interface StateIoTaskError {
 
 export interface StateIoTaskReply {
   operationId: string
-  kind: 'load' | 'readHeader' | 'commit' | 'publishGeneration'
+  kind: 'load' | 'recoverLost' | 'readHeader' | 'commit' | 'publishGeneration'
   load?: LoadResult
   header?: StateHeader | null
   result?: CommitResult
@@ -172,13 +172,14 @@ export function runStateIoTask(root: string, options: StateIoOptions, request: S
   try {
     let io = new StateIo(root, options)
     if (request.kind === 'load') { reply.load = io.load(request.appId as string, request.expectedStamp as string) }
+    else if (request.kind === 'recoverLost') { reply.load = io.recoverLost(request.appId as string, request.expectedStamp as string) }
     else if (request.kind === 'readHeader') { reply.header = io.readHeader(request.appId as string) }
     else if (request.kind === 'commit') { reply.result = io.commit(request.commit as CommitTaskRequest) }
     else if (request.kind === 'publishGeneration') {
       reply.result = io.publishGeneration(request.publication as PublishGenerationRequest)
     } else { throw new StateIoError('STATE_VALIDATION_FAILED', 'task-kind') }
   } catch (error) {
-    if (request.kind === 'load') {
+    if (request.kind === 'load' || request.kind === 'recoverLost') {
       reply.load = { kind: 'UNAVAILABLE', code: 'STATE_COMMIT_UNCERTAIN', stage: 'task-worker' }
     } else if (request.kind === 'readHeader') {
       let issue = error instanceof StateIoError ? error : new StateIoError('STATE_READ_FAILED', 'task-worker')
@@ -449,7 +450,8 @@ export class StateIo {
     finally { closeQuietly(directory) }
   }
 
-  private safeWrite(path: string, directory: string, text: string, prefix: string): void {
+  private safeWrite(path: string, directory: string, text: string, prefix: string,
+      conservativeRename: boolean = false): void {
     let fd: number | null = null
     let temp = ''
     let owned = false
@@ -484,7 +486,9 @@ export class StateIo {
       stage = prefix + '-dir-fsync'
       this.syncDirectory(directory, stage)
     } catch (error) {
-      if (renamed) { throw new StateIoError('STATE_COMMIT_UNCERTAIN', stage, errorCode(error)) }
+      if (renamed || (conservativeRename && stage === prefix + '-rename')) {
+        throw new StateIoError('STATE_COMMIT_UNCERTAIN', stage, errorCode(error))
+      }
       let code: StateErrorCode = stage.endsWith('-temp-fsync') ? 'STATE_SYNC_FAILED' :
         stage.endsWith('-rename') ? 'STATE_PUBLISH_FAILED' : 'STATE_WRITE_FAILED'
       throw failure(error, stage, code)
@@ -646,6 +650,90 @@ export class StateIo {
       return { kind: 'LOST', code: issue ? issue.code : 'STATE_CORRUPTED', stage: issue ? issue.stage : 'recovery-backup-format' }
     } catch (error) { return unavailable(failure(error, 'load', 'STATE_RECOVERY_FAILED')) }
     finally { releaseLock(lock) }
+  }
+
+  recoverLost(appId: string, expectedStamp: string): LoadResult {
+    let lock: fs.File | null = null
+    let result: LoadResult
+    try {
+      let paths = this.paths(appId)
+      if (typeof expectedStamp !== 'string' || expectedStamp.indexOf('\u0000') >= 0) {
+        throw new StateIoError('STATE_VALIDATION_FAILED', 'lost-request')
+      }
+      if (this.directoryFsync !== 'REQUIRED') { throw new StateIoError('STATE_SYNC_FAILED', 'lost-fsync-required') }
+      this.checkRoot()
+      if (!this.directoryExists(paths)) { throw new StateIoError('STATE_UNAVAILABLE', 'lost-project-absent') }
+      lock = this.lock(paths)
+      if (lock === null) { throw new StateIoError('STATE_LOCK_UNAVAILABLE', 'lost-lock') }
+      if (!fs.statSync(lock.fd).isFile()) { throw new StateIoError('STATE_LOCK_UNAVAILABLE', 'lost-lock-stat') }
+      result = this.recoverLostLocked(paths, appId, expectedStamp)
+    } catch (error) { result = unavailable(failure(error, 'lost-recovery', 'STATE_RECOVERY_FAILED')) }
+    finally {
+      if (lock !== null) {
+        try { lock.unlock() }
+        catch (error) { result = unavailable(new StateIoError('STATE_COMMIT_UNCERTAIN', 'lost-unlock', errorCode(error))) }
+        try { fs.closeSync(lock) }
+        catch (error) { result = unavailable(new StateIoError('STATE_COMMIT_UNCERTAIN', 'lost-close', errorCode(error))) }
+      }
+    }
+    return result
+  }
+
+  private recoverLostLocked(paths: StatePaths, appId: string, expectedStamp: string): LoadResult {
+    let renameAttempted = false
+    let stage = 'lost-main'
+    try {
+      this.checkRoot()
+      let main = this.readFile(paths.main, appId, stage)
+      if (main.kind === 'VALID') { return ready(main, 'MAIN', expectedStamp) }
+      if (main.kind === 'IO') { return unavailable(main.error as StateIoError) }
+      stage = 'lost-backup'
+      let backup = this.readFile(paths.backup, appId, stage)
+      if (backup.kind === 'IO') { return unavailable(backup.error as StateIoError) }
+      this.checkRoot()
+      if (backup.kind === 'VALID') {
+        if ((backup.data as DecodedStateData).format !== 'FORMAT2') {
+          return { kind: 'LOST', code: 'STATE_CORRUPTED', stage: 'lost-backup-format' }
+        }
+        this.safeWrite(paths.main, paths.directory, backup.text as string, 'lost-restore', true)
+        return ready(backup, 'BAK', expectedStamp)
+      }
+      stage = 'lost-dir-preflight'
+      this.syncDirectory(paths.directory, stage)
+      let targets: string[] = []
+      if (main.kind === 'CORRUPT') { targets.push(paths.main) }
+      if (backup.kind === 'CORRUPT') { targets.push(paths.backup) }
+      stage = 'lost-quarantine-stat'
+      for (let target of targets) {
+        if (!fs.lstatSync(target).isFile()) { throw new StateIoError('STATE_UNAVAILABLE', stage) }
+      }
+      for (let target of targets) {
+        stage = 'lost-quarantine-name'
+        let suffix = util.generateRandomUUID()
+        if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(suffix)) {
+          throw new StateIoError('STATE_VALIDATION_FAILED', stage)
+        }
+        let quarantine = target + '.' + suffix + '.quarantine'
+        stage = 'lost-quarantine-open'
+        let fd = fileIo.openSync(quarantine,
+          fs.OpenMode.CREATE | STATE_OPEN_EXCL | fs.OpenMode.WRITE_ONLY | fs.OpenMode.NOFOLLOW, 0o600)
+        stage = 'lost-quarantine-close'
+        try { fileIo.closeSync(fd) }
+        catch (error) {
+          try { fileIo.closeSync(fd) } catch (_error) {}
+          throw error as Error
+        }
+        stage = 'lost-quarantine-rename'
+        renameAttempted = true
+        fs.renameSync(target, quarantine)
+      }
+      stage = 'lost-dir-fsync'
+      this.syncDirectory(paths.directory, stage)
+      return { kind: 'ABSENT' }
+    } catch (error) {
+      return unavailable(renameAttempted ? new StateIoError('STATE_COMMIT_UNCERTAIN', stage, errorCode(error)) :
+        failure(error, stage, 'STATE_RECOVERY_FAILED'))
+    }
   }
 
   readCommittedReadOnly(appId: string, expectedStamp: string): LoadResult {
