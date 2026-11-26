@@ -3,9 +3,10 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const path = require('node:path')
 const ts = require(process.env.VERA_TYPESCRIPT_PATH || 'typescript')
-const root = path.resolve(__dirname, '../../entry/src/main/ets')
+const root = path.resolve(process.env.VERA_SOURCE_ROOT || path.join(__dirname, '../../entry/src/main/ets'))
 const cache = new Map()
-const disk = new Map()
+const worker = require('./state-io-check').createWorkerFixture('/effects-fixture/vera')
+const disk = worker.disk
 const timers = new Map()
 const hosts = []
 const bridges = []
@@ -19,28 +20,19 @@ const traces = []
 let now = 100000
 let nextTimer = 0
 let platform = () => Promise.resolve('ok')
-const filesystem = {
-  OpenMode: { CREATE: 1, WRITE_ONLY: 2, TRUNC: 4 },
-  mkdirSync() {},
-  openSync(file) { return { fd: file } },
-  writeSync(file, value) { disk.set(file, value) },
-  closeSync() {},
-  statSync(file) {
-    if (!disk.has(file)) throw Error('absent')
-    return { size: disk.get(file).length }
-  },
-  readTextSync(file) {
-    if (!disk.has(file)) throw Error('absent')
+const filesystem = new Proxy(worker.filesystem, { get(target, key) {
+  if (key === 'readTextSync') return file => {
+    assert(!worker.workerActive(), 'worker must use bounded byte reads')
+    if (!disk.has(file)) throw Object.assign(Error('absent'), { code: 13900002 })
     return disk.get(file)
-  },
-  renameSync(from, to) {
-    assert(disk.has(from))
-    disk.set(to, disk.get(from))
-    disk.delete(from)
-  },
-  unlinkSync(file) { disk.delete(file) },
-  listFileSync(dir) { return [...disk.keys()].filter(file => path.dirname(file) === dir).map(file => path.basename(file)) }
-}
+  }
+  if (key === 'mkdirSync') return file => {
+    if (worker.workerActive()) return target.mkdirSync(file)
+    if (!worker.memory.nodes.has(file)) worker.memory.put(file, '', 'dir')
+  }
+  if (key === 'statSync') return file => worker.workerActive() ? target.statSync(file) : worker.memory.statSync(file)
+  return target[key]
+} })
 const forbidden = name => new Proxy({}, { get(_target, key) {
   throw Error('Forbidden platform access: ' + name + '.' + String(key))
 } })
@@ -64,7 +56,7 @@ function adapter(route, target, values, mode) {
 function load(file) {
   file = path.resolve(file)
   if (cache.has(file)) return cache.get(file).exports
-  const compiled = ts.transpileModule(fs.readFileSync(file, 'utf8'), {
+  const compiled = ts.transpileModule(fs.readFileSync(file, 'utf8').replace(/^@Concurrent\s*$/gm, ''), {
     fileName: file.replace(/\.ets$/, '.ts'),
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020, experimentalDecorators: true },
     reportDiagnostics: true
@@ -78,6 +70,12 @@ function load(file) {
     if (name.endsWith('/VeraSdkBackend')) return { runSdkAdapter: (target, values) => adapter('sdk', target, values) }
     if (name.endsWith('/VeraConsentStore')) return { consent }
     if (name === '@kit.CoreFileKit') return { fileIo: filesystem }
+    if (name === '@ohos.fileio') return { default: worker.legacyFilesystem }
+    if (name === '@kit.ArkTS') return { taskpool: worker.taskpool, util: worker.util }
+    if (name === '@kit.CryptoArchitectureKit') return { cryptoFramework: worker.cryptoFramework }
+    if (name === '@kit.BasicServicesKit') return { systemDateTime: {
+      TimeType: { STARTUP: 0 }, getUptime: () => now
+    } }
     if (name === '@kit.PerformanceAnalysisKit') return { hilog: forbidden('hilog') }
     if (name.startsWith('@kit.') || name === 'libllama.so') return forbidden(name)
     if (name.startsWith('.')) return load(path.resolve(path.dirname(file), name + '.ets'))
@@ -193,7 +191,7 @@ function deferred() {
   return { promise, resolve, reject }
 }
 async function microtasks() {
-  for (let i = 0; i < 40; i++) await Promise.resolve()
+  for (let i = 0; i < 200; i++) await Promise.resolve()
 }
 function runTimer() {
   const due = [...timers].filter(([, timer]) => timer.at <= now)
@@ -204,18 +202,20 @@ function runTimer() {
   return true
 }
 async function pump() {
+  let idle = false
+  Promise.all(hosts.map(host => host.whenIdle())).then(() => { idle = true })
   for (let i = 0; i < 5000; i++) {
     await microtasks()
-    if (!runTimer()) return
+    if (!runTimer() && idle) return
   }
-  assert.fail('fake timer drain must terminate')
+  assert.fail('fake timer and host drain must terminate')
 }
 async function finish(promise) {
   let settled = false, value, failure
   Promise.resolve(promise).then(result => { settled = true; value = result }, error => { settled = true; failure = error })
   for (let i = 0; !settled && i < 5000; i++) {
     await microtasks()
-    if (!settled) assert(runTimer(), 'operation unresolved without runnable fake timers')
+    if (!settled) runTimer()
   }
   assert(settled, 'operation did not settle')
   if (failure) throw failure
@@ -232,7 +232,20 @@ function input(handle, action, value = 0, kind = 'HANDLER') {
     persist: false, draws: [] }
 }
 function harness(options = {}) {
-  const host = new InProcessHost(() => now)
+  const { AppActor } = runtime('AppActor')
+  const host = new InProcessHost(() => now, (callbacks, owner) => {
+    const actor = new AppActor(callbacks, owner)
+    return new Proxy(actor, { get(target, key) {
+      if (key === 'dispatch') return (...args) => {
+        const barrier = p.turnBarrier
+        p.turnBarrier = null
+        const result = target.dispatch(...args)
+        return barrier ? Promise.resolve(result).then(() => barrier.promise) : result
+      }
+      const value = target[key]
+      return typeof value === 'function' ? value.bind(target) : value
+    } })
+  })
   hosts.push(host)
   const p = { host, frames: [], snapshots: [], effects: [], errors: [], pending: [], failures: [],
     admissions: [], posts: [], events: [], fields: [], flushes: [], handle: null, binding: null,
@@ -294,7 +307,11 @@ function harness(options = {}) {
     p.binding.bind(p.handle)
     return p.handle
   }
-  p.post = (action = 'fire', value = 0) => accepted(host.postInput(p.handle, input(p.handle, action, value)))
+  p.post = async (action = 'fire', value = 0) => {
+    const seq = accepted(host.postInput(p.handle, input(p.handle, action, value)))
+    await microtasks()
+    return seq
+  }
   p.snapshot = async () => decode(await finish(host.requestSnapshot(p.handle)))
   return p
 }
@@ -318,10 +335,11 @@ test('real sdk.call buffers initial widgetRefresh until actual acquired handle, 
   const p = harness()
   p.begin(programs.refresh.stamp)
   const acquiring = p.host.acquire('', programs.refresh, config('LIVE_PERSISTENT', 'project/version'), p.subscriber)
+  const acquired = await finish(acquiring)
   assert.equal(p.effects.length, 1)
   assert.equal(p.handle, null)
   assert.equal(calls.length, 0)
-  p.handle = await finish(acquiring)
+  p.handle = acquired
   p.fields.push('typed before answer')
   p.binding.bind(p.handle)
   assert.equal(calls.length, 1)
@@ -348,8 +366,8 @@ test('real sdk.call buffers initial widgetRefresh until actual acquired handle, 
 test('real SDK dotted target and explicit foreground intent use actual executeEffect routing', async () => {
   const p = harness()
   await p.acquire()
-  p.post('sdkFire')
-  p.post('foreground')
+  await p.post('sdkFire')
+  await p.post('foreground')
   await pump()
   assert.deepEqual(calls.map(call => [call.route, call.target, call.mode]), [
     ['sdk', sdkTarget, undefined], ['intent', target, 'foreground']
@@ -360,7 +378,7 @@ test('real SDK dotted target and explicit foreground intent use actual executeEf
 test('real handler flat parameters arrive as ordered Map with duplicate replacement and default background mode', async () => {
   const p = harness()
   await p.acquire()
-  p.post('ordered')
+  await p.post('ordered')
   await pump()
   assert.deepEqual(calls[0], { route: 'intent', target, values: [['z', 'last'], ['a', '']], mode: 'background' })
   assert.deepEqual((await p.snapshot()).answers, ['ok'])
@@ -388,7 +406,7 @@ for (const action of ['fire', 'sdkFire']) {
       platform = () => Promise.resolve(text)
       const p = harness()
       await p.acquire()
-      p.post(action)
+      await p.post(action)
       await pump()
       assert.deepEqual((await p.snapshot()).answers, [text])
       assert.equal(p.posts[0].text, text)
@@ -402,7 +420,7 @@ for (const action of ['fire', 'sdkFire']) {
 test('consent refusal returns exact string through real result handler and never calls platform', async () => {
   const p = harness({ askBeforeCalls: true })
   await p.acquire()
-  p.post()
+  await p.post()
   assert.equal(calls.length, 0)
   assert.equal(p.pending.at(-1).rawTarget, target)
   p.bridge.refusePending()
@@ -415,20 +433,20 @@ test('consent refusal returns exact string through real result handler and never
 test('consent grants are keyed by captured stamp and raw target; replacement version must ask again', async () => {
   const p = harness({ askBeforeCalls: true })
   await p.acquire()
-  p.post()
+  await p.post()
   p.bridge.allowPending()
   await pump()
   assert.deepEqual(remembered, [[programs.basic.vbc2, target]])
-  p.post()
+  await p.post()
   await pump()
   assert.equal(calls.length, 2)
-  p.post('sdkFire')
+  await p.post('sdkFire')
   assert.equal(p.pending.at(-1).rawTarget, sdkTarget)
   assert.equal(calls.length, 2)
   p.bridge.refusePending()
   await pump()
   await p.replace()
-  p.post()
+  await p.post()
   assert.equal(calls.length, 2)
   assert.equal(p.pending.at(-1).rawTarget, target)
   assert.deepEqual(consentChecks.at(-1), [programs.newer.vbc2, target])
@@ -461,7 +479,7 @@ test('no-consent real platform calls overlap and dispatch in completion order', 
   platform = () => calls.length === 1 ? first.promise : second.promise
   const p = harness()
   await p.acquire()
-  p.post('pair')
+  await p.post('pair')
   assert.equal(calls.length, 2)
   second.resolve('second')
   await pump()
@@ -481,7 +499,7 @@ for (const [name, fail, text] of [
     platform = fail
     const p = harness()
     await p.acquire()
-    p.post()
+    await p.post()
     await pump()
     assert.deepEqual((await p.snapshot()).answers, [text])
     assert.equal(p.posts[0].text, text)
@@ -534,6 +552,7 @@ test('wrong app/generation and duplicate requests are rejected before and after 
   const p = harness()
   p.begin(programs.refresh.stamp)
   const acquiring = p.host.acquire('', programs.refresh, config(), p.subscriber)
+  await finish(acquiring)
   const original = p.effects[0]
   p.binding.onEffectRequest({ ...original, appId: 'wrong' })
   p.binding.onEffectRequest({ ...original, vmGeneration: original.vmGeneration + 1 })
@@ -553,6 +572,7 @@ test('prebind buffer snapshots request and params and cannot be rebound to a sec
   const p = harness()
   p.begin(programs.refresh.stamp)
   const acquiring = p.host.acquire('', programs.refresh, config(), p.subscriber)
+  await finish(acquiring)
   const original = p.effects[0]
   original.params[1] = 'mutated-after-buffer'
   original.rawTarget = 'mutated.target'
@@ -571,6 +591,7 @@ test('replacement widgetRefresh buffers before returned handle and old binding n
   const oldHandle = p.handle, oldBinding = p.binding
   p.begin(programs.refresh.stamp)
   const replacing = p.host.replaceProgram(oldHandle, programs.refresh, config())
+  await finish(replacing)
   assert.equal(p.effects.length, 1)
   assert.equal(calls.length, 0)
   const emitted = p.effects[0]
@@ -608,7 +629,7 @@ for (const lifecycle of ['release', 'replace', 'promotion', 'dispose']) {
     platform = () => answer.promise
     const p = harness()
     await p.acquire()
-    p.post()
+    await p.post()
     const oldHandle = p.handle, oldBinding = p.binding, oldEffect = p.effects[0]
     p.bridge.invalidate()
     if (lifecycle === 'release') {
@@ -633,7 +654,7 @@ for (const lifecycle of ['release', 'replace', 'promotion', 'dispose']) {
     if (lifecycle !== 'dispose') {
       assert.deepEqual((await p.snapshot()).answers, [])
       platform = () => Promise.resolve('new result')
-      p.post()
+      await p.post()
       await pump()
       assert.deepEqual((await p.snapshot()).answers, ['new result'])
       assert.equal(p.posts[0].handle, p.handle)
@@ -647,7 +668,7 @@ test('captureValidity cancellation while field flush awaits suppresses result', 
   const p = harness({ captureValidity: () => () => valid })
   await p.acquire()
   p.flushHook = () => gate.promise
-  p.post()
+  await p.post()
   await microtasks()
   assert.equal(p.flushes.length, 1)
   valid = false
@@ -663,12 +684,12 @@ test('binding replacement while awaiting field flush drops old result and preser
   const p = harness()
   await p.acquire()
   p.flushHook = () => gate.promise
-  p.post()
+  await p.post()
   await microtasks()
   await p.replace()
   gate.resolve()
   p.flushHook = null
-  p.post()
+  await p.post()
   await pump()
   assert.equal(p.posts.length, 1)
   assert.equal(p.posts[0].handle, p.handle)
@@ -679,7 +700,7 @@ test('readyToPost false defers without timers and explicit flush resumes exactly
   let ready = false
   const p = harness({ readyToPost: () => ready })
   await p.acquire()
-  p.post()
+  await p.post()
   await microtasks()
   assert.equal(p.posts.length, 0)
   assert.equal(timers.size, 0)
@@ -698,7 +719,7 @@ test('REJECTED admission is terminal and never retried or reexecuted', async () 
   platform = () => answer.promise
   const p = harness()
   await p.acquire()
-  p.post()
+  await p.post()
   await finish(p.host.release(p.handle))
   answer.resolve('late')
   await microtasks()
@@ -722,9 +743,9 @@ test('in-flight field flush and older actions are admitted before result', async
     await gate.promise
     accepted(p.host.postInput(p.handle, input(p.handle, 'edit', 'composed', 'FIELD')))
   }
-  p.post()
+  await p.post()
   await microtasks()
-  p.post('add', 5)
+  await p.post('add', 5)
   assert.equal(p.posts.length, 0)
   gate.resolve()
   await pump()
@@ -742,7 +763,7 @@ test('composition deferred promise flush keeps completion queued until compositi
   p.flushHook = () => composition.promise.then(() => {
     accepted(p.host.postInput(p.handle, input(p.handle, 'edit', 'IME committed', 'FIELD')))
   })
-  p.post('pair')
+  await p.post('pair')
   await microtasks()
   assert.equal(p.posts.length, 0)
   assert.equal(calls.length, 2)
@@ -760,9 +781,12 @@ function fillMailbox(p) {
   now += 9
 }
 function fillOnNextFrame(p) {
+  const barrier = deferred()
+  p.turnBarrier = barrier
   p.frameHook = () => {
     p.frameHook = null
     fillMailbox(p)
+    setTimeout(() => barrier.resolve(), 0)
   }
 }
 
@@ -771,7 +795,7 @@ test('real mailbox full256 in onFrame yields, rejects result BACKPRESSURE then w
   const p = harness()
   await p.acquire()
   fillOnNextFrame(p)
-  p.post()
+  await p.post()
   assert.equal(calls.length, 1)
   await microtasks()
   assert.equal(p.posts.length, 1)
@@ -797,7 +821,7 @@ test('retained BACKPRESSURE completions retry FIFO in completion order, not requ
   const p = harness()
   await p.acquire()
   fillOnNextFrame(p)
-  p.post('pair')
+  await p.post('pair')
   second.resolve('second')
   await microtasks()
   first.resolve('first')
@@ -822,7 +846,7 @@ test('reentrant writable while still blocked must not spin microtasks or busy re
     return admission
   }
   fillOnNextFrame(p)
-  p.post()
+  await p.post()
   await microtasks()
   assert(attempts <= 2, 'reentrant writable repeatedly retried unchanged BACKPRESSURE: ' + attempts)
   assert.equal(timers.size, 1)
@@ -831,26 +855,31 @@ test('reentrant writable while still blocked must not spin microtasks or busy re
 })
 
 for (const lifecycle of ['invalidate', 'replace']) {
-  test('synchronous post fast-frame callback ' + lifecycle + ' cannot shift another result or notify stale admission', async () => {
+  test('synchronous post callback ' + lifecycle + ' cannot shift another result or notify stale admission', async () => {
+    const answer = deferred()
+    platform = () => answer.promise
     const p = harness()
     await p.acquire()
-    p.post('pair')
+    await p.post('pair')
     let replacing = null
-    p.frameHook = () => {
-      p.frameHook = null
+    p.postHook = (handle, id, text, post) => {
+      p.postHook = null
+      const admission = post(handle, id, text)
       if (lifecycle === 'invalidate') p.bridge.invalidate()
       else {
         p.begin(programs.newer.stamp)
         replacing = p.host.replaceProgram(p.handle, programs.newer, config())
       }
+      return admission
     }
+    answer.resolve('ok')
     await pump()
     assert.equal(p.posts.length, 1)
     assert.equal(p.admissions.length, 0)
     if (replacing) {
       p.handle = await finish(replacing)
       p.binding.bind(p.handle)
-      p.post()
+      await p.post()
       await pump()
       assert.deepEqual((await p.snapshot()).answers, ['ok'])
       assert.equal(p.posts.length, 2)
@@ -860,17 +889,22 @@ for (const lifecycle of ['invalidate', 'replace']) {
   })
 }
 
-test('synchronous post fast-frame reentrant refusal appends result without losing or duplicating queued completion', async () => {
+test('synchronous post reentrant refusal appends result without losing or duplicating queued completion', async () => {
+  const answer = deferred()
+  platform = () => answer.promise
   const p = harness({ askBeforeCalls: true })
   await p.acquire()
   grants.set(programs.basic.vbc2, new Set([target]))
-  p.post('pair')
-  p.post('sdkFire')
+  await p.post('pair')
+  await p.post('sdkFire')
   assert.equal(p.pending.at(-1).rawTarget, sdkTarget)
-  p.frameHook = () => {
-    p.frameHook = null
+  p.postHook = (handle, id, text, post) => {
+    p.postHook = null
+    const admission = post(handle, id, text)
     p.bridge.refusePending()
+    return admission
   }
+  answer.resolve('ok')
   await pump()
   assert.deepEqual((await p.snapshot()).answers, ['ok', 'ok', 'declined by the person'])
   assert.equal(p.posts.length, 3)
@@ -895,7 +929,7 @@ for (const point of ['captureValidity', 'validity', 'flush', 'readyToPost', 'pos
     await p.acquire()
     if (point === 'flush') p.flushHook = fail
     if (point === 'postEffectResult') p.postHook = (handle, id, text, post) => { fail(); return post(handle, id, text) }
-    p.post('pair')
+    await p.post('pair')
     await pump()
     assert.equal(p.failures.length, 1)
     assert.equal(p.failures[0].error, failure)
@@ -910,7 +944,7 @@ for (const point of ['captureValidity', 'validity', 'flush', 'readyToPost', 'pos
   })
 }
 
-test('failed replacement binding cannot resurrect buffered requests or disturb the restored old actor', async () => {
+test('failed memory replacement binding cannot resurrect buffered requests while the old actor remains usable', async () => {
   const p = harness()
   await p.acquire()
   const oldHandle = p.handle, oldBinding = p.binding
@@ -926,7 +960,12 @@ test('failed replacement binding cannot resurrect buffered requests or disturb t
   assert.equal(calls.length, 0)
   p.begin(programs.basic.vbc2)
   p.binding.bind(oldHandle)
-  p.post()
+  const failedHandle = { ...oldHandle, vmGeneration: oldHandle.vmGeneration + 1 }
+  assert.deepEqual(p.host.postInput(failedHandle, input(failedHandle, 'fire')), { status: 'REJECTED', reason: 'INVALID_HANDLE' })
+  await assert.rejects(p.host.requestSnapshot(failedHandle), error => error.code === 'INVALID_HANDLE')
+  assert.equal(p.posts.length, 0)
+  assert.deepEqual((await p.snapshot()).answers, [])
+  await p.post()
   await pump()
   assert.deepEqual((await p.snapshot()).answers, ['ok'])
   assert.equal(p.posts.length, 1)
@@ -941,7 +980,7 @@ test('rejected asynchronous field flush reports failure and removes only that re
     once = false
     return Promise.reject(Error('field flush rejected'))
   }
-  p.post('pair')
+  await p.post('pair')
   await pump()
   assert.equal(p.failures.length, 1)
   assert.equal(p.failures[0].error.message, 'field flush rejected')
@@ -957,7 +996,7 @@ test('throwing failure reporter is contained and later completion still posts', 
   p.flushHook = () => {
     if (once) { once = false; throw Error('flush failure') }
   }
-  p.post('pair')
+  await p.post('pair')
   await pump()
   assert.equal(reported.length, 1)
   assert.equal(reported[0][1].message, 'flush failure')
@@ -969,7 +1008,7 @@ test('COALESCED effect result is reported as invalid and never retried', async (
   const p = harness()
   await p.acquire()
   p.postHook = () => ({ status: 'COALESCED' })
-  p.post()
+  await p.post()
   await pump()
   assert.equal(p.failures.length, 1)
   assert.equal(p.failures[0].error.message, 'EFFECT_RESULT cannot be coalesced')
@@ -999,7 +1038,7 @@ for (const previous of [false, true]) {
     p.binding = newest
     if (!previous) p.handle = await finish(p.host.acquire('', programs.basic, config(), p.subscriber))
     newest.bind(p.handle)
-    p.post()
+    await p.post()
     await pump()
     assert.equal(calls.length, 1)
     assert.equal(p.posts.length, 1)
@@ -1116,7 +1155,7 @@ for (const point of ['begin', 'invalidate']) {
     armed = true
     if (point === 'invalidate') p.bridge.invalidate()
     await p.acquire()
-    p.post('pair')
+    await p.post('pair')
     await pump()
     assert.equal(p.failures.length, 1)
     assert.equal(p.failures[0].effect, null)
@@ -1129,7 +1168,7 @@ test('field flush barrier returning bridge.flush does not await itself and drain
   const p = harness()
   await p.acquire()
   p.flushHook = () => p.bridge.flush()
-  p.post('pair')
+  await p.post('pair')
   await pump()
   assert.equal(p.posts.length, 2)
   assert.equal(p.flushes.length, 2)
@@ -1143,7 +1182,7 @@ test('active flush is an immediately resolved kick, not a completion barrier', a
   const p = harness()
   await p.acquire()
   p.flushHook = () => gate.promise
-  p.post('pair')
+  await p.post('pair')
   await microtasks()
   assert.equal(p.flushes.length, 1)
   await finish(p.bridge.flush())
@@ -1165,7 +1204,7 @@ for (const [text, outcome] of [['ok', 'OK'], ['declined code=7', 'DECLINED'], ['
     platform = () => Promise.resolve(text)
     const p = harness()
     await p.acquire()
-    p.post()
+    await p.post()
     await pump()
     const effect = p.effects[0]
     const requests = traces.filter(record => record.event === 'EFFECT_REQUEST')
@@ -1192,7 +1231,7 @@ test('BACKPRESSURE emits no premature result trace and retry emits one host resu
   const p = harness()
   await p.acquire()
   fillOnNextFrame(p)
-  p.post()
+  await p.post()
   await microtasks()
   assert.equal(p.posts[0].admission.status, 'BACKPRESSURE')
   assert.equal(traces.filter(record => record.event === 'EFFECT_REQUEST').length, 1)
@@ -1213,7 +1252,7 @@ for (const phase of ['buffered', 'consent', 'in-flight', 'queued', 'backpressure
   test('stale bridge ' + phase + ' emits exactly one drop per effect and no duplicate request trace', async () => {
     const answer = deferred(), barrier = deferred()
     let valid = true
-    if (phase === 'in-flight') platform = () => answer.promise
+    if (phase === 'in-flight' || phase === 'invalidity') platform = () => answer.promise
     const p = harness({ askBeforeCalls: phase === 'consent', captureValidity: () => () => valid,
       readyToPost: () => phase !== 'queued' })
     if (phase === 'buffered') {
@@ -1223,8 +1262,8 @@ for (const phase of ['buffered', 'consent', 'in-flight', 'queued', 'backpressure
       await p.acquire()
       if (phase === 'barrier') p.flushHook = () => barrier.promise
       if (phase === 'backpressure') fillOnNextFrame(p)
-      p.post(phase === 'consent' ? 'pair' : 'fire')
-      if (phase === 'invalidity') valid = false
+      await p.post(phase === 'consent' ? 'pair' : 'fire')
+      if (phase === 'invalidity') { valid = false; answer.resolve('late') }
       await microtasks()
     }
     const oldBinding = p.binding
@@ -1281,6 +1320,7 @@ for (const lifecycle of ['rebind', 'invalidate']) {
     } })
     const oldBinding = p.begin(program.vbc2)
     const acquiring = p.host.acquire('', program, config(), p.subscriber)
+    await finish(acquiring)
     assert.equal(p.effects.length, 3)
     assert.equal(calls.length, 0)
     assert.deepEqual(p.pending, [null])
@@ -1302,7 +1342,7 @@ for (const lifecycle of ['rebind', 'invalidate']) {
     oldBinding.bind(p.handle)
     for (const effect of effects) oldBinding.onEffectRequest(effect)
     oldBinding.failBinding()
-    p.post()
+    await p.post()
     assert.equal(p.pending.at(-1).effectId, p.effects[3].effectId)
     p.bridge.allowPending()
     await pump()
@@ -1363,7 +1403,7 @@ for (const lifecycle of ['invalidate', 'rebind']) {
       const p = harness()
       await p.acquire()
       const oldBinding = p.binding, oldHandle = p.handle
-      p.post('pair')
+      await p.post('pair')
       const effects = [...p.effects]
       assert.equal(calls.length, 2)
       assert.equal(traces.filter(record => record.event === 'EFFECT_RESULT').length, 0)
@@ -1384,7 +1424,7 @@ for (const lifecycle of ['invalidate', 'rebind']) {
       oldBinding.failBinding()
       assert.equal(calls.length, 2)
       platform = () => Promise.resolve('new binding')
-      p.post()
+      await p.post()
       await pump()
       assert.equal(p.posts.length, 1)
       assert.equal(p.posts[0].handle, p.handle)
@@ -1414,7 +1454,7 @@ for (const buffered of [false, true]) {
     platform = () => answer.promise
     const p = harness()
     if (buffered) await p.acquire(programs.refresh)
-    else { await p.acquire(); p.post('pair') }
+    else { await p.acquire(); await p.post('pair') }
     const state = p.bridge.binding
     assert(state.owners instanceof Map)
     assert.equal(state.owners.size, p.effects.length)
@@ -1455,8 +1495,8 @@ test('same effect id and generation stay session-isolated across actors and brid
   const p = harness(), q = harness()
   await p.acquire()
   await q.acquire()
-  p.post()
-  q.post()
+  await p.post()
+  await q.post()
   const first = p.effects[0], second = q.effects[0]
   assert.equal(first.effectId, second.effectId)
   assert.equal(first.vmGeneration, second.vmGeneration)
@@ -1477,7 +1517,7 @@ test('same effect id and generation stay session-isolated across actors and brid
   await finish(p.host.release(p.handle))
   await p.acquire()
   platform = () => Promise.resolve('new actor response')
-  p.post()
+  await p.post()
   const third = p.effects[1]
   assert.equal(third.effectId, first.effectId)
   assert.equal(third.vmGeneration, first.vmGeneration)
@@ -1569,7 +1609,7 @@ const hostBookkeeping = [
 const hostGuardCoverage = {
   roots: ['entry/src/main/ets', 'widget/src/main/ets'],
   extensions: ['.ets', '.ts', '.tsx', '.js'],
-  limits: 'Bounded conservative AST inventory, not an ArkTS type proof: tracks explicit type/import/new and cast-only seeds, local extends subclasses, local assignment aliases, receiver-independent sensitive binding keys, destructuring declarations/assignments and member escapes. File-wide alias names deliberately overapproximate shadowed/unrelated receivers and sensitive object-literal keys, including P2 counters/log declarations. Thirteen approved safety-scope/record/hook/invoke/queueSdk/decode bodies, five AppActorTurnCoordinator constructor/runTurn/publication/fence bodies and two P2Host safety/invoke forwarding bodies pin enclosing control. Coordinator permissions return to its owned false baseline outside VM guard settlement; the VM guard restores its captured entry permission. Benchmark hosts queue/introspect locally without adapter dispatch; benchmark diagnostics and other owner scopes pin ordered sites only, not control-flow equivalence. Token-aware printer normalization preserves literal whitespace. TypeScript parser recovery is used for ArkUI syntax. No inter-file/interprocedural alias inference, reflective string synthesis, eval, runtime/native alias proof, generated sources, other roots, journal-inactive validation or production transaction validation; StateManager B root classification is manually reviewed, not body-pinned here.'
+  limits: 'Bounded conservative AST inventory, not an ArkTS type proof: tracks explicit type/import/new and cast-only seeds, local extends subclasses, local assignment aliases, receiver-independent sensitive binding keys, destructuring declarations/assignments and member escapes. File-wide alias names deliberately overapproximate shadowed/unrelated receivers and sensitive object-literal keys, including P2 counters/log declarations. Thirteen approved safety-scope/record/hook/invoke/queueSdk/decode bodies, six AppActorTurnCoordinator constructor/runTurn/publication/executePure/fence bodies and two P2Host safety/invoke forwarding bodies pin enclosing control. Coordinator permissions return to its owned false baseline outside VM guard settlement; the VM guard restores its captured entry permission. Benchmark hosts queue/introspect locally without adapter dispatch; benchmark diagnostics and other owner scopes pin ordered sites only, not control-flow equivalence. Token-aware printer normalization preserves literal whitespace. TypeScript parser recovery is used for ArkUI syntax. No inter-file/interprocedural alias inference, reflective string synthesis, eval, runtime/native alias proof, generated sources, other roots, journal-inactive validation or production transaction validation; StateManager B root classification is manually reviewed, not body-pinned here.'
 }
 const hostBaseline = {
   'entry/src/main/ets/components/VeraLiveTree.ets:<module>': ["import { VeraUiNode } from '../vera/VeraUi';"],
@@ -1577,8 +1617,8 @@ const hostBaseline = {
   'entry/src/main/ets/runtime/AppActor.ets:<module>': [
     "import { UiHostEnvironment, HostEffect, VeraUiNode, decodeVeraUi } from '../vera/VeraUi';",
     'export interface AppActorTurnEffects extends AppActorTurnVersion { readonly effects: HostEffect[]; }',
-    'export interface AppActorTurnCallbacks { snapshot: (snapshot: AppActorTurnSnapshot) => void; effects: (delivery: AppActorTurnEffects) => void; render: (version: AppActorTurnVersion, pure: (call: AppActorTurnCall) => RuntimeValue) => void | Promise<void>; error: (error: AppActorTurnError) => void; }',
-    'export interface AppActorCallbacks { render: (paint: boolean, reveal: boolean) => void | Promise<void>; snapshot: (encoded: string) => void; saved: (projectId: string) => void; effects: (effects: HostEffect[]) => void; error: (kind: string, message: string) => void; }'
+    'export interface AppActorTurnCallbacks { snapshot: (snapshot: AppActorTurnSnapshot) => void; effects: (delivery: AppActorTurnEffects) => void; render: (version: AppActorTurnVersion, pure: (call: AppActorTurnCall) => RuntimeValue) => void | Promise<void>; error: (error: AppActorTurnError) => void; durable?: () => void; saved?: (version: AppActorTurnVersion) => void; resumed?: (changed: boolean) => void; }',
+    'export interface AppActorCallbacks { render: (paint: boolean, reveal: boolean, version?: AppActorTurnVersion) => void | Promise<void>; snapshot: (encoded: string, version?: AppActorTurnVersion) => void; saved: (projectId: string) => void; effects: (effects: HostEffect[], version?: AppActorTurnVersion) => void; error: (kind: string, message: string) => void; version?: (version: AppActorTurnVersion) => void; durable?: () => void; identity?: () => string; generation?: () => number; }'
   ],
   'entry/src/main/ets/runtime/AppActor.ets:AppActorTurnCoordinator': ['private host: UiHostEnvironment;'],
   'entry/src/main/ets/runtime/AppActor.ets:AppActorTurnCoordinator.constructor': [
@@ -1589,34 +1629,35 @@ const hostBaseline = {
     'hasEffects = this.host.pendingEffects.length > 0;', 'this.host.effectsAllowed = false;',
     'this.host.pendingEffects = [];', 'this.host.effectsAllowed = false;', 'this.host.pendingEffects = [];',
     'this.host.pendingEffects = [];', 'this.host.pendingEffects = [];', 'this.host.pendingEffects = [];',
-    'effects = this.host.pendingEffects', 'this.host.pendingEffects = [];', 'await this.publish(result, effects, owner);',
+    'effects = this.host.pendingEffects', 'this.host.pendingEffects = [];', 'before !== null && effects.length === 0', 'await this.publish(result, effects, owner, render);',
     'this.host.pendingEffects = [];', 'this.host.effectsAllowed = false;'
   ],
-  'entry/src/main/ets/runtime/AppActor.ets:AppActorTurnCoordinator.publish': ['await this.publishOwned(result, effects, owner);'],
+  'entry/src/main/ets/runtime/AppActor.ets:AppActorTurnCoordinator.publish': ['await this.publishOwned(result, effects, owner, render);'],
   'entry/src/main/ets/runtime/AppActor.ets:AppActorTurnCoordinator.publishOwned': [
     'effects.length > 0', 'this.callbacks.effects({ mode: version.mode, vmGeneration: version.vmGeneration, stateRevision: version.stateRevision, effects: effects });'
   ],
+  'entry/src/main/ets/runtime/AppActor.ets:AppActorTurnCoordinator.executePure': ['this.host.effectsAllowed = false;', 'this.host.pendingEffects = [];'],
   'entry/src/main/ets/runtime/AppActor.ets:AppActorTurnCoordinator.fence': ['this.host.effectsAllowed = false;', 'this.host.pendingEffects = [];'],
   'entry/src/main/ets/runtime/AppActor.ets:AppActor': ['private host: UiHostEnvironment | null = null;'],
-  'entry/src/main/ets/runtime/AppActor.ets:AppActor.initialize': ['this.host = null;', 'this.host = new UiHostEnvironment();', 'this.vm = new VirtualMachine(module, this.host);'],
+  'entry/src/main/ets/runtime/AppActor.ets:AppActorMemoryRuntime': ['host: UiHostEnvironment | null = null;'],
+  'entry/src/main/ets/runtime/AppActor.ets:AppActor.activate': [
+    'this.host = new UiHostEnvironment();',
+    'this.vm = new VirtualMachine(module, this.host!, 5000000, this.safety ? { now: (): number => systemDateTime.getUptime(systemDateTime.TimeType.STARTUP), deadlineMs: 1000 } : null, this.safety ? { journalMode: flags.journalMode } : null);',
+    'this.vm === null || this.host === null || this.safety !== flags.vmJournal',
+    'this.host!.effectsAllowed = false;',
+    "this.coordinator = new AppActorTurnCoordinator(this.manager!, this.vm!, this.host!, this.mode, policy, { snapshot: (snapshot): void => this.publishSnapshot(snapshot.encoded, snapshot), effects: (delivery): void => { if (this.cancelled || this.disposed) { return; } this.align(delivery); this.callback(() => this.callbacks.effects(delivery.effects, delivery)); }, render: (version, pure): Promise<void> => this.render(version, pure), durable: (): void => this.markDurable(), saved: (version): void => { if (this.cancelled || this.disposed) { return; } this.align(version); this.callback(() => this.callbacks.saved(this.persistKey.split('/')[0])); }, resumed: (changed: boolean): void => { if (!this.cancelled && !this.disposed) { StageTrace.emit(this.traceOwner, 'RESUME_STATE_RELOAD', { changed: changed }); } }, error: (error): void => { reportedFailure = error; StageTrace.emit(this.traceOwner, 'ERROR', { kind: error.kind }); if (!this.cancelled && !this.disposed) { this.callback(() => this.callbacks.error(error.kind, error.code)); } } }, this.safety);",
+    'this.callback(() => this.callbacks.effects(delivery.effects, delivery));',
+    'allowed = this.host!.effectsAllowed', 'this.host!.effectsAllowed = false;', 'this.host!.effectsAllowed = allowed;'
+  ],
+  'entry/src/main/ets/runtime/AppActor.ets:AppActor.captureMemoryRuntime': ['runtime.host = this.host;', 'runtime.effectsAllowed = this.host!.effectsAllowed;', 'runtime.pendingEffects = this.host!.pendingEffects;'],
+  'entry/src/main/ets/runtime/AppActor.ets:AppActor.restoreMemoryRuntime': ['this.host = runtime.host;', 'this.host!.effectsAllowed = runtime.effectsAllowed;', 'this.host!.pendingEffects = runtime.pendingEffects;'],
   'entry/src/main/ets/runtime/AppActor.ets:AppActor.clearEffects': ['this.host !== null', 'this.host!.effectsAllowed = false;', 'this.host!.pendingEffects = [];'],
   'entry/src/main/ets/runtime/AppActor.ets:AppActor.dispose': ['this.host = null;'],
-  'entry/src/main/ets/runtime/AppActor.ets:AppActor.view': ['this.host !== null', 'this.host!.effectsAllowed = false;'],
-  'entry/src/main/ets/runtime/AppActor.ets:AppActor.draw': ['this.host !== null', 'this.host!.effectsAllowed = false;'],
-  'entry/src/main/ets/runtime/AppActor.ets:AppActor.buildScene': ['this.host !== null', 'this.host!.effectsAllowed = false;'],
-  'entry/src/main/ets/runtime/AppActor.ets:AppActor.dispatch': ['this.host !== null', 'this.host!.effectsAllowed = true;', 'this.host !== null', 'this.host!.effectsAllowed = false;'],
-  'entry/src/main/ets/runtime/AppActor.ets:AppActor.runWidgetRefresh': ['this.host !== null', 'this.host!.effectsAllowed = true;', 'this.host !== null', 'this.host!.effectsAllowed = false;'],
-  'entry/src/main/ets/runtime/AppActor.ets:AppActor.frameHandlers': ['this.host !== null', 'this.host!.effectsAllowed = true;', 'this.host !== null', 'this.host!.effectsAllowed = false;'],
-  'entry/src/main/ets/runtime/AppActor.ets:AppActor.move': ['this.host !== null', 'this.host!.effectsAllowed = true;', 'this.host !== null', 'this.host!.effectsAllowed = false;'],
-  'entry/src/main/ets/runtime/AppActor.ets:AppActor.seeded': ['this.host !== null', 'this.host!.effectsAllowed = false;'],
-  'entry/src/main/ets/runtime/AppActor.ets:AppActor.drainEffects': [
-    "!this.ready() || this.mode === 'PREVIEW' || this.host === null", 'effects: HostEffect[] = this.host!.pendingEffects',
-    'effects.length === 0', 'this.host!.pendingEffects = [];', 'this.callbacks.effects(effects);'
-  ],
+  'entry/src/main/ets/runtime/AppActor.ets:AppActor.pure': ['this.host!.effectsAllowed = false;'],
   'entry/src/main/ets/runtime/InProcessHost.ets:<module>': ["import { HostEffect, VeraUiNode } from '../vera/VeraUi';"],
   'entry/src/main/ets/vera/VeraLiveWidget.ets:<module>': ["import { UiHostEnvironment, VeraUiNode, decodeVeraUi, formatVeraNumber } from './VeraUi';"],
   'entry/src/main/ets/vera/VeraLiveWidget.ets:WidgetSession': ['private host: UiHostEnvironment = new UiHostEnvironment();'],
-  'entry/src/main/ets/vera/VeraLiveWidget.ets:WidgetSession.constructor': ['this.vm = new VirtualMachine(module, this.host, LIVE_MAX_STEPS);'],
+  'entry/src/main/ets/vera/VeraLiveWidget.ets:WidgetSession.constructor': ['this.vm = readOnlyFlags === null ? new VirtualMachine(module, this.host, LIVE_MAX_STEPS) : new VirtualMachine(module, this.host, LIVE_MAX_STEPS, { now: (): number => Date.now(), deadlineMs: 1000 }, { journalMode: readOnlyFlags.journalMode });'],
   'entry/src/main/ets/vera/VeraLiveWidget.ets:WidgetSession.settle': ['this.host.effectsAllowed = true;', 'this.host.pendingEffects = [];', 'this.host.effectsAllowed = false;', 'this.host.pendingEffects = [];'],
   'entry/src/main/ets/vera/VeraLiveWidget.ets:WidgetSession.frame': ['this.host.effectsAllowed = false;'],
   'entry/src/main/ets/vera/VeraLiveWidget.ets:WidgetSession.refresh': ['this.host.effectsAllowed = true;', 'this.host.pendingEffects = [];', 'this.host.effectsAllowed = false;', 'this.host.pendingEffects = [];'],
@@ -1692,8 +1733,12 @@ const hostBaseline = {
   'entry/src/main/ets/vera/VeraUi.ets:UiHostEnvironment': [
     'pendingEffects: HostEffect[] = [];', 'effectsAllowed: boolean = false;', 'private nextEffectId: number = 1;',
     'private safetyRecord: UiHostSafetyRecord | null = null;', 'private safetyPure: boolean = false;', 'private safetyInvalid: boolean = false;', 'private invoking: boolean = false;',
+    'private diagnosticObserving: boolean = false;', 'observeDiagnostics(observer: () => void): void',
     'beginSafetyTurn(reserve: () => void): VmHostSafetyScope', 'setSafetyPure(pure: boolean): void', 'private checkSafetyIdle(): void', 'private settleSafety(record: UiHostSafetyRecord, outcome: string): void',
     'invoke(module: string, name: string, args: RuntimeValue[], awaited: boolean): RuntimeValue', 'private invokeValue(module: string, name: string, args: RuntimeValue[], awaited: boolean): RuntimeValue', 'private queueSdk(args: RuntimeValue[]): RuntimeValue'
+  ],
+  'entry/src/main/ets/vera/VeraUi.ets:UiHostEnvironment.observeDiagnostics': [
+    'previous = this.diagnosticObserving', 'this.diagnosticObserving = true;', 'this.diagnosticObserving = previous;'
   ],
   'entry/src/main/ets/vera/VeraUi.ets:UiHostEnvironment.beginSafetyTurn': [
     'this.checkSafetyIdle();', 'this.safetyRecord !== null || this.safetyPure', 'this.safetyRecord !== null', 'this.safetyRecord.failed = true;',
@@ -1701,7 +1746,7 @@ const hostBaseline = {
     'this.settleSafety(record, outcome);'
   ],
   'entry/src/main/ets/vera/VeraUi.ets:UiHostEnvironment.setSafetyPure': ['this.checkSafetyIdle();', 'this.safetyPure = pure;'],
-  'entry/src/main/ets/vera/VeraUi.ets:UiHostEnvironment.checkSafetyIdle': ['this.invoking', 'this.safetyRecord !== null', 'this.safetyRecord.failed = true;', 'this.safetyInvalid'],
+  'entry/src/main/ets/vera/VeraUi.ets:UiHostEnvironment.checkSafetyIdle': ['this.diagnosticObserving', 'this.invoking', 'this.safetyRecord !== null', 'this.safetyRecord.failed = true;', 'this.safetyInvalid'],
   'entry/src/main/ets/vera/VeraUi.ets:UiHostEnvironment.settleSafety': [
     'this.checkSafetyIdle();', 'this.safetyRecord !== record', 'this.safetyRecord !== null', 'this.safetyRecord.failed = true;', 'this.pendingEffects = record.queue;', 'this.nextEffectId = record.nextId;',
     'this.pendingEffects.length = 0;', 'this.pendingEffects = record.queue;', 'this.safetyInvalid = true;', 'this.effectsAllowed = record.allowed;', 'this.safetyPure = false;', 'this.safetyRecord = null;'
@@ -1754,6 +1799,7 @@ const hostBodyBaseline = {
     this.mode = mode
     this.policy = policy
     this.callbacks = callbacks
+    this.safety = safety
     this.generation = state.status().vmGeneration
     if (state.status().mode !== mode || host.pendingEffects.length !== 0) {
       throw new AppActorTurnError('STATE_VALIDATION_FAILED', 'state')
@@ -1770,7 +1816,8 @@ const hostBodyBaseline = {
     let owner = this.owner()
     let commitClass = this.policy.classify(source, persist)
     let admitted = calls.map((call: AppActorTurnCall): AppActorTurnCall => {
-      return { entry: call.entry, args: call.args.slice(), useState: call.useState }
+      return { entry: call.entry, args: call.args.slice(), useState: call.useState,
+        value: call.value, prepare: call.prepare }
     })
     this.currentPhase = 'EXECUTING'
     let release: () => void = (): void => {}
@@ -1784,6 +1831,10 @@ const hostBodyBaseline = {
         this.assertAvailable()
         if (this.checkpointReload) { await this.publishCheckpointReload(owner) }
       }
+      let before: string | null = null
+      if (skipIfSame) {
+        try { before = this.state.captureWorkingSnapshot() } catch (_error) {}
+      }
       let tx: StateTransaction | null = null
       let submitted = false
       let result: StateAcceptanceResult
@@ -1793,7 +1844,9 @@ const hostBodyBaseline = {
         this.host.effectsAllowed = this.mode !== 'PREVIEW'
         for (let call of admitted) {
           let args = call.useState ? [this.state.getWorkingState()].concat(call.args) : call.args
-          let value = this.vm.execute(call.entry, args)
+          if (!this.safety) { this.state.setWorkingState(tx, this.state.getWorkingState()) }
+          let value = call.value === undefined ? this.vm.execute(call.entry, args) : call.value
+          if (call.prepare !== undefined) { value = call.prepare(value) }
           this.assertOwner(owner)
           this.state.setWorkingState(tx, value)
           if (this.host.pendingEffects.length > 0) { this.state.markEffects(tx) }
@@ -1803,8 +1856,10 @@ const hostBodyBaseline = {
         this.currentPhase = 'COMMIT_PENDING'
         submitted = true
         this.recovering++
-        try { result = await this.state.commitTurn(tx) }
-        finally { this.recovering-- }
+        try {
+          result = await this.state.commitTurn(tx)
+          if (this.mode === 'LIVE_PERSISTENT' && result.status === 'COMMITTED') { this.callbacks.durable?.() }
+        } finally { this.recovering-- }
       } catch (error) {
         if (tx !== null && !submitted) {
           try { this.state.rollbackTurn(tx) }
@@ -1862,13 +1917,17 @@ const hostBodyBaseline = {
       this.host.pendingEffects = []
       this.currentPhase = 'PUBLISHING'
       this.flushCheckpoint(owner)
-      await this.publish(result, effects, owner)
+      let render = true
+      if (before !== null && effects.length === 0) {
+        try { render = this.state.captureWorkingSnapshot() !== before } catch (_error) {}
+      }
+      await this.publish(result, effects, owner, render)
       return result
     } catch (error) {
       this.host.pendingEffects = []
       if (this.mode === 'PREVIEW') { throw error as Error }
       if (!this.owns(owner)) { throw new AppActorTurnError('STATE_UNAVAILABLE', 'state') }
-      throw this.issue(error as Error, 'handler')
+      throw this.issue(error as Error, source === 'INIT' ? 'init' : source === 'CARRY' ? 'carry' : 'handler')
     } finally {
       this.host.effectsAllowed = false
       this.observeFault()
@@ -1879,7 +1938,7 @@ const hostBodyBaseline = {
   }`,
   'entry/src/main/ets/runtime/AppActor.ets:AppActorTurnCoordinator.publish': `{
     this.publications++
-    try { await this.publishOwned(result, effects, owner) }
+    try { await this.publishOwned(result, effects, owner, render) }
     finally { this.publications-- }
   }`,
   'entry/src/main/ets/runtime/AppActor.ets:AppActorTurnCoordinator.publishOwned': `{
@@ -1912,7 +1971,17 @@ const hostBodyBaseline = {
       if (failure === null) { failure = new AppActorTurnError((error as Error).message, 'effects', result) }
     }
     this.assertOwner(owner)
+    if (result?.status === 'COMMITTED') {
+      try { this.notifySaved(owner, version) }
+      catch (error) {
+        if (failure === null) { failure = new AppActorTurnError((error as Error).message, 'save', result) }
+      }
+    }
     this.assertAvailable()
+    if (!render) {
+      if (failure !== null) { throw failure }
+      return
+    }
     let reading = true
     let pure = (call: AppActorTurnCall): RuntimeValue => {
       this.assertOwner(owner)
@@ -1921,15 +1990,49 @@ const hostBodyBaseline = {
       return this.executePure(call)
     }
     try {
-      let delivery: void | Promise<void>
-      try { delivery = this.callbacks.render(version, pure) }
-      finally { reading = false }
-      await delivery
+      await this.callbacks.render(version, pure)
     } catch (error) {
       if (failure === null) { failure = new AppActorTurnError((error as Error).message, 'render', result) }
-    }
+    } finally { reading = false }
     this.assertOwner(owner)
     if (failure !== null) { throw failure }
+  }`,
+  'entry/src/main/ets/runtime/AppActor.ets:AppActorTurnCoordinator.executePure': `{
+    let owner = this.owner()
+    let root = this.state.getWorkingState()
+    if (!this.safety) {
+      try {
+        let value = this.vm.execute(call.entry, call.useState ? [root].concat(call.args) : call.args)
+        this.assertOwner(owner)
+        return value
+      } catch (error) {
+        this.currentPhase = 'FAULTED'
+        this.checkpointDelivery = null
+        this.host.effectsAllowed = false
+        this.host.pendingEffects = []
+        let tx: StateTransaction | null = null
+        try {
+          tx = this.state.beginTurn('VOLATILE', this.mode === 'PREVIEW' ? 'INIT' : 'INPUT')
+          this.state.setWorkingState(tx, root)
+        } catch (_error) {} finally {
+          if (tx !== null) {
+            try { this.state.rollbackTurn(tx) } catch (_error) {}
+          }
+        }
+        throw this.retainFailure(error as Error, 'view')
+      }
+    }
+    let scope = this.vm.beginTurn(new Object(), root)
+    try {
+      let result = this.vm.executePure(call.entry, call.useState ? [root].concat(call.args) : call.args)
+      this.assertOwner(owner)
+      scope.accept()
+      return result
+    } catch (error) {
+      try { scope.rollback() }
+      catch (_error) { this.currentPhase = 'FAULTED' }
+      throw error as Error
+    }
   }`,
   'entry/src/main/ets/runtime/AppActor.ets:AppActorTurnCoordinator.fence': `{
     if (this.fenced) { return }
@@ -1996,6 +2099,7 @@ const hostBodyBaseline = {
     this.safetyPure = pure
   }`,
   'UiHostEnvironment.checkSafetyIdle': `{
+    if (this.diagnosticObserving) { throw new RuntimeTrap('R-TURN', 'host operation during diagnostics') }
     if (this.invoking) {
       if (this.safetyRecord !== null) { this.safetyRecord.failed = true }
       throw new RuntimeTrap('R-TURN', 'host invoke is active')
@@ -2655,7 +2759,7 @@ test('P3 legacy UI registry declarations are values and decode IDs reset indepen
     assert.deepEqual(decoded[0].children.map(node => node.id), [1, 2, 3, 4])
     assert.deepEqual(decoded[0].children.map(node => node.kind), ['surface', 'world', 'ticker', 'backhandler'])
   }
-  assert.deepEqual(Object.keys(p.host).sort(), ['effectsAllowed', 'invoking', 'nextEffectId', 'pendingEffects', 'safetyInvalid', 'safetyPure', 'safetyRecord'])
+  assert.deepEqual(Object.keys(p.host).sort(), ['diagnosticObserving', 'effectsAllowed', 'invoking', 'nextEffectId', 'pendingEffects', 'safetyInvalid', 'safetyPure', 'safetyRecord'])
   assert.equal(p.host.nextEffectId, 1)
   assert.deepEqual(p.host.pendingEffects, [])
   assert.deepEqual(calls, [])

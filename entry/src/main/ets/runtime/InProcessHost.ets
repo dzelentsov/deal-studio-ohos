@@ -1,4 +1,8 @@
-import { AppActor, AppActorCallbacks } from './AppActor'
+import { AppActor, AppActorCallbacks, AppActorCheckpoint, AppActorTurnError, AppActorTurnVersion } from './AppActor'
+import { store } from '../vera/ProjectStore'
+import { scheduleCardRefresh } from '../vera/FormUpdater'
+import type { ProjectStateLifecyclePort, ProjectStateScope, ProjectStateRemovalBarrier,
+  ProjectRemovalOutcome } from '../vera/ProjectStateMigration'
 import { AcquireOptions, ActorHandle, AdmissionResult, AppSubscriber, DrawRequest,
   EffectRequest, FrameEnvelope, HostOperationError, HostStateVersion, InputEvent, InputPayload,
   ProgramRef, RevisionedEffectRequest, RevisionedFrameEnvelope, RuntimeMode, SceneDraw,
@@ -27,6 +31,7 @@ export interface HostActor {
   view(): VeraUiNode | null | Promise<VeraUiNode | null>
   draw(entry: string): GfxOp[] | Promise<GfxOp[]>
   buildScene(entry: string): WorldSpec | Promise<WorldSpec>
+  checkpointBackground?(now: number): AppActorCheckpoint | Promise<AppActorCheckpoint>
   surfaceSave(now: number, editsPending: boolean): string | Promise<string>
   worldSave(now: number, editsPending: boolean, stopping: boolean): string | Promise<string>
   viewDue(now: number): boolean
@@ -35,6 +40,7 @@ export interface HostActor {
   clearEffects(): void
   cancel(): void
   quiesce?(): void | Promise<void>
+  closureConfirmed?(): boolean
   dispose(): void | Promise<void>
 }
 
@@ -52,12 +58,17 @@ function attempt<T>(run: () => T | Promise<T>, failed: (error: Error) => T | Pro
 }
 
 export class HostOperationFailure extends Error {
-  code: HostOperationError
+  readonly code: string
+  readonly handleInvalidated: boolean
+  readonly cause: Error | null
+  cleanupError: Error | null = null
 
-  constructor(code: HostOperationError) {
-    super(code)
+  constructor(code: string, cause: Error | null = null, handleInvalidated: boolean = false) {
+    super(cause === null ? code : cause.message)
     this.name = 'HostOperationError'
     this.code = code
+    this.cause = cause
+    this.handleInvalidated = handleInvalidated
   }
 }
 
@@ -112,6 +123,7 @@ class MailboxEntry {
   options: AcquireOptions | null = null
   saveState: boolean = false
   reopen: boolean = false
+  checkpointOwner: HostPublicationFence | null = null
   resolveHandle: ((handle: ActorHandle) => void) | null = null
   resolveSnapshot: ((encoded: string) => void) | null = null
   resolveVoid: (() => void) | null = null
@@ -131,6 +143,7 @@ class ActorRecord {
   actor: HostActor | null = null
   retiring: HostActor | null = null
   frames: Promise<void>[] = []
+  checkpoints: number = 0
   closing: boolean = false
   starting: boolean = false
   subscriber: AppSubscriber | null
@@ -142,6 +155,7 @@ class ActorRecord {
   inputSeq: number = 0
   appliedSeq: number = 0
   frameSeq: number = 0
+  snapshotSeq: number = 0
   effectSeq: number = 0
   segment: number = 0
   eventSlots: number = 0
@@ -156,9 +170,15 @@ class ActorRecord {
   idleTimer: number = -1
   idleSince: number = 0
   turnFailed: boolean = false
+  reportedErrors: Set<string> = new Set<string>()
+  readKind: string = ''
   firstFrameFailed: boolean = false
   requiringFirstFrame: boolean = false
   deliveries: (() => void)[] | null = null
+  stateRevision: number = 0
+  durable: boolean = false
+  fenced: boolean = false
+  settlementWaiters: (() => void)[] = []
 
   constructor(appId: string, program: ProgramRef, options: AcquireOptions, subscriber: AppSubscriber) {
     this.appId = appId
@@ -173,6 +193,12 @@ export interface HostPublicationFence {
   readonly appId: string
   readonly runtimeMode: RuntimeMode
   readonly vmGeneration: number
+}
+
+interface HostDeliveryOwner {
+  fence: HostPublicationFence
+  subscriber: AppSubscriber | null
+  lease: HostLease | null
 }
 
 function publicationCounter(value: number): boolean {
@@ -247,7 +273,25 @@ export function sameHostPublication(captured: HostPublicationFence, current: Hos
     publicationCounter(captured.vmGeneration) && captured.vmGeneration === current.vmGeneration
 }
 
-export class InProcessHost implements EffectResultHost {
+class HostStateRemovalBarrier implements ProjectStateRemovalBarrier {
+  private drain: () => Promise<void>
+
+  constructor(drain: () => Promise<void>) {
+    this.drain = drain
+  }
+
+  quiesceActorsAndFinalSave(): Promise<void> {
+    return this.drain()
+  }
+
+  drainAllCallersAndStorage(): Promise<void> {
+    return this.drain()
+  }
+
+  release(_outcome: ProjectRemovalOutcome): void {}
+}
+
+export class InProcessHost implements EffectResultHost, ProjectStateLifecyclePort {
   private static instance: InProcessHost | null = null
   private now: () => number
   private registry: Map<string, ActorRecord> = new Map<string, ActorRecord>()
@@ -267,10 +311,78 @@ export class InProcessHost implements EffectResultHost {
   private pending: number = 0
   private idleWaiters: (() => void)[] = []
   private cleanups: WeakMap<Object, Promise<void> | null> = new WeakMap<Object, Promise<void> | null>()
+  private records: Set<ActorRecord> = new Set<ActorRecord>()
+  private unregisterLifecycle: () => void
+  private stateSaved: (projectId: string) => void
 
-  constructor(now: () => number = () => Date.now(), actorFactory: HostActorFactory | null = null) {
+  constructor(now: () => number = () => Date.now(), actorFactory: HostActorFactory | null = null,
+      stateSaved: (projectId: string) => void = scheduleCardRefresh) {
     this.now = now
     this.actorFactory = actorFactory
+    this.stateSaved = stateSaved
+    this.unregisterLifecycle = store.registerStateLifecycle(this)
+  }
+
+  fenceAllAdmissions(scope: ProjectStateScope): ProjectStateRemovalBarrier {
+    let affected: Set<ActorRecord> = new Set<ActorRecord>()
+    let matches = (appId: string): boolean => scope.versionId === undefined ?
+      appId.startsWith(scope.projectId + '/') : appId === scope.projectId + '/' + scope.versionId
+    this.records.forEach((record: ActorRecord): void => {
+      let targeted = record.options.mode === 'LIVE_PERSISTENT' && matches(record.options.persistKey)
+      this.registry.forEach((candidate: ActorRecord, identity: string): void => {
+        if (candidate === record && matches(identity)) { targeted = true }
+      })
+      for (let entry of record.mailbox.concat(record.current === null ? [] : [record.current!])) {
+        if (matches(entry.handle.appId)) { targeted = true }
+        if (entry.options !== null && entry.options.mode === 'LIVE_PERSISTENT' && matches(entry.options.persistKey)) {
+          targeted = true
+        }
+      }
+      if (!targeted) { return }
+      record.fenced = true
+      if (record.idleTimer !== -1) { clearTimeout(record.idleTimer); record.idleTimer = -1 }
+      affected.add(record)
+    })
+    let settlement: Promise<void> | null = null
+    let drain = (): Promise<void> => {
+      if (settlement === null) {
+        let failure: Error | null = null
+        settlement = Promise.all(Array.from(affected).map(async (record: ActorRecord): Promise<void> => {
+          try { await this.retireFencedRecord(record) }
+          catch (error) { if (failure === null) { failure = error as Error } }
+        })).then(() => { if (failure !== null) { throw failure } })
+      }
+      return settlement!
+    }
+    return new HostStateRemovalBarrier(drain)
+  }
+
+  private recordSettled(record: ActorRecord): Promise<void> {
+    if (record.current === null && record.mailbox.length === 0 && record.checkpoints === 0) { return Promise.resolve() }
+    return new Promise<void>((resolve) => { record.settlementWaiters.push(resolve) })
+  }
+
+  private settleRecord(record: ActorRecord): void {
+    if (record.current !== null || record.mailbox.length > 0 || record.checkpoints !== 0) { return }
+    let waiters = record.settlementWaiters
+    record.settlementWaiters = []
+    for (let resolve of waiters) { resolve() }
+  }
+
+  private async retireFencedRecord(record: ActorRecord): Promise<void> {
+    await this.recordSettled(record)
+    let failure: Error | null = null
+    try {
+      if (!record.destroyed && record.actor !== null) {
+        if (record.actor!.quiesce !== undefined) { await record.actor!.quiesce!() }
+        if (record.options.mode === 'LIVE_PERSISTENT' && record.actor!.ready()) {
+          if (!await record.actor!.saveNow()) { throw new HostOperationFailure('ACTOR_NOT_READY') }
+        }
+      }
+    } catch (error) { failure = error as Error }
+    try { await this.destroyRecord(record) }
+    catch (error) { if (failure === null) { failure = error as Error } }
+    if (failure !== null) { throw failure }
   }
 
   whenIdle(): Promise<void> {
@@ -303,6 +415,7 @@ export class InProcessHost implements EffectResultHost {
     try {
       let requested = this.registry.get(appId)
       identity = this.identity(config, config.mode !== 'LIVE_PERSISTENT' && requested !== undefined ? requested : null)
+      if (config.mode === 'LIVE_PERSISTENT') { store.assertStateAdmission(identity) }
       if (config.mode === 'LIVE_PERSISTENT' && appId.length > 0 && appId !== identity) {
         throw new HostOperationFailure('APP_ID_CONFLICT')
       }
@@ -310,13 +423,16 @@ export class InProcessHost implements EffectResultHost {
       return Promise.reject(e as Error)
     }
     let record = this.registry.get(identity)
+    if (record !== undefined && (record.destroyed || record.fenced || record.transitioning || record.closing)) {
+      return Promise.reject(new HostOperationFailure('ACTOR_NOT_READY'))
+    }
     if (record !== undefined && record.leases.size === 0 &&
         (this.now() - record.idleSince >= 5000 || !this.compatible(record, program, config))) {
-      this.destroyRecord(record)
-      record = undefined
+      if (record.current !== null) { return Promise.reject(new HostOperationFailure('ACTOR_NOT_READY')) }
+      return Promise.resolve().then(() => this.destroyRecord(record!))
+        .then(() => this.acquire(appId, program, config, subscriber))
     }
     if (record !== undefined) {
-      if (record.transitioning || record.closing) { return Promise.reject(new HostOperationFailure('ACTOR_NOT_READY')) }
       if (!this.compatible(record, program, config)) {
         return Promise.reject(new HostOperationFailure('APP_ID_CONFLICT'))
       }
@@ -330,6 +446,7 @@ export class InProcessHost implements EffectResultHost {
     let initialize = record === undefined
     if (record === undefined) {
       record = new ActorRecord(identity, this.copyProgram(program), config, subscriber)
+      this.records.add(record)
       this.createActor(record)
       this.registry.set(identity, record)
     }
@@ -545,6 +662,29 @@ export class InProcessHost implements EffectResultHost {
     return promise
   }
 
+  checkpointBackground(): Promise<void> {
+    if (this.disposed) { return Promise.resolve() }
+    let checkpoints: Promise<void>[] = []
+    let failure: Error | null = null
+    this.records.forEach((record: ActorRecord): void => {
+      if (record.destroyed || record.fenced) { return }
+      let handle: ActorHandle = { appId: record.appId, vmGeneration: record.vmGeneration, leaseId: '' }
+      let entry = new MailboxEntry('BACKGROUND', new HostLease(handle, record))
+      entry.checkpointOwner = this.publicationFence(record)
+      let checkpoint = new Promise<void>((resolve, reject) => {
+        entry.resolveVoid = resolve
+        entry.reject = reject
+      })
+      checkpoints.push(checkpoint.catch((error: Error): void => {
+        if (failure === null) { failure = error }
+      }))
+      this.control(record, entry)
+    })
+    return Promise.all(checkpoints).then((): void => {
+      if (failure !== null) { throw failure }
+    })
+  }
+
   notifyEdits(handle: ActorHandle, pending: boolean): void {
     let lease = this.activeLease(handle)
     if (lease !== null) { lease.editsPending = pending }
@@ -561,16 +701,23 @@ export class InProcessHost implements EffectResultHost {
     })
     this.disposePromise = promise
     this.pending++
-    this.registry.forEach((record: ActorRecord) => {
+    let cleanups: Promise<void>[] = []
+    let failed = (error: Error): void => {
+      if (this.disposeFailure === null) { this.disposeFailure = error }
+    }
+    Array.from(this.records).forEach((record: ActorRecord): void => {
       record.actor!.cancel()
       this.discard(record, () => true, 'ACTOR_NOT_READY')
-      if (record.current === null) { this.destroyRecord(record) }
-      else if (record.idleTimer !== -1) { clearTimeout(record.idleTimer); record.idleTimer = -1 }
+      if (record.current === null) {
+        let cleanup = attempt<void>(() => this.destroyRecord(record), failed)
+        if (cleanup instanceof Promise) { cleanups.push(cleanup.catch(failed)) }
+      } else if (record.idleTimer !== -1) { clearTimeout(record.idleTimer); record.idleTimer = -1 }
     })
-    this.registry.clear()
     this.leases.clear()
-    this.pending--
-    this.settleIdle()
+    Promise.all(cleanups).then(() => {
+      this.pending--
+      this.settleIdle()
+    })
     return promise
   }
 
@@ -631,7 +778,7 @@ export class InProcessHost implements EffectResultHost {
     if (this.disposed) { return null }
     let lease = this.leases.get(handle.leaseId)
     if (lease === undefined || lease.state !== 'ACTIVE' || !this.matches(lease, handle) ||
-        lease.record === null || lease.record.destroyed ||
+        lease.record === null || lease.record.destroyed || lease.record.fenced ||
         (!lease.record.transitioning &&
           (lease.record.appId !== handle.appId || lease.record.vmGeneration !== handle.vmGeneration))) { return null }
     return lease
@@ -698,6 +845,10 @@ export class InProcessHost implements EffectResultHost {
   }
 
   private lifecycle(record: ActorRecord, entry: MailboxEntry): Promise<ActorHandle> {
+    try {
+      if (record.fenced) { throw new HostOperationFailure('ACTOR_NOT_READY') }
+      if (entry.options!.mode === 'LIVE_PERSISTENT') { store.assertStateAdmission(entry.options!.persistKey) }
+    } catch (error) { return Promise.reject(error as Error) }
     let promise = new Promise<ActorHandle>((resolve, reject) => {
       entry.resolveHandle = resolve
       entry.reject = reject
@@ -788,6 +939,8 @@ export class InProcessHost implements EffectResultHost {
         this.freeSlot(record, entry)
         record.current = entry
         record.turnFailed = false
+        record.reportedErrors.clear()
+        record.readKind = ''
         this.pending++
         let turn = attempt<void>(() => this.runTurn(record, entry),
           (error: Error): void => { this.failTurn(record, entry, error) })
@@ -815,8 +968,11 @@ export class InProcessHost implements EffectResultHost {
   }
 
   private failTurn(record: ActorRecord, entry: MailboxEntry, error: Error): void {
+    if (entry.kind === 'BACKGROUND') { this.report(record, 'state', error.message) }
     if (entry.reject !== null) { entry.reject!(error) }
-    else { this.report(record, this.turnKind(entry), error.message) }
+    else {
+      this.report(record, error instanceof AppActorTurnError ? error.kind : this.turnKind(entry), error.message)
+    }
   }
 
   private finishTurn(record: ActorRecord, entry: MailboxEntry): void {
@@ -828,6 +984,7 @@ export class InProcessHost implements EffectResultHost {
       this.writable(record)
       this.kick(record)
     }
+    this.settleRecord(record)
     this.settleIdle()
   }
 
@@ -850,7 +1007,7 @@ export class InProcessHost implements EffectResultHost {
   }
 
   private writable(record: ActorRecord): void {
-    if (record.destroyed || record.subscriber === null || record.leases.size === 0) { return }
+    if (record.destroyed || record.fenced || record.subscriber === null || record.leases.size === 0) { return }
     let available = false
     if (record.blockedCritical && record.eventSlots < 256) {
       record.blockedCritical = false
@@ -865,11 +1022,50 @@ export class InProcessHost implements EffectResultHost {
 
   private validEntry(record: ActorRecord, entry: MailboxEntry): boolean {
     return !record.destroyed && entry.lease.record === record && entry.lease.state !== 'RELEASED' &&
-      this.matches(entry.lease, entry.handle) && record.appId === entry.handle.appId &&
-      record.vmGeneration === entry.handle.vmGeneration
+      (entry.kind === 'RELEASE' || this.matches(entry.lease, entry.handle) &&
+        record.appId === entry.handle.appId && record.vmGeneration === entry.handle.vmGeneration)
+  }
+
+  private ownsCheckpoint(record: ActorRecord, entry: MailboxEntry): boolean {
+    let owner = entry.checkpointOwner
+    return !record.destroyed && owner !== null && owner!.incarnation === record.actor &&
+      owner!.appId === record.appId && owner!.runtimeMode === record.options.mode &&
+      owner!.vmGeneration === record.vmGeneration
   }
 
   private runTurn(record: ActorRecord, entry: MailboxEntry): void | Promise<void> {
+    if (entry.kind === 'BACKGROUND') {
+      if (record.fenced || !this.ownsCheckpoint(record, entry)) {
+        throw new HostOperationFailure('ACTOR_NOT_READY')
+      }
+      if (record.options.mode !== 'LIVE_PERSISTENT') { entry.resolveVoid!(); return }
+      let actor = record.actor!
+      if (!record.initialized || !actor.ready()) { throw new HostOperationFailure('ACTOR_NOT_READY') }
+      if (actor.checkpointBackground === undefined) {
+        return chain(actor.worldSave(this.now(), false, true), (result: string): void => {
+          if (result === 'ERROR') { throw new Error('BACKGROUND_CHECKPOINT_FAILED') }
+          entry.resolveVoid!()
+        })
+      }
+      return chain(actor.checkpointBackground!(this.now()), (checkpoint: AppActorCheckpoint): void => {
+        record.checkpoints++
+        this.pending++
+        checkpoint.completion.then((result: string): void => {
+          if (result === 'ERROR') { throw new Error('BACKGROUND_CHECKPOINT_FAILED') }
+          entry.resolveVoid!()
+        }).catch((error: Error): void => {
+          if (this.ownsCheckpoint(record, entry)) {
+            this.report(record, 'state', error.message)
+          }
+          entry.reject!(error)
+        }).finally((): void => {
+          record.checkpoints--
+          this.pending--
+          this.settleRecord(record)
+          this.settleIdle()
+        })
+      })
+    }
     if (!this.validEntry(record, entry)) {
       if ((entry.kind === 'INITIALIZE' || entry.kind === 'ACQUIRE') && entry.lease.record === record) {
         this.removeLease(record, entry.lease)
@@ -883,6 +1079,7 @@ export class InProcessHost implements EffectResultHost {
       return this.finishRelease(record, entry)
     }
     if (entry.kind === 'PROMOTE' || entry.kind === 'REPLACE') {
+      if (record.fenced) { throw new HostOperationFailure('ACTOR_NOT_READY') }
       return this.changeRuntime(record, entry)
     }
     if (!record.initialized || !record.actor!.ready()) { throw new HostOperationFailure('ACTOR_NOT_READY') }
@@ -959,6 +1156,7 @@ export class InProcessHost implements EffectResultHost {
 
   private activate(record: ActorRecord, entry: MailboxEntry): void | Promise<void> {
     let frameSeq = record.frameSeq
+    let snapshotSeq = record.snapshotSeq
     record.starting = true
     return attempt<void>(() => {
       let startup: void | Promise<void> = undefined
@@ -974,7 +1172,12 @@ export class InProcessHost implements EffectResultHost {
         }
         startup = chain(startup, () => {
           if (this.disposed) { throw new HostOperationFailure('ACTOR_NOT_READY') }
-          return chain(record.actor!.notifyStateSnapshot(), () => this.render(record, false))
+          return chain(this.awaitFrames(record), () => {
+            let snapshot = record.snapshotSeq === snapshotSeq ? record.actor!.notifyStateSnapshot() : undefined
+            return chain(snapshot, () => {
+              if (record.frameSeq === frameSeq && !record.firstFrameFailed) { return this.render(record, false) }
+            })
+          })
         })
       }
       return chain(startup, () => chain(this.awaitFrames(record), () => {
@@ -1028,6 +1231,10 @@ export class InProcessHost implements EffectResultHost {
     let oldFrameSeq = record.frameSeq
     let oldAppliedSeq = record.appliedSeq
     let oldFirstFrameFailed = record.firstFrameFailed
+    let oldRevision = record.stateRevision
+    let oldDurable = record.durable
+    let irreversible = false
+    let candidateStarted = false
     let committed = false
     record.transitioning = true
     record.deliveries = []
@@ -1035,28 +1242,52 @@ export class InProcessHost implements EffectResultHost {
     record.requiringFirstFrame = true
     this.registry.set(identity, record)
     return attempt<void>(() => {
-      record.appId = identity
-      record.options = options
-      let startup: void | Promise<void> = undefined
-      if (entry.kind === 'REPLACE') {
-        record.retiring = oldActor
-        record.program = entry.program!
-        record.vmGeneration++
-        record.frameSeq = 0
-        this.createActor(record)
-        startup = record.actor!.initialize(record.program, options, false)
-      } else { startup = record.actor!.promote(options) }
-      return chain(startup, () => chain(this.awaitFrames(record), () => {
-        if (this.disposed || record.destroyed || !record.actor!.ready() || record.turnFailed || record.firstFrameFailed ||
-            record.frameSeq === (entry.kind === 'REPLACE' ? 0 : oldFrameSeq)) {
+      let prepare = oldActor.quiesce === undefined ? undefined : oldActor.quiesce!()
+      prepare = chain(prepare, () => {
+        if (oldOptions.mode !== 'LIVE_PERSISTENT') { return }
+        return chain(oldActor.saveNow(), (saved: boolean): void => {
+          if (!saved) { throw new HostOperationFailure('ACTOR_NOT_READY') }
+          oldRevision = record.stateRevision
+          oldDurable = record.durable
+        })
+      })
+      let startup = chain(prepare, () => {
+        if (this.disposed || record.destroyed || record.fenced) {
           throw new HostOperationFailure('ACTOR_NOT_READY')
         }
-        let save: boolean | Promise<boolean> = true
-        if (entry.kind === 'REPLACE' && oldOptions.mode === 'LIVE_PERSISTENT' && oldActor.worldDirty()) {
-          save = oldActor.saveNow()
+        let retirement: void | Promise<void> = undefined
+        if (entry.kind === 'REPLACE' && oldOptions.mode === 'LIVE_PERSISTENT') {
+          irreversible = true
+          retirement = this.cleanupActor(oldActor)
         }
-        return chain(save, (saved: boolean) => {
-          if (!saved || this.disposed || record.destroyed) { throw new HostOperationFailure('ACTOR_NOT_READY') }
+        return chain(retirement, () => {
+          if (this.disposed || record.destroyed || record.fenced) {
+            throw new HostOperationFailure('ACTOR_NOT_READY')
+          }
+          record.deliveries = []
+          record.appId = identity
+          record.options = options
+          record.stateRevision = 0
+          record.durable = false
+          candidateStarted = true
+          if (entry.kind === 'REPLACE' || options.mode !== 'LIVE_PERSISTENT') { record.vmGeneration++ }
+          if (entry.kind === 'REPLACE') {
+            record.retiring = oldActor
+            record.program = entry.program!
+            record.frameSeq = 0
+            this.createActor(record)
+            return record.actor!.initialize(record.program, options, false)
+          }
+          return record.actor!.promote(options)
+        })
+      })
+      return chain(startup, () => {
+        if (entry.kind === 'PROMOTE') { irreversible = true }
+        return chain(this.awaitFrames(record), () => {
+          if (this.disposed || record.destroyed || record.fenced || !record.actor!.ready() || record.turnFailed ||
+              record.firstFrameFailed || record.frameSeq === (entry.kind === 'REPLACE' ? 0 : oldFrameSeq)) {
+            throw new HostOperationFailure('ACTOR_NOT_READY')
+          }
           record.requiringFirstFrame = false
           let deliveries = record.deliveries!
           record.deliveries = null
@@ -1064,43 +1295,46 @@ export class InProcessHost implements EffectResultHost {
             leaseId: entry.lease.handle.leaseId }
           entry.lease.handle = handle
           if (entry.kind === 'REPLACE') { entry.lease.editsPending = false }
-          this.discard(record, (pending: MailboxEntry): boolean => pending.kind !== 'RELEASE' &&
-            pending.kind !== 'PROMOTE' && pending.kind !== 'REPLACE', 'INVALID_HANDLE')
+          this.discard(record, (pending: MailboxEntry): boolean => pending.kind !== 'RELEASE', 'INVALID_HANDLE')
           for (let pending of record.mailbox) {
-            if ((pending.kind === 'RELEASE' || pending.kind === 'PROMOTE' || pending.kind === 'REPLACE') &&
-                pending.lease === entry.lease) { pending.handle = handle }
+            if (pending.kind === 'RELEASE' && pending.lease === entry.lease) { pending.handle = handle }
           }
           record.effects.clear()
           committed = true
-           let cleanup = entry.kind === 'REPLACE' ? this.cleanupActor(oldActor) : undefined
-           return chain(cleanup, () => {
-             record.retiring = null
+          let cleanup = entry.kind === 'REPLACE' ? this.cleanupActor(oldActor) : undefined
+          return chain(cleanup, () => {
+            record.retiring = null
             for (let delivery of deliveries) {
-              if (this.disposed) { break }
+              if (this.disposed || record.fenced) { break }
               this.safe(delivery)
             }
-            if (this.disposed || !record.actor!.ready()) { throw new HostOperationFailure('ACTOR_NOT_READY') }
+            if (this.disposed || record.fenced || !record.actor!.ready()) {
+              throw new HostOperationFailure('ACTOR_NOT_READY')
+            }
             let refresh: void | Promise<void> = undefined
             if (entry.kind === 'REPLACE' ||
                 (entry.kind === 'PROMOTE' && oldOptions.mode === 'PREVIEW' && options.mode !== 'PREVIEW')) {
               refresh = record.actor!.runWidgetRefresh()
             }
             return chain(refresh, () => chain(this.awaitFrames(record), () => {
-              if (this.disposed || !record.actor!.ready()) { throw new HostOperationFailure('ACTOR_NOT_READY') }
+              if (this.disposed || record.fenced || !record.actor!.ready()) {
+                throw new HostOperationFailure('ACTOR_NOT_READY')
+              }
               if (identity !== oldAppId && this.registry.get(oldAppId) === record) { this.registry.delete(oldAppId) }
               record.transitioning = false
               entry.resolveHandle!(handle)
             }))
           })
         })
-      }))
+      })
     }, (error: Error): void | Promise<void> => {
       record.requiringFirstFrame = false
-      if (committed) {
+      if (committed || irreversible || candidateStarted && record.durable || !oldActor.ready() ||
+          this.disposed || record.destroyed) {
         record.deliveries = null
-        let failure = error
+        let failure = new HostOperationFailure((error as HostOperationFailure).code || 'ACTOR_NOT_READY', error, true)
         let cleanup = attempt<void>(() => this.destroyRecord(record), (cleanupError: Error): void => {
-          failure = cleanupError
+          failure.cleanupError = cleanupError
         })
         return chain(cleanup, () => chain(attempt<void>(() => this.awaitFrames(record), () => undefined), (): void => {
           record.transitioning = false
@@ -1109,25 +1343,33 @@ export class InProcessHost implements EffectResultHost {
       }
       let candidate = record.actor!
       record.actor = oldActor
-      record.retiring = null
+      record.retiring = candidate !== oldActor ? candidate : null
       record.appId = oldAppId
       record.program = oldProgram
       record.options = oldOptions
       record.vmGeneration = oldGeneration
+      record.stateRevision = oldRevision
+      record.durable = oldDurable
       record.frameSeq = oldFrameSeq
       record.appliedSeq = oldAppliedSeq
       record.firstFrameFailed = oldFirstFrameFailed
       if (!this.disposed && !record.destroyed) { this.registry.set(oldAppId, record) }
       let failure: Error | null = null
-      let cleanup = attempt<void>(() => entry.kind === 'REPLACE' ? this.cleanupActor(candidate) :
-        !this.disposed ? oldActor.promote(oldOptions) : undefined, (cleanupError: Error): void => {
+      let cleanup = attempt<void>(() => entry.kind === 'REPLACE' && candidate !== oldActor ? this.cleanupActor(candidate) :
+        candidateStarted && !this.disposed ? oldActor.promote(oldOptions) : undefined, (cleanupError: Error): void => {
         failure = cleanupError
       })
-      return chain(cleanup, () => chain(attempt<void>(() => this.awaitFrames(record), () => undefined), (): void => {
-        if (identity !== oldAppId && this.registry.get(identity) === record) { this.registry.delete(identity) }
+      return chain(cleanup, () => chain(attempt<void>(() => this.awaitFrames(record), () => undefined), (): void | Promise<void> => {
         record.deliveries = null
         record.transitioning = false
-        if (failure !== null) { throw failure! }
+        if (failure !== null) {
+          let invalidated = new HostOperationFailure((error as HostOperationFailure).code || 'ACTOR_NOT_READY', error, true)
+          invalidated.cleanupError = failure
+          let destruction = attempt<void>(() => this.destroyRecord(record), (): void => undefined)
+          return chain(destruction, (): void => { throw invalidated })
+        }
+        record.retiring = null
+        if (identity !== oldAppId && this.registry.get(identity) === record) { this.registry.delete(identity) }
         throw new HostOperationFailure('ACTOR_NOT_READY')
       }))
     })
@@ -1149,7 +1391,8 @@ export class InProcessHost implements EffectResultHost {
         if (failure === null) { failure = error }
       })
       return chain(cleanup, () => {
-        let teardown = attempt<void>(() => this.disposed ? this.destroyRecord(record) : undefined,
+        let teardown = attempt<void>(() => this.disposed || last && failure !== null ?
+          this.destroyRecord(record) : undefined,
           (error: Error): void => { if (failure === null) { failure = error } })
         return chain(teardown, () => {
           if (failure !== null) { this.report(record, 'state', failure!.message) }
@@ -1178,11 +1421,19 @@ export class InProcessHost implements EffectResultHost {
       record.subscriber = null
       record.blockedCritical = false
       record.blockedNoncritical = false
-      if (!this.disposed && !record.destroyed) {
+      if (!this.disposed && !record.destroyed && !record.fenced) {
         record.idleSince = this.now()
         record.idleTimer = setTimeout(() => {
           record.idleTimer = -1
-          if (record.leases.size === 0) { this.destroyRecord(record) }
+          if (record.current === null && record.mailbox.length === 0 && record.checkpoints === 0) {
+            if (record.leases.size === 0) { this.destroyRecord(record) }
+          } else {
+            this.recordSettled(record).then((): void | Promise<void> => {
+              if (!record.destroyed && record.leases.size === 0 && this.now() - record.idleSince >= 5000) {
+                return this.destroyRecord(record)
+              }
+            }).catch(() => undefined)
+          }
         }, 5000)
       }
     }
@@ -1194,33 +1445,102 @@ export class InProcessHost implements EffectResultHost {
     return pending
   }
 
+  private hostVersion(record: ActorRecord, version?: AppActorTurnVersion): HostStateVersion {
+    let result: HostStateVersion = version === undefined ?
+      { runtimeMode: record.options.mode, vmGeneration: record.vmGeneration, stateRevision: record.stateRevision } :
+      { runtimeMode: version.mode, vmGeneration: version.vmGeneration, stateRevision: version.stateRevision }
+    validateHostVersion(result)
+    return result
+  }
+
+  private alignVersion(record: ActorRecord, version: AppActorTurnVersion): void {
+    let next = this.hostVersion(record, version)
+    if (next.runtimeMode !== record.options.mode) { throw new HostOperationFailure('ACTOR_NOT_READY') }
+    let changed = record.vmGeneration !== next.vmGeneration
+    record.vmGeneration = next.vmGeneration
+    record.stateRevision = next.stateRevision
+    if (!changed) { return }
+    record.effects.clear()
+    let renewed: HostLease[] = []
+    record.leases.forEach((lease: HostLease): void => {
+      if (!record.transitioning && (lease.state === 'ACTIVE' || lease.state === 'CLOSING')) {
+        lease.handle = { appId: record.appId, vmGeneration: record.vmGeneration, leaseId: lease.handle.leaseId }
+        for (let entry of record.mailbox) {
+          if (entry.lease === lease && entry.kind === 'RELEASE') { entry.handle = lease.handle }
+        }
+        renewed.push(lease)
+      } else if (lease.state === 'PENDING') {
+        lease.handle = { appId: record.appId, vmGeneration: record.vmGeneration, leaseId: lease.handle.leaseId }
+        for (let entry of record.mailbox) {
+          if (entry.lease === lease && (entry.kind === 'INITIALIZE' || entry.kind === 'ACQUIRE')) {
+            entry.handle = lease.handle
+          }
+        }
+        if (record.current !== null && record.current!.lease === lease &&
+            (record.current!.kind === 'INITIALIZE' || record.current!.kind === 'ACQUIRE')) {
+          record.current!.handle = lease.handle
+        }
+      }
+    })
+    this.discard(record, (entry: MailboxEntry): boolean => entry.kind !== 'RELEASE' &&
+      entry.handle.vmGeneration !== record.vmGeneration, 'INVALID_HANDLE')
+    let subscriber = record.subscriber
+    if (subscriber !== null && subscriber.onActorHandle !== undefined) {
+      for (let lease of renewed) {
+        let handle = lease.handle
+        let owner = this.deliveryOwner(record)
+        owner.lease = lease
+        this.deliver(record, () => subscriber!.onActorHandle!(handle), owner)
+      }
+    }
+  }
+
+  private publicationFence(record: ActorRecord): HostPublicationFence {
+    return { incarnation: record.actor!, appId: record.appId, runtimeMode: record.options.mode,
+      vmGeneration: record.vmGeneration }
+  }
+
   private createActor(record: ActorRecord): void {
     let actor: HostActor | null = null
     let owns = (): boolean => !this.disposed && !record.destroyed && record.actor === actor
     let callbacks: AppActorCallbacks = {
-      render: (_paint: boolean, reveal: boolean): void | Promise<void> => {
+      identity: (): string => record.appId,
+      generation: (): number => record.vmGeneration,
+      version: (version: AppActorTurnVersion): void => { if (owns()) { this.alignVersion(record, version) } },
+      durable: (): void => { if (owns()) { record.durable = true } },
+      render: (_paint: boolean, reveal: boolean, version?: AppActorTurnVersion): void | Promise<void> => {
         if (!owns()) { return }
         let current = record.current
         if (current !== null && current.inputSeq !== undefined) {
           record.appliedSeq = Math.max(record.appliedSeq, current.inputSeq!)
         }
-        let prior = record.frames.length === 0 ? undefined : record.frames[record.frames.length - 1]
-        let frame = chain(prior, () => owns() ? this.render(record, reveal) : undefined)
+        let frame = this.render(record, reveal, this.hostVersion(record, version))
         if (frame instanceof Promise) { record.frames.push(frame) }
         return frame
       },
-      snapshot: (encoded: string): void => {
-        if (owns() && record.subscriber !== null) {
-          this.deliver(record, () => record.subscriber!.onStateSnapshot(encoded))
+      snapshot: (encoded: string, version?: AppActorTurnVersion): void => {
+        if (!owns() || record.subscriber === null) { return }
+        let snapshot = makeStateSnapshot(record.appId, encoded, this.hostVersion(record, version))
+        let subscriber = record.subscriber!
+        if (snapshot !== null) {
+          this.deliver(record, () => {
+            record.snapshotSeq++
+            subscriber.onStateSnapshot(encoded, snapshot!)
+          })
         }
       },
       saved: (projectId: string): void => {
-        if ((owns() || (!this.disposed && !record.destroyed && record.retiring === actor)) &&
-            record.subscriber !== null) {
-          this.deliver(record, () => record.subscriber!.onStateSaved(projectId))
+        if (!this.records.has(record) || record.actor !== actor || record.options.mode !== 'LIVE_PERSISTENT' ||
+            projectId !== record.options.persistKey.split('/')[0]) { return }
+        this.safe(() => this.stateSaved(projectId))
+        if (owns() && record.subscriber !== null) {
+          let subscriber = record.subscriber!
+          this.deliver(record, () => subscriber.onStateSaved(projectId))
         }
       },
-      effects: (effects: HostEffect[]): void => { if (owns()) { this.deliverEffects(record, effects) } },
+      effects: (effects: HostEffect[], version?: AppActorTurnVersion): void => {
+        if (owns()) { this.deliverEffects(record, effects, this.hostVersion(record, version)) }
+      },
       error: (kind: string, message: string): void => { if (owns()) { this.report(record, kind, message) } }
     }
     actor = this.actorFactory === null ? new AppActor(callbacks, record) :
@@ -1228,18 +1548,33 @@ export class InProcessHost implements EffectResultHost {
     record.actor = actor
   }
 
-  private render(record: ActorRecord, reveal: boolean): void | Promise<void> {
+  private read<T>(record: ActorRecord, kind: string, run: () => T | Promise<T>): T | Promise<T> {
+    let previous = record.readKind
+    record.readKind = kind
+    return attempt<T>(() => chain(run(), (value: T): T => {
+      record.readKind = previous
+      return value
+    }), (error: Error): T => {
+      record.readKind = previous
+      throw error
+    })
+  }
+
+  private render(record: ActorRecord, reveal: boolean,
+      version: HostStateVersion = this.hostVersion(record)): void | Promise<void> {
     if (this.disposed || record.destroyed) { return }
+    let owner = this.deliveryOwner(record)
     let started = this.now()
     let actor = record.actor!
-    return attempt<void>(() => chain(actor.view(), (view: VeraUiNode | null) => {
-      if (this.disposed || record.destroyed || record.actor !== actor) { return }
+    return attempt<void>(() => chain(this.read(record, 'view', () => actor.view()), (view: VeraUiNode | null) => {
+      if (!this.ownsDelivery(record, owner)) { return }
       if (view === null && record.requiringFirstFrame) {
         this.failFirstFrame(record)
         return
       }
-      return this.deliverFrame(record, view, [], reveal, [0, 0, this.now() - started])
+      return this.deliverFrame(record, view, [], reveal, [0, 0, this.now() - started], version, owner)
     }), (error: Error): void => {
+      if (!this.ownsDelivery(record, owner)) { return }
       this.failFirstFrame(record)
       this.report(record, 'view', error.message)
     })
@@ -1259,6 +1594,8 @@ export class InProcessHost implements EffectResultHost {
     if (this.disposed || record.destroyed) { return }
     let gfx: Object[] = []
     let actor = record.actor!
+    let owner = this.deliveryOwner(record)
+    let version = this.hostVersion(record)
     let started = this.now()
     let current: DrawRequest | null = null
     let drawNext = (index: number): void | Promise<void> => {
@@ -1266,7 +1603,7 @@ export class InProcessHost implements EffectResultHost {
         if (this.disposed || record.destroyed || record.actor !== actor) { return }
         let draw = draws[i]
         current = draw
-        let ops = actor.draw(draw.entry)
+        let ops = this.read(record, 'draw', () => actor.draw(draw.entry))
         let append = (value: GfxOp[]): void => {
           let item: SurfaceGfx = { nodeId: draw.nodeId, surfaceRevision: draw.surfaceRevision, ops: value }
           gfx.push(item)
@@ -1282,27 +1619,32 @@ export class InProcessHost implements EffectResultHost {
     let failed = false
     return chain(attempt<void>(() => drawNext(0), (error: Error): void => {
       failed = true
+      if (!this.ownsDelivery(record, owner)) { return }
       if (current !== null) { StageTrace.emit(record, 'DRAW', { nodeId: current.nodeId, result: 'ERROR' }) }
       actor.clearEffects()
       this.report(record, 'draw', error.message)
     }), () => {
-      if (failed || this.disposed || record.destroyed || record.actor !== actor) { return }
+      if (failed || !this.ownsDelivery(record, owner)) { return }
       let drawMs = this.now() - started
       started = this.now()
-      let view = withView ? attempt<VeraUiNode | null>(() => actor.view(), (error: Error): null => {
-        this.report(record, 'view', error.message)
+      let view = withView ? attempt<VeraUiNode | null>(() => this.read(record, 'view', () => actor.view()), (error: Error): null => {
+        if (this.ownsDelivery(record, owner)) { this.report(record, 'view', error.message) }
         return null
       }) : null
       return chain(view, (node: VeraUiNode | null) => {
-        if (withView && node === null && gfx.length === 0) { return }
-        return this.deliverFrame(record, node, gfx, false, [handlersMs, drawMs, this.now() - started])
+        if (!this.ownsDelivery(record, owner) || withView && node === null && gfx.length === 0) { return }
+        return this.deliverFrame(record, node, gfx, false, [handlersMs, drawMs, this.now() - started], version, owner)
       })
     })
   }
 
   private deliverFrame(record: ActorRecord, view: Object | null, gfx: Object[], reveal: boolean,
-      timing: number[]): void | Promise<void> {
-    if (this.disposed || record.destroyed || record.subscriber === null) { return }
+      timing: number[], version: HostStateVersion = this.hostVersion(record),
+      owner: HostDeliveryOwner = this.deliveryOwner(record)): void | Promise<void> {
+    if (!this.ownsDelivery(record, owner)) { return }
+    let fence = owner.fence
+    let subscriber = owner.subscriber!
+    let appliedSeq = record.appliedSeq
     let actor = record.actor!
     let scenes: SceneDraw[] = []
     let nodes: VeraUiNode[] = view === null ? [] : [view as VeraUiNode]
@@ -1314,7 +1656,7 @@ export class InProcessHost implements EffectResultHost {
         node.id = nextId++
         for (let index = node.children.length - 1; index >= 0; index--) { nodes.push(node.children[index]) }
         if (node.kind === 'world') {
-          let spec = actor.buildScene(node.label)
+          let spec = this.read(record, 'world', () => actor.buildScene(node.label))
           let nodeId = node.id
           if (spec instanceof Promise) {
             return chain(spec, (value: WorldSpec) => {
@@ -1328,44 +1670,45 @@ export class InProcessHost implements EffectResultHost {
     }
     return attempt<void>(() => chain(buildNext(), () => {
       if (this.disposed || record.destroyed || record.actor !== actor) { return }
-      let frame: FrameEnvelope = { appId: record.appId, vmGeneration: record.vmGeneration,
-        frameSeq: ++record.frameSeq, appliedSeq: record.appliedSeq, reveal: reveal,
-        view: view === null ? null : JSON.parse(JSON.stringify(view)) as Object,
-        gfx: JSON.parse(JSON.stringify(gfx)) as Object[], timing: timing,
-        scenes: view === null ? undefined : JSON.parse(JSON.stringify(scenes)) as SceneDraw[] }
+      if (!this.ownsDelivery(record, owner)) { return }
+      let frame = makeRevisionedFrame({ appId: fence.appId, vmGeneration: version.vmGeneration,
+        frameSeq: ++record.frameSeq, appliedSeq: appliedSeq, reveal: reveal,
+        view: view, gfx: gfx, timing: timing, scenes: view === null ? undefined : scenes }, version)
       StageTrace.frame(record, view, reveal)
-      this.deliver(record, () => record.subscriber!.onViewFrame(frame))
+      this.deliver(record, () => subscriber.onViewFrame(frame), owner)
     }), (error: Error): void => {
+      if (!this.ownsDelivery(record, owner)) { return }
       actor.clearEffects()
       this.failFirstFrame(record)
       this.report(record, 'WORLD', 'World error: ' + error.message)
     })
   }
 
-  private deliverEffects(record: ActorRecord, effects: HostEffect[]): void {
-    if (this.disposed || record.destroyed || record.options.mode === 'PREVIEW' || record.current === null ||
+  private deliverEffects(record: ActorRecord, effects: HostEffect[], version: HostStateVersion): void {
+    if (this.disposed || record.destroyed || version.runtimeMode === 'PREVIEW' || record.current === null ||
         record.subscriber === null) { return }
-    if (record.deliveries !== null) {
-      record.deliveries!.push(() => this.deliverEffects(record, effects))
-      return
-    }
     let lease = record.current!.lease
+    let subscriber = record.subscriber!
+    let appId = record.appId
     for (let effect of effects) {
-      if (this.disposed || record.destroyed || lease.state === 'RELEASED') { return }
       let params: string[] = []
       effect.values.forEach((value: string, key: string) => { params.push(key, value) })
       let id = ++record.effectSeq
-      let pending = new PendingEffect()
-      pending.handler = effect.resultHandler
-      pending.leaseId = lease.handle.leaseId
-      record.effects.set(id, pending)
-      let request: EffectRequest = { appId: record.appId, vmGeneration: record.vmGeneration,
+      let request = makeRevisionedEffect({ appId: appId, vmGeneration: version.vmGeneration,
         effectId: id, kind: effect.kind, rawTarget: effect.rawTarget, params: params,
-        resultHandler: effect.resultHandler, mode: effect.rawMode.length > 0 ? effect.rawMode : 'background' }
+        resultHandler: effect.resultHandler, mode: effect.rawMode.length > 0 ? effect.rawMode : 'background' }, version)
+      if (request === null) { continue }
       StageTrace.associateEffectOwner(request, record)
-      StageTrace.request(record, id, effect.rawTarget, effect.values, effect.resultHandler,
-        request.mode, record.vmGeneration)
-      this.safe(() => record.subscriber!.onEffectRequest(request))
+      this.deliver(record, (): void => {
+        if (lease.state === 'RELEASED' || lease.record !== record) { return }
+        let pending = new PendingEffect()
+        pending.handler = request!.resultHandler
+        pending.leaseId = lease.handle.leaseId
+        record.effects.set(id, pending)
+        StageTrace.request(record, id, request!.rawTarget, effect.values, request!.resultHandler,
+          request!.mode, request!.vmGeneration)
+        subscriber.onEffectRequest(request!)
+      })
     }
   }
 
@@ -1374,6 +1717,7 @@ export class InProcessHost implements EffectResultHost {
     if (entry.kind === 'MOVE') { return 'move' }
     if (entry.kind === 'DRAW') { return 'draw' }
     if (entry.kind === 'VIEW') { return 'view' }
+    if (entry.kind === 'INPUT' && entry.input!.kind === 'SCENE') { return 'scene' }
     return 'handler'
   }
 
@@ -1383,6 +1727,17 @@ export class InProcessHost implements EffectResultHost {
         normalized === 'back' || normalized === 'surface_down' || normalized === 'surface_up' ||
         normalized === 'surface_cancel') {
       normalized = 'handler'
+    }
+    if (normalized === 'handler' && record.current !== null) {
+      normalized = this.turnKind(record.current!)
+    } else if (normalized === 'view' && record.readKind.length > 0) {
+      normalized = record.readKind
+    }
+    let failure = normalized === 'world' && message.startsWith('World error: ') ? message.substring(13) : message
+    if (record.current !== null) {
+      let key = normalized + ':' + failure
+      if (record.reportedErrors.has(key)) { return }
+      record.reportedErrors.add(key)
     }
     if (normalized === 'view' || normalized === 'draw' || normalized === 'move' || normalized === 'frame' ||
         normalized === 'world') {
@@ -1401,9 +1756,24 @@ export class InProcessHost implements EffectResultHost {
     this.deliver(record, () => record.subscriber!.onError(normalized, message, inputSeq))
   }
 
-  private deliver(record: ActorRecord, callback: () => void): void {
-    if (record.deliveries !== null) { record.deliveries!.push(callback) }
-    else if (!this.disposed && !record.destroyed && record.subscriber !== null) { this.safe(callback) }
+  private deliveryOwner(record: ActorRecord): HostDeliveryOwner {
+    return { fence: this.publicationFence(record), subscriber: record.subscriber,
+      lease: record.current === null ? null : record.current!.lease }
+  }
+
+  private ownsDelivery(record: ActorRecord, owner: HostDeliveryOwner): boolean {
+    return !this.disposed && !record.destroyed && owner.subscriber !== null &&
+      record.subscriber === owner.subscriber && sameHostPublication(owner.fence, this.publicationFence(record)) &&
+      (owner.lease === null || owner.lease!.record === record && owner.lease!.state !== 'RELEASED')
+  }
+
+  private deliver(record: ActorRecord, callback: () => void,
+      owner: HostDeliveryOwner = this.deliveryOwner(record)): void {
+    let delivery = (): void => {
+      if (this.ownsDelivery(record, owner)) { this.safe(callback) }
+    }
+    if (record.deliveries !== null) { record.deliveries!.push(delivery) }
+    else { delivery() }
   }
 
   private safe(callback: () => void): void {
@@ -1453,27 +1823,40 @@ export class InProcessHost implements EffectResultHost {
     this.registry.forEach((candidate: ActorRecord, identity: string) => {
       if (candidate === record) { identities.push(identity) }
     })
-    for (let identity of identities) { this.registry.delete(identity) }
+    let forget = (): void => {
+      for (let identity of identities) {
+        if (this.registry.get(identity) === record) { this.registry.delete(identity) }
+      }
+      this.records.delete(record)
+      this.settleRecord(record)
+    }
     this.ready = this.ready.filter((candidate: ActorRecord): boolean => candidate !== record)
     record.scheduled = false
     this.pending++
     let failure: Error | null = null
+    let closureConfirmed = true
     let cleanups: Promise<void>[] = []
     let actors: HostActor[] = [record.actor!]
     if (record.retiring !== null) { actors.push(record.retiring!); record.retiring = null }
     for (let actor of actors) {
       let cleanup = attempt<void>(() => this.cleanupActor(actor), (error: Error): void => {
         if (failure === null) { failure = error }
+        let confirmed = false
+        try { confirmed = actor.closureConfirmed !== undefined && actor.closureConfirmed!() === true } catch (_) {}
+        if (!confirmed) { closureConfirmed = false }
         if (this.disposed && this.disposeFailure === null) { this.disposeFailure = error }
       })
       if (cleanup instanceof Promise) { cleanups.push(cleanup) }
     }
-    if (cleanups.length === 0) {
+    if (cleanups.length === 0 && failure === null) {
+      forget()
       this.pending--
       this.settleIdle()
       return
     }
     let completion = Promise.all(cleanups).then(() => {
+      if (closureConfirmed) { forget() }
+      else { this.settleRecord(record) }
       this.pending--
       this.settleIdle()
       if (failure !== null) { throw failure! }
@@ -1510,6 +1893,7 @@ export class InProcessHost implements EffectResultHost {
       let reject = this.disposeReject!
       this.disposeResolve = null
       this.disposeReject = null
+      this.unregisterLifecycle()
       if (this.disposeFailure !== null) { reject(this.disposeFailure!) }
       else { resolve() }
     }

@@ -2332,7 +2332,9 @@ test('diagnostic callback failure cannot disrupt commits and diagnostics contain
   await turn(d, 3, 'IMMEDIATE')
   assert(d.events.length > 0)
   for (const event of d.events) assert.deepEqual(Object.keys(event).sort(),
-    ['appId', 'baseRevision', 'code', 'dirtyAgeMs', 'stage', 'vmGeneration'].sort())
+    ['appId', 'baseRevision', 'code', 'dirtyAgeMs', 'stage', 'vmGeneration', 'revision', 'durationMs',
+      'commitClass', 'turnSource', 'format', 'loadSource', 'outcome', 'dirty', 'transientFailures',
+      'reloadAttempts', 'payloadBytes', 'commitsPerSecond', 'p95DurationMs', 'sampleCount', 'windowMs'].sort())
 })
 
 test('definitive refusal restores retained graph aliases/slots and deferred host state without decoding snapshot', async () => {

@@ -6,6 +6,13 @@
 - Consolidated 12 template-block checks into `template-suite.js` with a shared `template-fixture.js`, deleting the originals.
 - Made the harness reliable on Windows (CRLF-normalized fixtures and sources, path normalization, checksum tolerance, Python fallback).
 
+## Worker Thread backend: Stage 1B — AppState Persistence & VM Safety
+
+- Activated Format 2 persistence through Main's sole `StateManager` writer and Task Pool I/O, with commit-gated snapshots/effects, asynchronous seed/delete migration, lifecycle barriers and fenced recovery. Execution remains in-process on the UI thread; Form can only read committed AppState.
+- Integrated VM undo journaling, pure rendering, deadlines and the default-on `vmJournal` safety switch. Retained permanent regression checks and sole-writer CI; removed temporary device-probe launch routes/workers.
+- Focused host checks and an unsigned ArkTS build passed; exception-handling warnings were resolved. Existing deprecation and model/physics-stub warnings remain. The latest background-checkpoint fix is built, not deployed; its manual device trial remains user-owned and unverified.
+- Remaining Stage 1B gates are administratively accepted for progression, not empirically passed; the specifications record the waived portions. Actual stopped-Main Form verification is deferred, not passed, to Stage 1C. Full widget fallback, Main push, EL1 cache and action routing remain Stage 1C work; the stages ship together.
+
 ## Worker Thread backend: Stage 1
 
 ### Step 1

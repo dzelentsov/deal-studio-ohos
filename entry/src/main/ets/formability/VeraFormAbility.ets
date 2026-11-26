@@ -4,6 +4,7 @@ import { store } from '../vera/ProjectStore'
 import { buildFormBinding, refreshProjectCards } from '../vera/FormUpdater'
 import { formBindings, refreshLedger } from '../vera/FormBindings'
 import { liveBinding, liveFormTap, liveFormRefresh, LiveRefresh } from '../vera/LiveFormService'
+import { StateLifecycleDiag } from '../runtime/trace/StageTrace'
 
 export default class VeraFormAbility extends FormExtensionAbility {
   private init(): void {
@@ -13,6 +14,7 @@ export default class VeraFormAbility extends FormExtensionAbility {
   }
 
   onAddForm(want: Want): formBindingData.FormBindingData {
+    StateLifecycleDiag.emit('FORM', 'FORM_ADD')
     this.init()
     let params = want.parameters as Record<string, Object>
     if (params !== null && params !== undefined && params['ohos.extra.param.key.form_name'] === 'live') {
@@ -32,6 +34,7 @@ export default class VeraFormAbility extends FormExtensionAbility {
   }
 
   async onUpdateForm(formId: string): Promise<void> {
+    StateLifecycleDiag.emit('FORM', 'FORM_UPDATE')
     this.init()
     // Which card this is; when the system cannot say, a card bound to a project is a live one and any other the list.
     let live = formBindings.projectFor(formId).length > 0
@@ -53,11 +56,13 @@ export default class VeraFormAbility extends FormExtensionAbility {
   onCastToNormalForm(formId: string): void { this.onUpdateForm(formId) }
 
   onRemoveForm(formId: string): void {
+    StateLifecycleDiag.emit('FORM', 'FORM_REMOVE')
     this.init()
     formBindings.unbind(formId)
   }
 
   async onFormEvent(formId: string, message: string): Promise<void> {
+    StateLifecycleDiag.emit('FORM', 'FORM_EVENT')
     this.init()
     let projectId = formBindings.projectFor(formId)
     if (projectId.length === 0) { return }

@@ -5,7 +5,7 @@ const path = require('node:path')
 const crypto = require('node:crypto')
 const { TextEncoder, TextDecoder } = require('node:util')
 const ts = require(process.env.VERA_TYPESCRIPT_PATH || 'typescript')
-const root = path.resolve(__dirname, '../../entry/src/main/ets/runtime')
+const root = path.resolve(process.env.VERA_SOURCE_ROOT || path.join(__dirname, '../../entry/src/main/ets'), 'runtime')
 const APP = 'project/app'
 const ROOT = '/state-fixture'
 const DIR = ROOT + '/project'
@@ -293,6 +293,9 @@ function load(file) {
   const importer = name => {
     imports.push(name)
     if (name === '@kit.CoreFileKit') return { fileIo: filesystem }
+    if (name === '@kit.BasicServicesKit') return { systemDateTime: {
+      TimeType: { STARTUP: 0 }, getUptime: () => require('node:perf_hooks').performance.now()
+    } }
     if (name === '@ohos.fileio') return { default: legacyFilesystem }
     if (name === '@kit.ArkTS') return { util, taskpool: {
       get Task() { return poolAdapter.Task },
@@ -306,6 +309,42 @@ function load(file) {
   new Function('require', 'module', 'exports', compiled.outputText)(importer, module, module.exports)
   return module.exports
 }
+function createWorkerFixture(stateRoot, observe = () => {}, fault = () => '') {
+  const memory = new MemoryFs()
+  active = memory
+  poolAdapter = new PoolAdapter()
+  const pool = poolAdapter
+  const parent = file => {
+    if (memory.nodes.has(file)) return
+    if (file !== '/') parent(path.dirname(file))
+    memory.put(file, '', 'dir')
+  }
+  parent(stateRoot)
+  const originalEvent = memory.event.bind(memory)
+  memory.event = (op, details = {}) => {
+    observe({ op, ...details })
+    if (fault() === op) throw nativeError()
+    return originalEvent(op, details)
+  }
+  const disk = {
+    get: file => memory.text(file),
+    has: file => memory.nodes.has(file),
+    set(file, text) { parent(path.dirname(file)); memory.put(file, text); return this },
+    delete: file => memory.nodes.delete(file),
+    keys: () => [...memory.nodes].filter(([, node]) => node.kind === 'file').map(([file]) => file)[Symbol.iterator](),
+    get size() { return [...this.keys()].length },
+    clear() {
+      assert.equal(memory.fds.size, 0, 'all worker descriptors released before reset')
+      assert([...memory.nodes.values()].every(node => node.owner === null), 'all worker locks released before reset')
+      memory.nodes.clear(); parent(stateRoot)
+      pool.tasks.length = 0; pool.executions.length = 0; pool.events.length = 0
+    }
+  }
+  return { memory, disk, filesystem, legacyFilesystem, taskpool: pool, util, cryptoFramework,
+    workerActive: () => workerDepth > 0 }
+}
+module.exports = { createWorkerFixture }
+if (require.main === module) {
 const { StateIo } = load(path.join(root, 'StateIo.ets'))
 const format = load(path.join(root, 'StateFileFormat.ets'))
 const payload = text => JSON.stringify(['o', 'State', [['z', ['s', text]], ['a', ['n', 7]]]])
@@ -321,6 +360,17 @@ const isTemp = event => /\.tmp$/.test(event.path || '')
 const isMainTemp = event => event.path?.startsWith(MAIN + '.') && !event.path.startsWith(BAK + '.') && isTemp(event)
 const isBakTemp = event => event.path?.startsWith(BAK + '.') && isTemp(event)
 const mutations = () => active.trace.filter(event => ['write', 'rename', 'unlink', 'mkdir'].includes(event.op) || (event.op === 'open' && (event.flags & modes.CREATE) && event.path !== LOCK))
+function assertMeasured(actual, expected) {
+  assert.equal(typeof actual.lockWaitMs, 'number')
+  assert(Number.isFinite(actual.lockWaitMs) && actual.lockWaitMs >= 0)
+  const metrics = { lockWaitMs: actual.lockWaitMs }
+  if (expected.status === 'COMMITTED' && ['WRITTEN', 'FAILED'].includes(expected.backup)) {
+    assert.equal(typeof actual.backupDurationMs, 'number')
+    assert(Number.isFinite(actual.backupDurationMs) && actual.backupDurationMs >= 0)
+    metrics.backupDurationMs = actual.backupDurationMs
+  }
+  assert.deepEqual(actual, { ...expected, ...metrics })
+}
 function noWrites() { assert.deepEqual(mutations(), []) }
 function noTemps() { assert.deepEqual([...active.nodes.keys()].filter(file => file.endsWith('.tmp')), []) }
 function readOnlyTrace() {
@@ -354,7 +404,7 @@ test('success / unicode large partial byte IO and native exclusive numeric fd', 
   active.maxRead = 997
   active.maxWrite = 733
   const result = io.commit(request({ pre: { appId: APP, vmGeneration: 1, baseRevision: 0 }, payload: buffer(LARGE), backupDue: true }))
-  assert.deepEqual(result, { status: 'COMMITTED', revision: 1, backup: 'WRITTEN' })
+  assertMeasured(result, { status: 'COMMITTED', revision: 1, backup: 'WRITTEN' })
   assert.equal(active.text(MAIN), active.text(BAK))
   const loaded = io.load(APP, STAMP)
   assert.equal(loaded.encodedState, LARGE)
@@ -421,12 +471,12 @@ for (const target of [MAIN, BAK]) test('CAS / first-create race ' + path.basenam
 })
 
 for (const vmGeneration of [0, 99]) test('CAS / first absent commit generation ' + vmGeneration + ' is fenced', io => {
-  assert.deepEqual(io.commit(request({ pre: { appId: APP, vmGeneration, baseRevision: 0 }, backupDue: true })), { status: 'FENCED_COMMIT' })
+  assertMeasured(io.commit(request({ pre: { appId: APP, vmGeneration, baseRevision: 0 }, backupDue: true })), { status: 'FENCED_COMMIT' })
   assert(!active.nodes.has(MAIN))
   assert(!active.nodes.has(BAK))
   noWrites()
   noTemps()
-  assert.deepEqual(io.commit(request({ pre: { appId: APP, vmGeneration: 1, baseRevision: 0 } })), { status: 'COMMITTED', revision: 1, backup: 'SKIPPED' })
+  assertMeasured(io.commit(request({ pre: { appId: APP, vmGeneration: 1, baseRevision: 0 } })), { status: 'COMMITTED', revision: 1, backup: 'SKIPPED' })
   assert.equal(decode().vmGeneration, 1)
 })
 
@@ -703,7 +753,7 @@ test('publication / literal payload revision stamp preserved generation increase
 
 test('publication / legacy conversion preserves tagged insertion order and stamp', io => {
   active.put(MAIN, JSON.stringify({ stamp: STAMP, value: JSON.parse(SMALL) }))
-  assert.deepEqual(io.publishGeneration(publication({ expectedSource: 'LEGACY', expectedRevision: 0, nextVmGeneration: 1 })), { status: 'COMMITTED', revision: 0, backup: 'SKIPPED' })
+  assertMeasured(io.publishGeneration(publication({ expectedSource: 'LEGACY', expectedRevision: 0, nextVmGeneration: 1 })), { status: 'COMMITTED', revision: 0, backup: 'SKIPPED' })
   assert.equal(decode().format, 'FORMAT2')
   assert.equal(decode().encodedState, SMALL)
   assert.equal(decode().stamp, STAMP)
@@ -711,7 +761,7 @@ test('publication / legacy conversion preserves tagged insertion order and stamp
 })
 
 test('publication / ABSENT does not create a state file', io => {
-  assert.deepEqual(io.publishGeneration(publication({ expectedSource: 'ABSENT', expectedRevision: 0, expectedStamp: '', nextVmGeneration: 1 })), { status: 'COMMITTED', revision: 0, backup: 'SKIPPED' })
+  assertMeasured(io.publishGeneration(publication({ expectedSource: 'ABSENT', expectedRevision: 0, expectedStamp: '', nextVmGeneration: 1 })), { status: 'COMMITTED', revision: 0, backup: 'SKIPPED' })
   assert(!active.nodes.has(MAIN))
   assert(!active.nodes.has(BAK))
   noWrites()
@@ -818,7 +868,7 @@ test('fault / directory fsync after main rename COMMIT_UNCERTAIN new main visibl
   seed()
   active.fail('fsync', event => event.path === DIR)
   const result = io.commit(request({ backupDue: true }))
-  assert.deepEqual(result, { status: 'COMMIT_UNCERTAIN', code: 'STATE_COMMIT_UNCERTAIN', stage: 'commit-main-dir-fsync' })
+  assertMeasured(result, { status: 'COMMIT_UNCERTAIN', code: 'STATE_COMMIT_UNCERTAIN', stage: 'commit-main-dir-fsync' })
   assert.equal(decode().revision, 8)
   assert(!active.nodes.has(BAK))
   noTemps()
@@ -832,7 +882,7 @@ for (const [name, op, count] of faults) test('fault / backup temp ' + name + ' C
     if (count !== undefined) return count
     throw nativeError()
   })
-  assert.deepEqual(io.commit(request({ backupDue: true })), { status: 'COMMITTED', revision: 8, backup: 'FAILED' })
+  assertMeasured(io.commit(request({ backupDue: true })), { status: 'COMMITTED', revision: 8, backup: 'FAILED' })
   assert.equal(decode().revision, 8)
   assert.equal(active.text(BAK), backup)
   noTemps()
@@ -843,7 +893,7 @@ test('fault / backup directory fsync failure still COMMITTED backup FAILED', io 
   active.once(event => event.op === 'rename' && event.to === BAK, () => {
     active.fail('fsync', event => event.path === DIR)
   })
-  assert.deepEqual(io.commit(request({ backupDue: true })), { status: 'COMMITTED', revision: 8, backup: 'FAILED' })
+  assertMeasured(io.commit(request({ backupDue: true })), { status: 'COMMITTED', revision: 8, backup: 'FAILED' })
   assert.equal(active.text(MAIN), active.text(BAK))
   noTemps()
 })
@@ -895,7 +945,7 @@ for (const operation of ['commit', 'publishGeneration']) {
 test('durability / explicitly unsupported directory fsync reduced path', () => {
   seed()
   const io = new StateIo(ROOT, { directoryFsync: 'UNSUPPORTED', lockTimeoutMs: 0, tmpOrphanAgeMs: 60000 })
-  assert.deepEqual(io.commit(request({ backupDue: true })), { status: 'COMMITTED', revision: 8, backup: 'WRITTEN' })
+  assertMeasured(io.commit(request({ backupDue: true })), { status: 'COMMITTED', revision: 8, backup: 'WRITTEN' })
   const syncs = active.trace.filter(event => event.op === 'fsync')
   assert.equal(syncs.length, 2)
   assert(syncs.every(event => event.kind === 'file' && isTemp(event)))
@@ -994,7 +1044,7 @@ for (const variant of ['both corrupt', 'main only', 'backup only', 'invalid utf8
   const foreignNode = active.put(foreign, 'older evidence')
   const temp = MAIN + '.' + crypto.randomUUID() + '.tmp'
   const tempNode = active.put(temp, 'orphan evidence', 'file', 120000)
-  assert.deepEqual(io.recoverLost(APP, STAMP), { kind: 'ABSENT' })
+  assertMeasured(io.recoverLost(APP, STAMP), { kind: 'ABSENT' })
   assert(!active.nodes.has(MAIN))
   assert(!active.nodes.has(BAK))
   assert.equal(active.nodes.get(LOCK), lock)
@@ -1020,7 +1070,7 @@ for (const variant of ['both corrupt', 'main only', 'backup only', 'invalid utf8
     assert.equal(reservation.mode, 0o600)
   }
   assert(!active.trace.some(event => event.op === 'unlink' || event.op === 'write'))
-  assert.deepEqual(io.recoverLost(APP, STAMP), { kind: 'ABSENT' })
+  assertMeasured(io.recoverLost(APP, STAMP), { kind: 'ABSENT' })
   assert.equal(active.nodes.get(LOCK), lock)
   assert.equal(quarantines().length, originals.size + 1)
   assert.equal(io.commit(request({ pre: { appId: APP, vmGeneration: 1, baseRevision: 0 } })).status, 'COMMITTED')
@@ -1115,7 +1165,7 @@ for (const target of [MAIN, BAK]) for (const [name, damage] of [
 ]) test('lost reset / full validation quarantines ' + name + ' ' + path.basename(target), io => {
   lostSeed()
   const evidence = active.put(target, damage(fileText()))
-  assert.deepEqual(io.recoverLost(APP, STAMP), { kind: 'ABSENT' })
+  assertMeasured(io.recoverLost(APP, STAMP), { kind: 'ABSENT' })
   assert.equal(quarantines().filter(file => active.nodes.get(file) === evidence).length, 1)
   assert(!active.nodes.has(MAIN))
   assert(!active.nodes.has(BAK))
@@ -1172,9 +1222,9 @@ for (const stage of ['main read', 'backup read', 'main rename', 'backup rename',
   let syncs = 0
   active.once(event => event.op === op && event.path === target && (stage !== 'final sync' || ++syncs === 2), () => {
     assert.equal(lock.owner === null, false)
-    assert.deepEqual(peer.commit(request({ pre: { appId: APP, vmGeneration: 1, baseRevision: 0 } })), { status: 'STALE' })
+    assertMeasured(peer.commit(request({ pre: { appId: APP, vmGeneration: 1, baseRevision: 0 } })), { status: 'STALE' })
   })
-  assert.deepEqual(io.recoverLost(APP, STAMP), { kind: 'ABSENT' })
+  assertMeasured(io.recoverLost(APP, STAMP), { kind: 'ABSENT' })
   assert.equal(active.nodes.get(LOCK), lock)
   assert.equal(lock.owner, null)
   assert.equal(quarantines().length, 2)
@@ -1183,7 +1233,7 @@ for (const stage of ['main read', 'backup read', 'main rename', 'backup rename',
 test('lost reset / valid legacy backup remains LOST and untouched', io => {
   lostSeed()
   const backup = active.put(BAK, JSON.stringify({ stamp: STAMP, value: JSON.parse(SMALL) }))
-  assert.deepEqual(io.recoverLost(APP, STAMP), { kind: 'LOST', code: 'STATE_CORRUPTED', stage: 'lost-backup-format' })
+  assertMeasured(io.recoverLost(APP, STAMP), { kind: 'LOST', code: 'STATE_CORRUPTED', stage: 'lost-backup-format' })
   assert.equal(active.nodes.get(BAK), backup)
   assert.equal(active.text(MAIN), '{main')
   noWrites()
@@ -1195,7 +1245,7 @@ test('lost reset / busy stable lock timeout no reads or mutation', io => {
   held.tryLock(true)
   active.trace = []
   try {
-    assert.deepEqual(io.recoverLost(APP, STAMP), { kind: 'UNAVAILABLE', code: 'STATE_LOCK_UNAVAILABLE', stage: 'lost-lock' })
+    assertMeasured(io.recoverLost(APP, STAMP), { kind: 'UNAVAILABLE', code: 'STATE_LOCK_UNAVAILABLE', stage: 'lost-lock' })
     assert.equal(active.nodes.get(LOCK), lock)
     assert(!active.trace.some(event => event.op === 'read'))
     noWrites()
@@ -1321,7 +1371,7 @@ async function checkTaskPool() {
     assert.equal(execution.args[2].expectedStamp, STAMP)
     assert(!('authority' in execution.args[2]))
     poolAdapter.finish()
-    assert.deepEqual(await resetting, { kind: 'ABSENT' })
+    assertMeasured(await resetting, { kind: 'ABSENT' })
     await closing
     assert(closed)
     assert.equal(active.nodes.get(LOCK), lock)
@@ -1408,7 +1458,7 @@ async function checkTaskPool() {
     assert.equal(poolAdapter.executions.length, 1)
     assert.equal(active.trace.length, 0)
     poolAdapter.finish()
-    assert.deepEqual(await resetting, { kind: 'ABSENT' })
+    assertMeasured(await resetting, { kind: 'ABSENT' })
     assert.equal((await publishing).result.status, 'COMMITTED')
     assert.equal((await saving).result.status, 'COMMITTED')
     await closing
@@ -1426,7 +1476,7 @@ async function checkTaskPool() {
     const refused = lane.recoverLost(APP, STAMP)
     const retried = lane.recoverLost(APP, STAMP)
     assert.equal((await refused).code, 'STATE_READ_FAILED')
-    assert.deepEqual(await retried, { kind: 'ABSENT' })
+    assertMeasured(await retried, { kind: 'ABSENT' })
     assert.equal(poolAdapter.executions.length, 2)
     assert.equal(quarantines().length, 2)
     await lane.close()
@@ -1489,8 +1539,12 @@ async function checkTaskPool() {
     assert.equal(loadResult.encodedState, undefined)
     assert.equal(loadResult.header.revision, 7)
     assert.equal((await header).revision, 7)
-    assert.deepEqual(await committed, { operationId: 'commit-fixture', result: { status: 'COMMITTED', revision: 8, backup: 'SKIPPED' } })
-    assert.deepEqual(await published, { operationId: 'publish-fixture', result: { status: 'COMMITTED', revision: 8, backup: 'SKIPPED' } })
+    const committedReply = await committed
+    assertMeasured(committedReply.result, { status: 'COMMITTED', revision: 8, backup: 'SKIPPED' })
+    assert.deepEqual(committedReply, { operationId: 'commit-fixture', result: committedReply.result })
+    const publishedReply = await published
+    assertMeasured(publishedReply.result, { status: 'COMMITTED', revision: 8, backup: 'SKIPPED' })
+    assert.deepEqual(publishedReply, { operationId: 'publish-fixture', result: publishedReply.result })
     await barrier
     assert(idle)
     assert.equal(decode().vmGeneration, 4)
@@ -1905,3 +1959,4 @@ async function checkTaskPool() {
   if (failures.length) process.exitCode = 1
 }
 checkTaskPool().catch(error => { console.error(error.stack); process.exitCode = 1 })
+}

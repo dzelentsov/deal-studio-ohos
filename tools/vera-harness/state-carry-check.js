@@ -356,8 +356,10 @@ function externalGraphChecks() {
       constructors: [
         ['Cell', 'constructor(v: RuntimeValue)', 'cellBirths.set(this, nextAllocationSerial()); this.value = v;']
       ],
+      owners: [
+        ['runtime/AppActor.ets', 'AppActor', 'manager/coordinator -> StateManager working root; capture/restore promotion ownership -> retire/dispose']
+      ],
       roots: [
-        ['runtime/AppActor.ets', 'AppActor', 'currentState', 'initialize/restoreState/seeded -> handler candidates -> persist/snapshot -> reconcileState -> dispose'],
         ['runtime/StateManager.ets', 'StateManager', 'working', 'initialState -> load -> beginTurn/setWorkingState -> commitTurn/rollbackTurn -> reload; close fences but retains root until manager collection'],
         ['runtime/StateManager.ets', 'ManagedStateTransaction', 'originalRoot', 'beginTurn retains alias until accept/rollback; no deep snapshot implied'],
         ['vera/VeraLiveWidget.ets', 'WidgetSession', 'state', 'saved decode/init -> restore/refresh/tap candidates -> encodedState; session lifetime'],
@@ -378,7 +380,11 @@ function externalGraphChecks() {
   }
   const printer = ts.createPrinter({removeComments: true, newLine: ts.NewLineKind.LineFeed})
   const parse = (name, text) => ts.createSourceFile(name, text, ts.ScriptTarget.ES2020, true, ts.ScriptKind.TS)
-  const print = node => printer.printNode(ts.EmitHint.Unspecified, node, node.getSourceFile())
+  const printedNodes = new WeakMap(), canonicalTexts = new Map()
+  const print = node => {
+    if (!printedNodes.has(node)) printedNodes.set(node, printer.printNode(ts.EmitHint.Unspecified, node, node.getSourceFile()))
+    return printedNodes.get(node)
+  }
   const tokens = text => {
     const scanner = ts.createScanner(ts.ScriptTarget.ES2020, true, ts.LanguageVariant.Standard, text)
     const out = []
@@ -387,7 +393,10 @@ function externalGraphChecks() {
     }
     return JSON.stringify(out)
   }
-  const canonical = text => tokens(print(parse('review.ts', text)))
+  const canonical = text => {
+    if (!canonicalTexts.has(text)) canonicalTexts.set(text, tokens(print(parse('review.ts', text))))
+    return canonicalTexts.get(text)
+  }
   const reviewedArkUiBodies = [
     ['build', `{
       if (this.thumbnail) {
@@ -484,18 +493,19 @@ function externalGraphChecks() {
     ...(node.typeParameters || []).map(print), '(', ...node.parameters.map(print), ')', node.type ? print(node.type) : ''
   ].join(' ')
   const sorted = entries => entries.map(entry => JSON.stringify(entry)).sort()
-  const syntaxCache = new Map(), libraryCache = new Map(), fileCache = new Map()
+  const syntaxCache = new Map(), baselineSyntax = new Map(), libraryCache = new Map(), fileCache = new Map()
+  const soleWriterFiles = new Map()
   let previousProgram
   const expectedAccesses = ownership.D.accesses.flatMap(([file, owner, expression, use, count = 1]) =>
     Array.from({length: count}, () => [file, owner, tokens(expression)]))
   assert.equal(expectedAccesses.length, 46)
-  const inventory = input => {
+  const inventory = (input, inspectStorage, inspectFile) => {
     assert(input.size <= 512, 'external inventory: file bound')
     const virtual = name => path.join(root, name.replace(/\.ets$/, '.ts'))
     const dependencies = new Map()
     const trees = new Map([...input].map(([name, text]) => {
       assert(text.length <= 1024 * 1024, 'external inventory: source bound')
-      let cached = syntaxCache.get(name)
+      let cached = text === sources.get(name) ? baselineSyntax.get(name) : syntaxCache.get(name)
       if (cached?.text !== text) {
         const tree = parse(virtual(name), reviewSource(name, text)), relative = new Set()
         const collect = node => {
@@ -504,7 +514,8 @@ function externalGraphChecks() {
         }
         collect(tree)
         cached = {text, tree, relative: [...relative]}
-        syntaxCache.set(name, cached)
+        if (text === sources.get(name)) baselineSyntax.set(name, cached)
+        else syntaxCache.set(name, cached)
       }
       dependencies.set(virtual(name), cached.relative)
       return [virtual(name), cached.tree]
@@ -532,11 +543,42 @@ function externalGraphChecks() {
       const resolvedFileName = candidates(name, containing).find(file => trees.has(file))
       return resolvedFileName ? {resolvedFileName, extension: resolvedFileName.endsWith('.tsx') ? ts.Extension.Tsx : ts.Extension.Ts} : undefined
     })
-    const program = ts.createProgram([...trees.keys()], options, host, previousProgram)
-    previousProgram = program
-    assert.deepEqual(program.getOptionsDiagnostics().map(d => ts.flattenDiagnosticMessageText(d.messageText, '\n')), [],
-      'external inventory: TypeScript options')
-    const checker = program.getTypeChecker()
+    let checker
+    const getChecker = () => {
+      if (!checker) {
+        const program = ts.createProgram([...trees.keys()], options, host, previousProgram)
+        previousProgram = program
+        assert.deepEqual(program.getOptionsDiagnostics().map(d => ts.flattenDiagnosticMessageText(d.messageText, '\n')), [],
+          'external inventory: TypeScript options')
+        checker = program.getTypeChecker()
+      }
+      return checker
+    }
+    const changed = new Set([...new Set([...sources.keys(), ...input.keys()])]
+      .filter(file => sources.get(file) !== input.get(file)).map(virtual))
+    let globalChange = false
+    for (const file of changed) {
+      const tree = trees.get(file)
+      const name = path.relative(root, file).split(path.sep).join('/')
+      const before = baselineSyntax.get(name)?.tree
+      const augmented = node => ts.isModuleDeclaration(node) || ts.forEachChild(node, augmented)
+      if (!tree || !ts.isExternalModule(tree) || (before && !ts.isExternalModule(before)) ||
+          augmented(tree) || (before && augmented(before))) { globalChange = true; break }
+    }
+    if (globalChange) for (const file of trees.keys()) changed.add(file)
+    for (let pass = 0; pass < trees.size; pass++) {
+      let added = false
+      for (const [file] of trees) {
+        if (changed.has(file)) continue
+        if (dependencies.get(file).some(name => candidates(name, file).some(candidate => changed.has(candidate)))) {
+          changed.add(file)
+          added = true
+        }
+      }
+      if (!added) break
+    }
+    if (inspectStorage) return inspectStorage({getChecker, trees, virtual, changed})
+    getChecker()
     const vmTree = trees.get(virtual(interpreter))
     assert(vmTree && vmTree.parseDiagnostics.length === 0, 'external inventory: interpreter parse')
     const symbols = new Set(), runtimeSymbols = new Set()
@@ -547,7 +589,15 @@ function externalGraphChecks() {
       runtimeSymbols.add(symbol)
       if (graphClasses.includes(name)) symbols.add(symbol)
     }
+    const sensitivityCache = new Map()
     const sensitive = (type, tracked = symbols, seen = new Set(), depth = 0) => {
+      if (depth) return inspectSensitive(type, tracked, seen, depth)
+      if (!sensitivityCache.has(tracked)) sensitivityCache.set(tracked, new Map())
+      const cached = sensitivityCache.get(tracked)
+      if (!cached.has(type)) cached.set(type, inspectSensitive(type, tracked, seen, depth))
+      return cached.get(type)
+    }
+    const inspectSensitive = (type, tracked, seen, depth) => {
       if (!type || seen.has(type)) return false
       assert(depth < 32, 'external inventory: type depth')
       seen.add(type)
@@ -565,7 +615,7 @@ function externalGraphChecks() {
       return false
     }
     const storageOwners = new Set()
-    for (const [file, owner] of ownership.B.roots) {
+    for (const [file, owner] of [...ownership.B.owners, ...ownership.B.roots]) {
       const declaration = trees.get(virtual(file)).statements.find(node => ts.isClassDeclaration(node) && node.name?.text === owner)
       if (declaration) storageOwners.add(checker.getSymbolAtLocation(declaration.name))
     }
@@ -580,49 +630,44 @@ function externalGraphChecks() {
             (sensitive(checker.getTypeAtLocation(member), runtimeSymbols) ||
              sensitive(checker.getTypeAtLocation(member), interfaceOwners)))) {
           interfaceOwners.add(symbol)
+          sensitivityCache.delete(interfaceOwners)
           added = true
         }
       }
       if (!added) break
       assert(pass < interfaces.length, 'external inventory: interface origin bound')
     }
-    const changed = new Set([...new Set([...sources.keys(), ...input.keys()])]
-      .filter(file => sources.get(file) !== input.get(file)).map(virtual))
-    let globalChange = false
-    for (const file of changed) {
-      const tree = trees.get(file)
-      const name = path.relative(root, file).split(path.sep).join('/')
-      const before = sources.has(name) ? parse(file, sources.get(name)) : undefined
-      const augmented = node => ts.isModuleDeclaration(node) || ts.forEachChild(node, augmented)
-      if (!tree || !ts.isExternalModule(tree) || (before && !ts.isExternalModule(before)) ||
-          augmented(tree) || (before && augmented(before))) { globalChange = true; break }
-    }
-    if (globalChange) for (const file of trees.keys()) changed.add(file)
-    for (let pass = 0; pass < trees.size; pass++) {
-      let added = false
-      for (const [file] of trees) {
-        if (changed.has(file)) continue
-        if (dependencies.get(file).some(name => candidates(name, file).some(candidate => changed.has(candidate)))) {
-          changed.add(file)
-          added = true
-        }
-      }
-      if (!added) break
-    }
     const accesses = [], imports = [], constructors = [], fresh = [], rootsFound = [], surfaces = new Map(), ownerOrigins = new Map()
+    for (const kind of ['A', 'B']) {
+      for (const [name, sig, body] of ownership[kind].constructors) {
+        const cls = vmTree.statements.find(n => ts.isClassDeclaration(n) && n.name?.text === name)
+        const ctors = cls.members.filter(ts.isConstructorDeclaration)
+        assert.equal(ctors.length, 1, 'external inventory: constructor ' + name)
+        const actual = canonical(print(ctors[0]))
+        const expected = parse('ctor.ts', `class Review { ${sig} { ${body} } }`).statements[0].members[0]
+        assert.equal(actual, canonical(print(expected)), 'external inventory: constructor ownership/signatures changed')
+        constructors.push([kind, name, actual])
+      }
+    }
     let visited = 0
-    for (const [file] of input) {
+    const files = [...input.keys()].sort((a, b) =>
+      Number(sources.get(a) === input.get(a)) - Number(sources.get(b) === input.get(b)))
+    for (const file of files) {
       if (file === interpreter) continue
       const cached = fileCache.get(file)
       if (cached && !changed.has(virtual(file)) && cached.text === input.get(file)) {
+        visited += cached.visited
+        assert(visited <= 1500000, 'external inventory: AST node bound')
         accesses.push(...cached.accesses)
         imports.push(...cached.imports)
         fresh.push(...cached.fresh)
         rootsFound.push(...cached.rootsFound)
         if (cached.entries.length) surfaces.set(file, cached.entries)
         if (cached.ownerEntries.length) ownerOrigins.set(file, cached.ownerEntries)
+        if (inspectFile) inspectFile(file, cached)
         continue
       }
+      const start = visited
       const starts = [accesses.length, imports.length, fresh.length, rootsFound.length]
       const tree = trees.get(virtual(file)), entries = [], roots = new Set(), ownerEntries = [], ownerRoots = new Set()
       const add = (node, owner, kind) => {
@@ -725,26 +770,1123 @@ function externalGraphChecks() {
       }
       if (entries.length) surfaces.set(file, entries)
       if (ownerEntries.length) ownerOrigins.set(file, ownerEntries)
-      if (input === sources) fileCache.set(file, {text: input.get(file), entries, ownerEntries,
+      const result = {text: input.get(file), visited: visited - start, entries, ownerEntries,
         accesses: accesses.slice(starts[0]), imports: imports.slice(starts[1]),
-        fresh: fresh.slice(starts[2]), rootsFound: rootsFound.slice(starts[3])})
-    }
-    for (const kind of ['A', 'B']) {
-      for (const [name] of ownership[kind].constructors) {
-        const cls = vmTree.statements.find(n => ts.isClassDeclaration(n) && n.name?.text === name)
-        const ctors = cls.members.filter(ts.isConstructorDeclaration)
-        assert.equal(ctors.length, 1, 'external inventory: constructor ' + name)
-        constructors.push([kind, name, canonical(print(ctors[0]))])
-      }
+        fresh: fresh.slice(starts[2]), rootsFound: rootsFound.slice(starts[3])}
+      if (input === sources) fileCache.set(file, result)
+      if (inspectFile) inspectFile(file, result)
     }
     return {accesses, imports, constructors, fresh, rootsFound, surfaces, ownerOrigins}
   }
+  const soleWriterGuard = input => inventory(input, ({getChecker, trees, virtual, changed}) => {
+    const fail = (valid, message) => assert(valid, 'sole writer: ' + message)
+    const declarations = (file, names) => names.map(name => {
+      const found = trees.get(virtual(file))?.statements.filter(node => node.name?.text === name)
+      fail(found?.length === 1, 'protected declaration ' + file + ':' + name)
+      return found[0]
+    })
+    const ioFile = 'runtime/StateIo.ets', poolFile = 'runtime/StateIoTaskPool.ets'
+    const cleanupFile = 'runtime/StateCleanupTaskPool.ets', managerFile = 'runtime/StateManager.ets'
+    const formFile = 'vera/LiveFormService.ets', storeFile = 'vera/ProjectStore.ets'
+    const protectedNodes = [
+      ...declarations(ioFile, ['StateIo', 'runStateIoTask', 'runStateCleanupTask']),
+      ...declarations(poolFile, ['StateIoTaskPool']),
+      ...declarations(cleanupFile, ['StateCleanupTaskPool']),
+      ...declarations('runtime/shared/StatePort.ets', ['StateStoragePort', 'StateStorageFactory']),
+      ...declarations(poolFile, ['stateIoTask']),
+      ...declarations(cleanupFile, ['stateCleanupTask'])
+    ]
+    const pinNode = (node, text, label) => {
+      fail(canonical(print(node)) === canonical(text), 'reviewed boundary changed ' + label)
+    }
+    const pin = (file, name, text) => pinNode(declarations(file, [name])[0], text, file + ':' + name)
+    const pinMember = (file, name, member, text) => {
+      const nodes = declarations(file, [name])[0].members.filter(node =>
+        (ts.isConstructorDeclaration(node) ? 'constructor' : node.name?.text) === member)
+      fail(nodes.length === 1, 'protected member ' + name + '.' + member)
+      pinNode(nodes[0], text, file + ':' + name + '.' + member)
+    }
+    pinMember(storeFile, 'ProjectStore', 'createStateStorage', `createStateStorage(): StateStoragePort {
+      return new StateIoTaskPool(this.stateRoot(), { directoryFsync: 'REQUIRED' }, STATE_MAX_BYTES)
+    }`)
+    pin(ioFile, 'runStateCleanupTask', `export function runStateCleanupTask(root: string, options: StateIoOptions,
+        request: StateCleanupTaskRequest): StateCleanupTaskReply {
+      let result: StateCleanupResult
+      try {
+        let io = new StateIo(root, options)
+        io.removeStateFilesKeepingStableLocks(request.scope)
+        let removed: StateRemovedResult = { status: 'REMOVED' }
+        result = removed
+      } catch (error) {
+        let issue: StateIoError = error instanceof StateIoError ? error :
+          new StateIoError('STATE_COMMIT_UNCERTAIN', 'cleanup-worker')
+        if (issue.code === 'STATE_COMMIT_UNCERTAIN') {
+          let uncertain: UncertainCommitResult = {
+            status: 'COMMIT_UNCERTAIN', code: 'STATE_COMMIT_UNCERTAIN', stage: issue.stage
+          }
+          result = uncertain
+        } else {
+          let failed: FailedCommitResult = { status: 'FAILED', code: issue.code, stage: issue.stage }
+          result = failed
+        }
+      }
+      let reply: StateCleanupTaskReply = { operationId: request.operationId, result: result }
+      return reply
+    }`)
+    pin(ioFile, 'runStateIoTask', `export function runStateIoTask(root: string, options: StateIoOptions, request: StateIoTaskRequest): StateIoTaskReply {
+      let reply: StateIoTaskReply = { operationId: request.operationId, kind: request.kind }
+      try {
+        let io = new StateIo(root, options)
+        if (request.kind === 'load') { reply.load = io.load(request.appId as string, request.expectedStamp as string) }
+        else if (request.kind === 'recoverLost') { reply.load = io.recoverLost(request.appId as string, request.expectedStamp as string) }
+        else if (request.kind === 'readHeader') { reply.header = io.readHeader(request.appId as string) }
+        else if (request.kind === 'commit') { reply.result = io.commit(request.commit as CommitTaskRequest) }
+        else if (request.kind === 'publishGeneration') {
+          reply.result = io.publishGeneration(request.publication as PublishGenerationRequest)
+        } else { throw new StateIoError('STATE_VALIDATION_FAILED', 'task-kind') }
+      } catch (error) {
+        if (request.kind === 'load' || request.kind === 'recoverLost') {
+          reply.load = { kind: 'UNAVAILABLE', code: 'STATE_COMMIT_UNCERTAIN', stage: 'task-worker' }
+        } else if (request.kind === 'readHeader') {
+          let issue = error instanceof StateIoError ? error : new StateIoError('STATE_READ_FAILED', 'task-worker')
+          let taskError: StateIoTaskError = { code: issue.code, stage: issue.stage }
+          reply.error = taskError
+        } else {
+          reply.result = { status: 'COMMIT_UNCERTAIN', code: 'STATE_COMMIT_UNCERTAIN', stage: 'task-worker' }
+        }
+      }
+      return reply
+    }`)
+    pinMember(ioFile, 'StateIo', 'readCommittedReadOnly', `readCommittedReadOnly(appId: string, expectedStamp: string): LoadResult {
+      try {
+        let paths = this.paths(appId)
+        this.checkRoot()
+        if (!this.directoryExists(paths)) { return { kind: 'ABSENT' } }
+        let main = this.readFile(paths.main, appId, 'readonly-main')
+        if (main.kind === 'VALID') { return ready(main, 'MAIN', expectedStamp) }
+        this.checkRoot()
+        if (main.kind === 'ABSENT') { return { kind: 'ABSENT' } }
+        let issue = main.error as StateIoError
+        return main.kind === 'IO' ? unavailable(issue) : { kind: 'LOST', code: issue.code, stage: issue.stage }
+      } catch (error) { return unavailable(failure(error, 'readonly', 'STATE_READ_FAILED')) }
+    }`)
+    pin(ioFile, 'StateIoError', `export class StateIoError extends Error {
+      code: StateErrorCode
+      stage: string
+      causeCode?: string | number
+      constructor(code: StateErrorCode, stage: string, causeCode?: string | number) {
+        super(code + ' at ' + stage)
+        this.code = code
+        this.stage = stage
+        this.causeCode = causeCode
+      }
+    }`)
+    for (const text of ['private root: string', "private directoryFsync: 'REQUIRED' | 'UNSUPPORTED'",
+      'private lockTimeoutMs: number', 'private tmpOrphanAgeMs: number', 'private readonly telemetryClock: () => number']) {
+      pinMember(ioFile, 'StateIo', text.match(/(?:readonly )?(\w+):/)[1], text)
+    }
+    pinMember(ioFile, 'StateIo', 'constructor', String.raw`constructor(root: string, options: StateIoOptions,
+        telemetryClock: () => number = (): number => systemDateTime.getUptime(systemDateTime.TimeType.STARTUP)) {
+      if (typeof root !== 'string' || !root.startsWith('/') || root.indexOf('\u0000') >= 0 ||
+          root.split('/').some((part: string) => part === '.' || part === '..') ||
+          !options || (options.directoryFsync !== 'REQUIRED' && options.directoryFsync !== 'UNSUPPORTED')) {
+        throw new StateIoError('STATE_VALIDATION_FAILED', 'options')
+      }
+      this.telemetryClock = telemetryClock
+      this.root = root.replace(/\/+$/, '') || '/'
+      this.directoryFsync = options.directoryFsync
+      this.lockTimeoutMs = options.lockTimeoutMs === undefined ? 100 : options.lockTimeoutMs
+      this.tmpOrphanAgeMs = options.tmpOrphanAgeMs === undefined ? 60000 : options.tmpOrphanAgeMs
+      if (!Number.isSafeInteger(this.lockTimeoutMs) || this.lockTimeoutMs < 0 ||
+          !Number.isSafeInteger(this.tmpOrphanAgeMs) || this.tmpOrphanAgeMs < 0) {
+        throw new StateIoError('STATE_VALIDATION_FAILED', 'options')
+      }
+    }`)
+    pinMember(ioFile, 'StateIo', 'paths', String.raw`private paths(appId: string): StatePaths {
+      if (typeof appId !== 'string') { throw new StateIoError('STATE_VALIDATION_FAILED', 'app-id') }
+      let parts = appId.split('/')
+      if (parts.length !== 2 || parts.some((part: string) =>
+        part.length === 0 || part === '.' || part === '..' || /[\u0000-\u001f\\]/.test(part))) {
+        throw new StateIoError('STATE_VALIDATION_FAILED', 'app-id')
+      }
+      let directory = this.root + (this.root === '/' ? '' : '/') + parts[0]
+      let main = directory + '/' + parts[1] + '.state.json'
+      return { directory: directory, main: main, backup: main + '.bak', lock: main + '.commit.lock' }
+    }`)
+    pinMember(ioFile, 'StateIo', 'checkRoot', `private checkRoot(): void {
+      let file: fs.File | null = null
+      try { file = fs.openSync(this.root, fs.OpenMode.READ_ONLY | fs.OpenMode.DIR | fs.OpenMode.NOFOLLOW) }
+      catch (error) { throw new StateIoError('STATE_UNAVAILABLE', 'root-open', errorCode(error)) }
+      finally { closeQuietly(file) }
+    }`)
+    pinMember(ioFile, 'StateIo', 'directoryExists', `private directoryExists(paths: StatePaths): boolean {
+      let file: fs.File | null = null
+      try {
+        file = fs.openSync(paths.directory, fs.OpenMode.READ_ONLY | fs.OpenMode.DIR | fs.OpenMode.NOFOLLOW)
+        return true
+      } catch (error) {
+        this.checkRoot()
+        if (errorCode(error) === 13900002) { return false }
+        throw failure(error, 'project-open', 'STATE_UNAVAILABLE')
+      } finally { closeQuietly(file) }
+    }`)
+    pinMember(ioFile, 'StateIo', 'readFile', `private readFile(path: string, appId: string, stage: string): FileRead {
+      let file: fs.File | null = null
+      try {
+        try { file = fs.openSync(path, fs.OpenMode.READ_ONLY | fs.OpenMode.NOFOLLOW) }
+        catch (error) {
+          if (errorCode(error) === 13900002) { return { kind: 'ABSENT' } }
+          throw error as Error
+        }
+        let size = fileSize(file, stage)
+        let bytes = readBytes(file, size, stage)
+        if (fileSize(file, stage) !== size) { throw new StateIoError('STATE_CORRUPTED', stage + '-changed') }
+        let text = strictUtf8(bytes, stage)
+        let data = validateStateFile(text, appId, STATE_SCHEMA_VERSION)
+        return { kind: 'VALID', text: text, data: data }
+      } catch (error) {
+        let issue = failure(error, stage, 'STATE_READ_FAILED')
+        return { kind: issue.code === 'STATE_CORRUPTED' ? 'CORRUPT' : 'IO', error: issue }
+      } finally { closeQuietly(file) }
+    }`)
+    for (const [name, text] of [
+      ['errorCode', `function errorCode(error: Object): string | number | undefined { return (error as StateIoError).code }`],
+      ['failure', `function failure(error: Object, stage: string, code: StateErrorCode): StateIoError {
+        if (error instanceof StateIoError) { return error }
+        if (error instanceof StateFormatError) { return new StateIoError(error.code as StateErrorCode, stage) }
+        let nativeCode = errorCode(error)
+        if (nativeCode === 13900012 || nativeCode === 13900001) { return new StateIoError('STATE_UNAVAILABLE', stage, nativeCode) }
+        return new StateIoError(code, stage, nativeCode)
+      }`],
+      ['closeQuietly', `function closeQuietly(file: fs.File | null): void {
+        if (file !== null) { try { fs.closeSync(file) } catch (_error) {} }
+      }`],
+      ['strictUtf8', `function strictUtf8(bytes: Uint8Array, stage: string): string {
+        let decoder: util.TextDecoder
+        try { decoder = util.TextDecoder.create('utf-8', { fatal: true, ignoreBOM: true }) }
+        catch (error) { throw failure(error, stage + '-decoder', 'STATE_SERIALIZATION_FAILED') }
+        let text: string
+        try { text = bytes.byteLength === 0 ? '' : decoder.decodeToString(bytes, { stream: false }) }
+        catch (_error) { throw new StateIoError('STATE_CORRUPTED', stage + '-utf8') }
+        let encoded: Uint8Array
+        try { encoded = statePayloadBytes(text) }
+        catch (error) { throw failure(error, stage + '-encoder', 'STATE_SERIALIZATION_FAILED') }
+        if (encoded.byteLength !== bytes.byteLength) { throw new StateIoError('STATE_CORRUPTED', stage + '-utf8') }
+        for (let i = 0; i < bytes.byteLength; i++) {
+          if (bytes[i] !== encoded[i]) { throw new StateIoError('STATE_CORRUPTED', stage + '-utf8') }
+        }
+        return text
+      }`],
+      ['readBytes', `function readBytes(file: fs.File, size: number, stage: string): Uint8Array {
+        let bytes = new Uint8Array(size)
+        let offset = 0
+        while (offset < size) {
+          let length = Math.min(size - offset, STATE_IO_CHUNK_BYTES)
+          let chunk = new ArrayBuffer(length)
+          let count: number
+          try { count = fs.readSync(file.fd, chunk, { offset: offset, length: length }) }
+          catch (error) { throw failure(error, stage + '-read', 'STATE_READ_FAILED') }
+          if (count === 0) { throw new StateIoError('STATE_CORRUPTED', stage + '-truncated') }
+          if (!Number.isInteger(count) || count < 0 || count > length) { throw new StateIoError('STATE_READ_FAILED', stage + '-read-count') }
+          bytes.set(new Uint8Array(chunk, 0, count), offset)
+          offset += count
+        }
+        return bytes
+      }`],
+      ['fileSize', `function fileSize(file: fs.File, stage: string): number {
+        try {
+          let stat = fs.statSync(file.fd)
+          if (!stat.isFile() || !Number.isSafeInteger(stat.size) || stat.size < 0) {
+            throw new StateIoError('STATE_CORRUPTED', stage + '-stat')
+          }
+          return stat.size
+        } catch (error) { throw failure(error, stage + '-stat', 'STATE_READ_FAILED') }
+      }`],
+      ['ready', `function ready(read: FileRead, source: 'MAIN' | 'BAK', expectedStamp: string): LoadResult {
+        let data = read.data as DecodedStateData
+        let matching = data.stamp === expectedStamp
+        return { kind: 'READY', format: data.format, source: source, header: data.header,
+          stamp: data.stamp, encodedState: matching ? data.encodedState : undefined,
+          matchingStamp: matching, recovered: source === 'BAK' }
+      }`],
+      ['unavailable', `function unavailable(error: StateIoError): LoadResult {
+        return { kind: 'UNAVAILABLE', code: error.code, stage: error.stage }
+      }`]
+    ]) pin(ioFile, name, text)
+    const readOnlyFields = declarations(ioFile, ['StateIo'])[0].members.filter(ts.isPropertyDeclaration)
+    assert.deepEqual(readOnlyFields.map(node => print(node.name)),
+      ['root', 'directoryFsync', 'lockTimeoutMs', 'tmpOrphanAgeMs', 'telemetryClock'], 'sole writer: StateIo field inventory')
+    fail(!declarations(ioFile, ['StateIo'])[0].members.some(ts.isClassStaticBlockDeclaration), 'StateIo static initialization')
+    for (const [name, value] of [['STATE_SCHEMA_VERSION', '1'], ['STATE_IO_CHUNK_BYTES', '65536']]) {
+      const statements = trees.get(virtual(ioFile)).statements.filter(ts.isVariableStatement)
+        .filter(node => node.declarationList.declarations.some(d => d.name.text === name))
+      fail(statements.length === 1, 'read-only constant ' + name)
+      pinNode(statements[0], `const ${name}: number = ${value}`, name)
+    }
+    const formatFile = 'runtime/StateFileFormat.ets'
+    for (const [name, text] of [
+      ['StateFormatError', `export class StateFormatError extends Error {
+        code: string
+        constructor(code: string, message: string) { super(message); this.code = code }
+      }`],
+      ['corrupted', `function corrupted(message: string): never { throw new StateFormatError('STATE_CORRUPTED', message) }`],
+      ['validCounter', `function validCounter(value: number): boolean {
+        return Number.isSafeInteger(value) && value >= 0 && value < Number.MAX_SAFE_INTEGER
+      }`],
+      ['validateMetadata', String.raw`function validateMetadata(meta: StateMetadata): void {
+        if (typeof meta.appId !== 'string' || meta.appId.length === 0 ||
+            !Number.isSafeInteger(meta.schemaVersion) || meta.schemaVersion < 1 ||
+            !validCounter(meta.vmGeneration) || !validCounter(meta.revision) ||
+            typeof meta.stamp !== 'string' || meta.stamp.indexOf('\u0000') >= 0) {
+          corrupted('Invalid state metadata')
+        }
+      }`],
+      ['canonicalPayload', `export function canonicalPayload(value: Object): string {
+        return canonicalValue(value, new Set<Object>())
+      }`],
+      ['canonicalValue', `function canonicalValue(value: Object, active: Set<Object>): string {
+        if (value === null) { return 'null' }
+        if (typeof value === 'string' || typeof value === 'boolean') { return JSON.stringify(value) }
+        if (typeof value === 'number' && Number.isFinite(value)) { return JSON.stringify(value) }
+        if (typeof value !== 'object' || active.has(value)) {
+          throw new StateFormatError('STATE_VALIDATION_FAILED', 'Unsupported or cyclic payload')
+        }
+        active.add(value)
+        let parts: string[] = []
+        if (Array.isArray(value)) {
+          for (let i = 0; i < value.length; i++) { parts.push(canonicalValue(value[i], active)) }
+        } else {
+          if (value instanceof Date || value instanceof Map || value instanceof Set || value instanceof ArrayBuffer ||
+              ArrayBuffer.isView(value)) {
+            throw new StateFormatError('STATE_VALIDATION_FAILED', 'Payload must contain only JSON values')
+          }
+          let record = value as Record<string, Object>
+          for (let key of Object.keys(record).sort()) { parts.push(JSON.stringify(key) + ':' + canonicalValue(record[key], active)) }
+        }
+        active.delete(value)
+        return Array.isArray(value) ? '[' + parts.join(',') + ']' : '{' + parts.join(',') + '}'
+      }`],
+      ['validateValue', `function validateValue(raw: Object): void {
+        if (!Array.isArray(raw)) { corrupted('Invalid tagged state') }
+        let parts = raw as Object[]
+        let tag = parts[0]
+        if (tag === 'z' && parts.length === 1) { return }
+        if (parts.length === 2) {
+          if (tag === 'n' && typeof parts[1] === 'number' && Number.isFinite(parts[1])) { return }
+          if (tag === 's' && typeof parts[1] === 'string') { return }
+          if (tag === 'b' && typeof parts[1] === 'boolean') { return }
+          if (tag === 'a' && Array.isArray(parts[1])) {
+            for (let item of parts[1] as Object[]) { validateValue(item) }
+            return
+          }
+        }
+        if (tag === 'o' && parts.length === 3 && typeof parts[1] === 'string' && Array.isArray(parts[2])) {
+          let names = new Set<string>()
+          for (let entry of parts[2] as Object[]) {
+            if (!Array.isArray(entry)) { corrupted('Invalid object entry') }
+            let pair = entry as Object[]
+            if (pair.length !== 2 || typeof pair[0] !== 'string' || names.has(pair[0] as string)) {
+              corrupted('Invalid or duplicate object field')
+            }
+            names.add(pair[0] as string)
+            validateValue(pair[1])
+          }
+          return
+        }
+        corrupted('Invalid tagged state')
+      }`],
+      ['statePayloadBytes', `export function statePayloadBytes(payload: string): Uint8Array {
+        return payload.length === 0 ? new Uint8Array(0) : new util.TextEncoder().encodeInto(payload)
+      }`],
+      ['statePayloadHash', String.raw`export function statePayloadHash(stamp: string, payload: Uint8Array): string {
+        if (typeof stamp !== 'string' || stamp.indexOf('\u0000') >= 0) { corrupted('Invalid state stamp') }
+        try {
+          let digest = cryptoFramework.createMd('SHA256')
+          digest.updateSync({ data: statePayloadBytes(stamp + '\u0000') })
+          digest.updateSync({ data: payload })
+          let hex = ''
+          for (let byte of digest.digestSync().data) { hex += byte.toString(16).padStart(2, '0') }
+          return 'sha256:' + hex
+        } catch (error) { throw error as Error }
+      }`],
+      ['HeaderScanner', String.raw`class HeaderScanner {
+        position: number = 0
+        text: string
+        complete: boolean
+        constructor(text: string, complete: boolean) { this.text = text; this.complete = complete }
+        space(): void {
+          while (this.position < this.text.length && /[\t\n\r ]/.test(this.text[this.position])) { this.position++ }
+        }
+        need(): never {
+          if (this.complete) { corrupted('Truncated state header') }
+          throw new StateFormatError('HEADER_INCOMPLETE', 'State header needs a full read')
+        }
+        character(expected: string): void {
+          this.space()
+          if (this.position === this.text.length) { this.need() }
+          if (this.text[this.position++] !== expected) { corrupted('Invalid state header order') }
+        }
+        scalar(): Object {
+          this.space()
+          let start = this.position
+          if (start === this.text.length) { this.need() }
+          if (this.text[this.position] === '"') {
+            this.position++
+            let closed = false
+            while (this.position < this.text.length) {
+              let c = this.text[this.position++]
+              if (c === '\\') { this.position++ }
+              else if (c === '"') { closed = true; break }
+            }
+            if (!closed) { this.need() }
+          } else {
+            while (this.position < this.text.length && !/[,}\t\n\r ]/.test(this.text[this.position])) { this.position++ }
+            if (this.position === this.text.length && !this.complete) { this.need() }
+          }
+          try { return JSON.parse(this.text.slice(start, this.position)) as Object }
+          catch (_error) { return corrupted('Invalid state header value') }
+        }
+      }`],
+      ['readStateHeader', String.raw`export function readStateHeader(text: string, complete: boolean = false): StateHeaderRead {
+        let scanner = new HeaderScanner(text, complete)
+        let names = ['format', 'appId', 'schemaVersion', 'vmGeneration', 'revision', 'payloadLength', 'payloadHash', 'stamp']
+        let fields: Record<string, Object> = {}
+        try {
+          scanner.character('{')
+          for (let i = 0; i < names.length; i++) {
+            if (i > 0) { scanner.character(',') }
+            if (scanner.scalar() !== names[i]) { corrupted('Invalid state header order') }
+            scanner.character(':')
+            fields[names[i]] = scanner.scalar()
+          }
+          scanner.character(',')
+          if (scanner.scalar() !== 'value') { corrupted('Missing state payload') }
+          scanner.character(':')
+          scanner.space()
+        } catch (error) {
+          if ((error as StateFormatError).code === 'HEADER_INCOMPLETE') { return { kind: 'NEED_MORE' } }
+          throw error as Error
+        }
+        let meta: StateMetadata = {
+          appId: fields['appId'] as string, schemaVersion: fields['schemaVersion'] as number,
+          vmGeneration: fields['vmGeneration'] as number, revision: fields['revision'] as number, stamp: fields['stamp'] as string
+        }
+        validateMetadata(meta)
+        if (fields['format'] !== 2 || !Number.isSafeInteger(fields['payloadLength']) ||
+            (fields['payloadLength'] as number) < 0 || typeof fields['payloadHash'] !== 'string' ||
+            !/^sha256:[0-9a-f]{64}$/.test(fields['payloadHash'] as string)) { corrupted('Invalid state header') }
+        let header: StateHeader = {
+          format: 2, appId: meta.appId, schemaVersion: meta.schemaVersion,
+          vmGeneration: meta.vmGeneration, revision: meta.revision,
+          payloadLength: fields['payloadLength'] as number, payloadHash: fields['payloadHash'] as string
+        }
+        return { kind: 'READY', header: header, stamp: meta.stamp, payloadOffset: scanner.position }
+      }`],
+      ['validateStateFile', String.raw`export function validateStateFile(text: string, appId: string, schemaVersion: number = 1): DecodedStateData {
+        try {
+          let raw = JSON.parse(text) as Record<string, Object>
+          if (raw === null || Array.isArray(raw) || typeof raw !== 'object') { corrupted('Invalid state file') }
+          if (Object.keys(raw).indexOf('format') < 0) {
+            if (typeof raw['stamp'] !== 'string' || (raw['stamp'] as string).indexOf('\u0000') >= 0) {
+              corrupted('Invalid legacy stamp')
+            }
+            validateValue(raw['value'])
+            return { format: 'LEGACY', stamp: raw['stamp'] as string, vmGeneration: 0, revision: 0,
+              encodedState: canonicalPayload(raw['value']), value: raw['value'], ignoreBackup: true }
+          }
+          let read = readStateHeader(text, true)
+          let header = read.header as StateHeader
+          if (Object.keys(raw).length !== 9 || header.appId !== appId || header.schemaVersion !== schemaVersion) {
+            corrupted('State identity or schema mismatch')
+          }
+          let end = text.length
+          while (end > 0 && /[\t\n\r ]/.test(text[end - 1])) { end-- }
+          let payload = text.slice(read.payloadOffset as number, end - 1)
+          let bytes = statePayloadBytes(payload)
+          if (bytes.byteLength !== header.payloadLength || statePayloadHash(read.stamp as string, bytes) !== header.payloadHash) {
+            corrupted('State payload integrity mismatch')
+          }
+          let encoded = JSON.parse(payload) as Object
+          validateValue(encoded)
+          return { format: 'FORMAT2', header: header, stamp: read.stamp as string,
+            vmGeneration: header.vmGeneration, revision: header.revision,
+            encodedState: payload, value: encoded, ignoreBackup: false }
+        } catch (error) {
+          if (error instanceof SyntaxError || error instanceof RangeError) { return corrupted('Invalid state file') }
+          throw error as Error
+        }
+      }`]
+    ]) pin(formatFile, name, text)
+    pin(poolFile, 'stateIoTask', `@Concurrent
+      function stateIoTask(root: string, options: StateIoOptions, request: StateIoTaskRequest): StateIoTaskReply {
+        return runStateIoTask(root, options, request)
+      }`)
+    pin(cleanupFile, 'stateCleanupTask', `@Concurrent
+      function stateCleanupTask(root: string, options: StateIoOptions, request: StateCleanupTaskRequest): StateCleanupTaskReply {
+        try { return runStateCleanupTask(root, options, request) }
+        catch (_error) {
+          let result: UncertainCommitResult = {
+            status: 'COMMIT_UNCERTAIN', code: 'STATE_COMMIT_UNCERTAIN', stage: 'cleanup-worker-execute'
+          }
+          let reply: StateCleanupTaskReply = { operationId: request.operationId, result: result }
+          return reply
+        }
+      }`)
+    pin(formFile, 'FormCommittedStateIo', `class FormCommittedStateIo implements ProjectCommittedReadOnlyPort {
+      private io: StateIo
+      constructor(root: string) { this.io = new StateIo(root, { directoryFsync: 'REQUIRED' }) }
+      readCommittedReadOnly(appId: string, expectedStamp: string): LoadResult {
+        const operation = StateLifecycleDiag.operation()
+        const started = StateLifecycleDiag.now()
+        StateLifecycleDiag.emit('FORM', 'READ_BEGIN', operation)
+        try {
+          const result = this.io.readCommittedReadOnly(appId, expectedStamp)
+          StateLifecycleDiag.emit('FORM', 'READ_END', operation, result.kind, StateLifecycleDiag.elapsed(started),
+            undefined, result.matchingStamp)
+          return result
+        } catch (error) {
+          StateLifecycleDiag.emit('FORM', 'READ_END', operation, 'REJECTED', StateLifecycleDiag.elapsed(started))
+          throw error as Error
+        }
+      }
+    }`)
+    pin(storeFile, 'ProjectStateStorageFactory', `class ProjectStateStorageFactory implements StateStorageFactory {
+      private store: ProjectStore
+      constructor(store: ProjectStore) { this.store = store }
+      create(): StateStoragePort { return this.store.createStateStorage() }
+    }`)
+    pin('runtime/AppActor.ets', 'AppActorStorageFactory', `class AppActorStorageFactory implements StateStorageFactory {
+      create(): StateStoragePort { return store.createStateStorage() }
+    }`)
+    const allowedImports = {
+      StateIo: [formFile], runStateIoTask: [poolFile], runStateCleanupTask: [cleanupFile],
+      StateIoTaskPool: [storeFile], StateCleanupTaskPool: [storeFile],
+      StateStoragePort: [managerFile, storeFile, 'runtime/AppActor.ets'],
+      StateStorageFactory: [managerFile, storeFile, 'runtime/AppActor.ets']
+    }
+    for (const [file, name] of [[poolFile, 'stateIoTask'], [cleanupFile, 'stateCleanupTask']]) {
+      fail(/^@Concurrent\s+function\b/.test(declarations(file, [name])[0].getText()), 'concurrent worker ' + name)
+    }
+    const dispatchSites = new Map([
+      ['StateIoTaskPool.load', [`this.enqueue({ operationId: '', kind: 'load', appId: identity, expectedStamp: expectedStamp })`]],
+      ['StateIoTaskPool.recoverLost', [`this.enqueue({ operationId: '', kind: 'recoverLost', appId: identity, expectedStamp: expectedStamp })`]],
+      ['StateIoTaskPool.readHeader', [`this.enqueue({ operationId: '', kind: 'readHeader', appId: identity })`]],
+      ['StateIoTaskPool.commit', [`this.enqueue({ operationId: id, kind: 'commit', commit: owned })`]],
+      ['StateIoTaskPool.publishGeneration', [`this.enqueue({ operationId: id, kind: 'publishGeneration', publication: owned })`]],
+      ['StateIoTaskPool.enqueue', ['this.execute(envelope)']]
+    ].map(([owner, calls]) => [owner, calls.map(canonical)]))
+    pinMember(poolFile, 'StateIoTaskPool', 'enqueue', `private enqueue(request: StateIoTaskRequest): Promise<StateIoTaskReply> {
+      let envelope: StateIoTaskRequest = {
+        operationId: this.envelopeId(), kind: request.kind, appId: request.appId,
+        expectedStamp: request.expectedStamp, commit: request.commit, publication: request.publication
+      }
+      let pending = this.tail.then(() => this.execute(envelope))
+      this.tail = pending.then(() => {}, () => {})
+      return pending
+    }`)
+    pin(poolFile, 'StateIoTaskPool', `export class StateIoTaskPool {
+      private root: string
+      private options: StateIoOptions
+      private stateMaxBytes: number
+      private tail: Promise<void> = Promise.resolve()
+      private accepting: boolean = true
+      private uncertain: boolean = false
+      private fenced: boolean = false
+      private sequence: number = 0
+      private pendingIds: Set<string> = new Set<string>()
+      constructor(root: string, options: StateIoOptions, stateMaxBytes: number) {
+        check(typeof root === 'string' && root.startsWith('/') && stamp(root) &&
+          !root.split('/').some((part: string) => part === '.' || part === '..'), 'options')
+        check(record(options, ['directoryFsync', 'lockTimeoutMs', 'tmpOrphanAgeMs']), 'options')
+        check(options.directoryFsync === 'REQUIRED' || options.directoryFsync === 'UNSUPPORTED', 'options')
+        let lockTimeoutMs = options.lockTimeoutMs === undefined ? 100 : options.lockTimeoutMs
+        let tmpOrphanAgeMs = options.tmpOrphanAgeMs === undefined ? 60000 : options.tmpOrphanAgeMs
+        check(counter(lockTimeoutMs) && counter(tmpOrphanAgeMs) && Number.isSafeInteger(stateMaxBytes) &&
+          stateMaxBytes > 0 && stateMaxBytes < 16 * 1024 * 1024, 'options')
+        this.root = root
+        let ownedOptions: StateIoOptions = {
+          directoryFsync: options.directoryFsync, lockTimeoutMs: lockTimeoutMs, tmpOrphanAgeMs: tmpOrphanAgeMs
+        }
+        this.options = ownedOptions
+        this.stateMaxBytes = stateMaxBytes
+      }
+      whenIdle(): Promise<void> {
+        return this.tail.then(() => {
+          if (this.uncertain) { throw new StateIoError('STATE_COMMIT_UNCERTAIN', 'task-drain-uncertain') }
+        })
+      }
+      close(): Promise<void> { this.accepting = false; return this.whenIdle() }
+      fence(): Promise<void> { return this.close() }
+      private admit(): void {
+        if (!this.accepting || this.fenced) { throw new StateIoError('STATE_UNAVAILABLE', 'task-fenced') }
+      }
+      private reserve(id: string): void {
+        check(typeof id === 'string' && id.length > 0 && id.length <= 256, 'operation-id')
+        check(!this.pendingIds.has(id), 'operation-id-duplicate')
+        this.pendingIds.add(id)
+      }
+      private envelopeId(): string {
+        check(counter(this.sequence + 1), 'operation-id-capacity')
+        return '@state-io:' + (++this.sequence)
+      }
+      private enqueue(request: StateIoTaskRequest): Promise<StateIoTaskReply> {
+        let envelope: StateIoTaskRequest = {
+          operationId: this.envelopeId(), kind: request.kind, appId: request.appId,
+          expectedStamp: request.expectedStamp, commit: request.commit, publication: request.publication
+        }
+        let pending = this.tail.then(() => this.execute(envelope))
+        this.tail = pending.then(() => {}, () => {})
+        return pending
+      }
+      private async execute(request: StateIoTaskRequest): Promise<StateIoTaskReply> {
+        if (this.fenced) { throw new StateIoError('STATE_UNAVAILABLE', 'task-fenced') }
+        let execution: Promise<Object>
+        try {
+          let task = new taskpool.Task(stateIoTask, this.root, this.options, request)
+          task.setTransferList(request.commit ? [request.commit.payload] : [])
+          execution = taskpool.execute(task, taskpool.Priority.MEDIUM)
+        } catch (_error) { throw new StateIoError('STATE_TASK_SUBMIT_FAILED', 'task-submit') }
+        let reply: StateIoTaskReply
+        try { reply = await execution as StateIoTaskReply }
+        catch (_error) { return this.unknown(request, 'task-execute') }
+        try {
+          if (!record(reply, ['operationId', 'kind', 'load', 'header', 'result', 'error']) ||
+              reply.operationId !== request.operationId || reply.kind !== request.kind) {
+            return this.unknown(request, 'task-correlation')
+          }
+          if (request.kind === 'load' || request.kind === 'recoverLost') {
+            if (reply.header !== undefined || reply.result !== undefined || reply.error !== undefined ||
+                !validLoad(reply.load as LoadResult, request.appId as string, request.expectedStamp as string)) {
+              return this.unknown(request, 'task-result')
+            }
+            if ((reply.load as LoadResult).code === 'STATE_COMMIT_UNCERTAIN') { this.uncertain = true; this.fenced = true }
+          } else if (request.kind === 'readHeader') {
+            if (reply.load !== undefined || reply.result !== undefined) { return this.unknown(request, 'task-result') }
+            if (reply.error !== undefined) {
+              if (reply.header !== undefined || !record(reply.error, ['code', 'stage']) ||
+                  !validCode(reply.error.code) || typeof reply.error.stage !== 'string') {
+                return this.unknown(request, 'task-result')
+              }
+            } else if (reply.header !== null && !validHeader(reply.header as StateHeader, request.appId as string)) {
+              return this.unknown(request, 'task-result')
+            }
+          } else {
+            if (reply.load !== undefined || reply.header !== undefined || reply.error !== undefined ||
+                !validCommit(reply.result as CommitResult)) { return this.unknown(request, 'task-result') }
+            let result = reply.result as CommitResult
+            if (result.status === 'COMMITTED' && result.revision !== (request.commit ?
+              request.commit.pre.baseRevision + 1 : (request.publication as PublishGenerationRequest).expectedRevision)) {
+              return this.unknown(request, 'task-result')
+            }
+            let status = result.status
+            if (status === 'COMMIT_UNCERTAIN') { this.uncertain = true }
+            if (status === 'COMMIT_UNCERTAIN' || status === 'FENCED_COMMIT' || status === 'STALE_REVISION') { this.fenced = true }
+          }
+        } catch (_error) { return this.unknown(request, 'task-result') }
+        return reply
+      }
+      private unknown(request: StateIoTaskRequest, stage: string): StateIoTaskReply {
+        this.uncertain = true
+        this.fenced = true
+        if (request.kind === 'readHeader') { throw new StateIoError('STATE_READ_FAILED', stage) }
+        if (request.kind === 'load' || request.kind === 'recoverLost') {
+          return { operationId: request.operationId, kind: request.kind,
+            load: { kind: 'UNAVAILABLE', code: 'STATE_COMMIT_UNCERTAIN', stage: stage } }
+        }
+        return { operationId: request.operationId, kind: request.kind,
+          result: { status: 'COMMIT_UNCERTAIN', code: 'STATE_COMMIT_UNCERTAIN', stage: stage } }
+      }
+      async load(identity: string, expectedStamp: string): Promise<LoadResult> {
+        try {
+          this.admit()
+          check(appId(identity) && stamp(expectedStamp), 'load-request')
+          let reply = await this.enqueue({ operationId: '', kind: 'load', appId: identity, expectedStamp: expectedStamp })
+          return reply.load as LoadResult
+        } catch (error) {
+          let issue = error as StateIoError
+          return { kind: 'UNAVAILABLE', code: issue.code, stage: issue.stage }
+        }
+      }
+      async recoverLost(identity: string, expectedStamp: string): Promise<LoadResult> {
+        try {
+          this.admit()
+          check(appId(identity) && stamp(expectedStamp), 'lost-request')
+          let reply = await this.enqueue({ operationId: '', kind: 'recoverLost', appId: identity, expectedStamp: expectedStamp })
+          return reply.load as LoadResult
+        } catch (error) {
+          let issue = error instanceof StateIoError ? error : new StateIoError('STATE_UNAVAILABLE', 'lost-authority-refused')
+          return { kind: 'UNAVAILABLE', code: issue.code, stage: issue.stage }
+        }
+      }
+      async readHeader(identity: string): Promise<StateHeader | null> {
+        this.admit()
+        check(appId(identity), 'header-request')
+        let reply = await this.enqueue({ operationId: '', kind: 'readHeader', appId: identity })
+        if (reply.error) { throw new StateIoError(reply.error.code, reply.error.stage) }
+        return reply.header as StateHeader | null
+      }
+      async commit(request: CommitTaskRequest): Promise<CommitTaskResult> {
+        let id = ''
+        let reserved = false
+        try {
+          check(record(request, ['operationId', 'pre', 'schemaVersion', 'stamp', 'payload', 'backupDue']), 'commit-request')
+          id = typeof request.operationId === 'string' ? request.operationId : ''
+          this.admit()
+          this.reserve(id)
+          reserved = true
+          check(record(request.pre, ['appId', 'vmGeneration', 'baseRevision']) && appId(request.pre.appId) &&
+            counter(request.pre.vmGeneration) && counter(request.pre.baseRevision) &&
+            request.pre.baseRevision + 1 < Number.MAX_SAFE_INTEGER && request.schemaVersion === 1 &&
+            stamp(request.stamp) && request.payload instanceof ArrayBuffer && typeof request.backupDue === 'boolean', 'commit-request')
+          check(request.payload.byteLength <= this.stateMaxBytes, 'payload-size')
+          let pre: CommitPrecondition = {
+            appId: request.pre.appId, vmGeneration: request.pre.vmGeneration, baseRevision: request.pre.baseRevision
+          }
+          let owned: CommitTaskRequest = {
+            operationId: id, pre: pre, schemaVersion: request.schemaVersion,
+            stamp: request.stamp, payload: request.payload.slice(0), backupDue: request.backupDue
+          }
+          let reply = await this.enqueue({ operationId: id, kind: 'commit', commit: owned })
+          return { operationId: id, result: reply.result as CommitResult }
+        } catch (error) { return this.refused(id, error) }
+        finally { if (reserved) { this.pendingIds.delete(id) } }
+      }
+      async publishGeneration(request: PublishGenerationRequest): Promise<CommitTaskResult> {
+        let id = ''
+        let reserved = false
+        try {
+          check(record(request, ['operationId', 'appId', 'nextVmGeneration', 'expectedSource', 'expectedRevision', 'expectedStamp']), 'publication-request')
+          id = typeof request.operationId === 'string' ? request.operationId : ''
+          this.admit()
+          this.reserve(id)
+          reserved = true
+          check(appId(request.appId) && counter(request.nextVmGeneration) && counter(request.expectedRevision) &&
+            stamp(request.expectedStamp) && ['MAIN', 'BAK', 'LEGACY', 'ABSENT'].indexOf(request.expectedSource) >= 0, 'publication-request')
+          let owned: PublishGenerationRequest = {
+            operationId: id, appId: request.appId, nextVmGeneration: request.nextVmGeneration,
+            expectedSource: request.expectedSource, expectedRevision: request.expectedRevision, expectedStamp: request.expectedStamp
+          }
+          let reply = await this.enqueue({ operationId: id, kind: 'publishGeneration', publication: owned })
+          return { operationId: id, result: reply.result as CommitResult }
+        } catch (error) { return this.refused(id, error) }
+        finally { if (reserved) { this.pendingIds.delete(id) } }
+      }
+      private refused(id: string, error: Object): CommitTaskResult {
+        let issue = error instanceof StateIoError ? error : new StateIoError('STATE_SERIALIZATION_FAILED', 'task-snapshot')
+        return { operationId: id, result: { status: 'FAILED', code: issue.code, stage: issue.stage } }
+      }
+    }`)
+    pin(cleanupFile, 'StateCleanupTaskPool', String.raw`export class StateCleanupTaskPool {
+      private root: string
+      private options: StateIoOptions
+      private tail: Promise<void> = Promise.resolve()
+      private accepting: boolean = true
+      private sequence: number = 0
+      private failures: Map<string, StateIoError> = new Map<string, StateIoError>()
+      private uncertain: boolean = false
+      constructor(root: string, options: StateIoOptions) {
+        cleanupCheck(typeof root === 'string' && root.startsWith('/') && root.indexOf('\u0000') < 0 &&
+          !root.split('/').some((part: string): boolean => part === '.' || part === '..'), 'cleanup-options')
+        cleanupCheck(cleanupRecord(options, ['directoryFsync', 'lockTimeoutMs', 'tmpOrphanAgeMs']) &&
+          options.directoryFsync === 'REQUIRED', 'cleanup-fsync-required')
+        let timeout = options.lockTimeoutMs === undefined ? 100 : options.lockTimeoutMs
+        let orphanAge = options.tmpOrphanAgeMs === undefined ? 60000 : options.tmpOrphanAgeMs
+        cleanupCheck(Number.isSafeInteger(timeout) && timeout >= 0 &&
+          Number.isSafeInteger(orphanAge) && orphanAge >= 0, 'cleanup-options')
+        this.root = root
+        let owned: StateIoOptions = { directoryFsync: 'REQUIRED', lockTimeoutMs: timeout, tmpOrphanAgeMs: orphanAge }
+        this.options = owned
+      }
+      async removeStateFilesKeepingStableLocks(scope: StateCleanupScope): Promise<void> {
+        cleanupCheck(cleanupRecord(scope, ['projectId', 'versionId']) && cleanupIdentity(scope.projectId) &&
+          (scope.versionId === undefined || cleanupIdentity(scope.versionId)), 'cleanup-scope')
+        this.admit(scope.projectId)
+        cleanupCheck(Number.isSafeInteger(this.sequence + 1) && this.sequence + 1 < Number.MAX_SAFE_INTEGER, 'cleanup-sequence')
+        let ownedScope: StateCleanupScope = { projectId: scope.projectId, versionId: scope.versionId }
+        let request: StateCleanupTaskRequest = { operationId: '@state-cleanup:' + (++this.sequence), scope: ownedScope }
+        let pending = this.tail.then((): Promise<void> => this.execute(request))
+        this.tail = pending.then((): void => {}, (): void => {})
+        return pending
+      }
+      whenIdle(): Promise<void> {
+        return this.tail.then((): void => {
+          if (this.uncertain) { throw new StateIoError('STATE_COMMIT_UNCERTAIN', 'cleanup-drain-uncertain') }
+          if (this.failures.size > 0) { throw new StateIoError('STATE_UNAVAILABLE', 'cleanup-drain-fenced') }
+        })
+      }
+      close(): Promise<void> { this.accepting = false; return this.whenIdle() }
+      private admit(projectId: string): void {
+        let issue = this.failures.get(projectId)
+        if (issue !== undefined) { throw issue as Error }
+        if (!this.accepting) { throw new StateIoError('STATE_UNAVAILABLE', 'cleanup-closed') }
+      }
+      private fail(projectId: string, issue: StateIoError): void {
+        this.failures.set(projectId, issue)
+        if (issue.code === 'STATE_COMMIT_UNCERTAIN') { this.uncertain = true }
+        throw issue as Error
+      }
+      private async execute(request: StateCleanupTaskRequest): Promise<void> {
+        let prior = this.failures.get(request.scope.projectId)
+        if (prior !== undefined) { throw prior as Error }
+        let task: taskpool.Task
+        try {
+          task = new taskpool.Task(stateCleanupTask, this.root, this.options, request)
+          task.setTransferList([])
+        } catch (_error) {
+          this.fail(request.scope.projectId, new StateIoError('STATE_TASK_SUBMIT_FAILED', 'cleanup-task-create'))
+          return
+        }
+        let reply: StateCleanupTaskReply
+        try { reply = await taskpool.execute(task, taskpool.Priority.MEDIUM) as StateCleanupTaskReply }
+        catch (_error) {
+          this.fail(request.scope.projectId, new StateIoError('STATE_COMMIT_UNCERTAIN', 'cleanup-task-execute'))
+          return
+        }
+        let valid = false
+        try { valid = cleanupReply(reply, request.operationId) }
+        catch (_error) {
+          this.fail(request.scope.projectId, new StateIoError('STATE_COMMIT_UNCERTAIN', 'cleanup-task-result'))
+          return
+        }
+        if (!valid) {
+          this.fail(request.scope.projectId, new StateIoError('STATE_COMMIT_UNCERTAIN', 'cleanup-task-result'))
+          return
+        }
+        if (reply.result.status !== 'REMOVED') {
+          this.fail(request.scope.projectId, new StateIoError(reply.result.code, reply.result.stage))
+        }
+      }
+    }`)
+    const checker = getChecker()
+    const targets = new Map(protectedNodes.map(node => [checker.getSymbolAtLocation(node.name), node.name.text]))
+    const resolve = symbol => symbol && symbol.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(symbol) : symbol
+    const target = node => targets.get(resolve(checker.getSymbolAtLocation(node)))
+    const typeKind = (type, seen = new Set()) => {
+      if (!type || seen.has(type)) return undefined
+      fail(seen.size < 64, 'capability type bound')
+      seen.add(type)
+      if (targets.has(type.symbol)) return targets.get(type.symbol)
+      if (type.isUnionOrIntersection()) return type.types.map(t => typeKind(t, seen)).find(Boolean)
+      if (type.flags & ts.TypeFlags.TypeParameter) return typeKind(checker.getBaseConstraintOfType(type), seen)
+      if (type.flags & ts.TypeFlags.Object && type.objectFlags & ts.ObjectFlags.ClassOrInterface) {
+        return (type.getBaseTypes() || []).map(t => typeKind(t, seen)).find(Boolean)
+      }
+      return undefined
+    }
+    const taskpoolSymbols = new Map([poolFile, cleanupFile].map(file => {
+      const imports = trees.get(virtual(file)).statements.filter(node => ts.isImportDeclaration(node) &&
+        node.moduleSpecifier.text === '@kit.ArkTS').flatMap(node => node.importClause?.namedBindings?.elements || [])
+        .filter(node => (node.propertyName || node.name).text === 'taskpool')
+      fail(imports.length === 1, 'platform taskpool import ' + file)
+      return [file, checker.getSymbolAtLocation(imports[0].name)]
+    }))
+    const platformTask = (node, file) => ts.isNewExpression(node) && ts.isPropertyAccessExpression(node.expression) &&
+      node.expression.name.text === 'Task' &&
+      checker.getSymbolAtLocation(node.expression.expression) === taskpoolSymbols.get(file)
+    const dispatchObserved = new Map(), taskSites = new Map()
+    const observed = new Map()
+    const combined = [dispatchObserved, taskSites, observed]
+    const merge = maps => maps.forEach((map, index) => {
+      for (const [owner, sites] of map) combined[index].set(owner, [...(combined[index].get(owner) || []), ...sites])
+    })
+    let visited = 0
+    for (const [file] of input) {
+      const cached = soleWriterFiles.get(file)
+      if (cached && !changed.has(virtual(file)) && cached.text === input.get(file)) {
+        visited += cached.visited
+        fail(visited <= 1500000, 'AST node bound')
+        merge(cached.maps)
+        continue
+      }
+      const start = visited
+      const dispatchObserved = new Map(), taskSites = new Map()
+      const observed = new Map()
+      const maps = [dispatchObserved, taskSites, observed]
+      const tree = trees.get(virtual(file))
+      const visit = (node, owner = '<module>', className = '') => {
+        fail(++visited <= 1500000, 'AST node bound')
+        if (ts.isClassDeclaration(node)) { className = node.name?.text || ''; owner = className }
+        if (ts.isFunctionDeclaration(node)) owner = node.name?.text || '<anonymous>'
+        if (ts.isMethodDeclaration(node)) owner = className + '.' + print(node.name)
+        if (ts.isConstructorDeclaration(node)) owner = className + '.constructor'
+        const reviewedIo = file === ioFile && className === 'StateIo' && node.kind === ts.SyntaxKind.ThisKeyword &&
+          ts.isPropertyAccessExpression(node.parent) && node.parent.expression === node
+        if (file === ioFile && node.parent === tree && node.kind !== ts.SyntaxKind.EndOfFileToken) {
+          fail(ts.isImportDeclaration(node) || ts.isExportDeclaration(node) || ts.isInterfaceDeclaration(node) ||
+            ts.isTypeAliasDeclaration(node) || ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node) ||
+            (ts.isVariableStatement(node) && node.declarationList.declarations.every(d =>
+              d.initializer && ts.isNumericLiteral(d.initializer))), 'StateIo module initialization')
+        }
+        if (file === poolFile && className === 'StateIoTaskPool' &&
+            (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node))) {
+          const member = ts.isPropertyAccessExpression(node) ? node.name.text : node.argumentExpression.text
+          if (['enqueue', 'execute'].includes(member) &&
+              (node.expression.kind === ts.SyntaxKind.ThisKeyword || typeKind(checker.getTypeAtLocation(node.expression)) === 'StateIoTaskPool')) {
+            fail(node.expression.kind === ts.SyntaxKind.ThisKeyword && ts.isCallExpression(node.parent) &&
+              node.parent.expression === node && dispatchSites.get(owner)?.includes(canonical(print(node.parent))),
+              'adapter request dispatch ' + owner)
+            dispatchObserved.set(owner, [...(dispatchObserved.get(owner) || []), canonical(print(node.parent))])
+          }
+        }
+        if (file === ioFile && className === 'StateIo' && ts.isPropertyAccessExpression(node) &&
+            ['load', 'recoverLost', 'commit', 'publishGeneration', 'removeStateFilesKeepingStableLocks'].includes(node.name.text)) {
+          fail(false, 'StateIo internal writer dispatch ' + owner)
+        }
+        if ([ioFile, poolFile, cleanupFile].includes(file) && node.modifiers?.some(m => m.kind === ts.SyntaxKind.ExportKeyword)) {
+          const approved = (protectedNodes.includes(node) &&
+            !['stateIoTask', 'stateCleanupTask'].includes(node.name?.text)) ||
+            ts.isInterfaceDeclaration(node) || ts.isTypeAliasDeclaration(node) ||
+            (file === ioFile && node.name?.text === 'StateIoError')
+          fail(approved, 'unreviewed protected module export ' + file + ':' + (node.name ? print(node.name) : '<unnamed>'))
+        }
+        if (ts.isImportSpecifier(node)) {
+          const kind = target(node.name)
+          if (kind) fail(allowedImports[kind]?.includes(file), 'unreviewed protected import ' + file + ':' + kind)
+        }
+        if (ts.isExportDeclaration(node) && node.exportClause && ts.isNamedExports(node.exportClause)) {
+          fail(node.exportClause.elements.every(e => !target(e.propertyName || e.name)), 'protected named export ' + file)
+        }
+        if (ts.isExportDeclaration(node) && node.moduleSpecifier) {
+          const symbol = checker.getSymbolAtLocation(node.moduleSpecifier)
+          if (symbol) {
+            const exports = checker.getExportsOfModule(symbol)
+            const exposed = node.exportClause && ts.isNamedExports(node.exportClause) ?
+              node.exportClause.elements.map(e => target(e.propertyName || e.name)).filter(Boolean) :
+              exports.map(s => targets.get(resolve(s))).filter(Boolean)
+            fail(exposed.length === 0, 'protected re-export ' + file)
+          }
+        }
+        if (ts.isExportAssignment(node)) fail(!target(node.expression) && !typeKind(checker.getTypeAtLocation(node.expression)),
+          'protected default export ' + file)
+        if ((ts.isMethodDeclaration(node) || ts.isPropertyDeclaration(node) ||
+            ts.isGetAccessorDeclaration(node) || ts.isSetAccessorDeclaration(node)) && className === 'ProjectStore') {
+          fail(!ts.isComputedPropertyName(node.name) &&
+            (ts.isStringLiteral(node.name) ? node.name.text : print(node.name)) !== 'saveState', 'legacy ProjectStore.saveState')
+        }
+        if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+          const receiver = checker.getTypeAtLocation(node.expression)
+          const name = ts.isPropertyAccessExpression(node) ? node.name.text :
+            ts.isStringLiteral(node.argumentExpression) ? node.argumentExpression.text : ''
+          fail(!(receiver.symbol?.name === 'ProjectStore' && (name === 'saveState' ||
+            (ts.isElementAccessExpression(node) && !ts.isStringLiteral(node.argumentExpression)))), 'legacy saveState access ' + file)
+        }
+        if (ts.isIdentifier(node) && !reviewedIo && (node.parent.name !== node || ts.isShorthandPropertyAssignment(node.parent)) &&
+            !ts.isImportSpecifier(node.parent) && !ts.isExportSpecifier(node.parent)) {
+          const kind = target(node)
+          if (kind && !ts.isTypeNode(node.parent) && !ts.isHeritageClause(node.parent) && !ts.isExpressionWithTypeArguments(node.parent)) {
+            const parent = node.parent
+            const construction = ts.isNewExpression(parent) && parent.expression === node
+            const call = ts.isCallExpression(parent) && parent.expression === node
+            let allowed = false
+            if (kind === 'StateIo') allowed = construction && ((file === formFile && owner === 'FormCommittedStateIo.constructor') ||
+              (file === ioFile && ['runStateIoTask', 'runStateCleanupTask'].includes(owner)))
+            if (kind === 'runStateIoTask') allowed = call && file === poolFile && owner === 'stateIoTask'
+            if (kind === 'runStateCleanupTask') allowed = call && file === cleanupFile && owner === 'stateCleanupTask'
+            if (kind === 'stateIoTask' || kind === 'stateCleanupTask') {
+              allowed = platformTask(parent, file) && parent.arguments?.[0] === node &&
+                ((kind === 'stateIoTask' && file === poolFile && owner === 'StateIoTaskPool.execute') ||
+                 (kind === 'stateCleanupTask' && file === cleanupFile && owner === 'StateCleanupTaskPool.execute'))
+              if (allowed) taskSites.set(owner, [...(taskSites.get(owner) || []), canonical(print(parent))])
+            }
+            if (kind === 'StateIoTaskPool') allowed = construction && file === storeFile && owner === 'ProjectStore.createStateStorage'
+            if (kind === 'StateCleanupTaskPool') allowed = construction && file === storeFile && owner === 'ProjectStateCleanup.removeStateFilesKeepingStableLocks'
+            if (kind === 'StateStoragePort' || kind === 'StateStorageFactory') allowed = false
+            fail(allowed, 'protected symbol use ' + file + ':' + owner + ':' + kind)
+          }
+        }
+        if (!reviewedIo && (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node))) {
+          fail(!target(ts.isPropertyAccessExpression(node) ? node.name : node.argumentExpression),
+            'protected namespace/computed access ' + file + ':' + owner)
+        }
+        if (!reviewedIo && ts.isIdentifier(node) && ts.isExpression(node) && node.parent.name !== node) {
+          const symbol = checker.getTypeAtLocation(node).symbol
+          if (symbol?.flags & ts.SymbolFlags.Module) {
+            const protectedModule = checker.getExportsOfModule(symbol).some(s => targets.has(resolve(s)))
+            fail(!protectedModule || (ts.isPropertyAccessExpression(node.parent) && node.parent.expression === node),
+              'protected namespace escape ' + file)
+          }
+        }
+        if (ts.isExpression(node) && !reviewedIo && (node.parent.name !== node || ts.isShorthandPropertyAssignment(node.parent)) && !ts.isTypeNode(node.parent) &&
+            !ts.isHeritageClause(node.parent) && !ts.isExpressionWithTypeArguments(node.parent) &&
+            !(ts.isPropertyAccessExpression(node.parent) && node.parent.name === node)) {
+          const kind = ts.isIdentifier(node) && target(node) ? undefined : typeKind(checker.getTypeAtLocation(node))
+          if (kind && kind !== 'runStateIoTask' && kind !== 'runStateCleanupTask') {
+            const parent = node.parent
+            const access = ts.isPropertyAccessExpression(parent) && parent.expression === node
+            const invoked = access && ts.isCallExpression(parent.parent) && parent.parent.expression === parent
+            const member = access ? parent.name.text : ''
+            let allowed = file === managerFile && className === 'StateManager'
+            if (kind === 'StateIo') allowed = (file === ioFile && ['runStateIoTask', 'runStateCleanupTask'].includes(owner) &&
+              (ts.isNewExpression(node) || (invoked && node.getText() === 'io'))) ||
+              (file === formFile && className === 'FormCommittedStateIo')
+            if (kind === 'StateIoTaskPool' || kind === 'StateStoragePort') allowed ||= invoked && file === storeFile &&
+              ['ProjectStateTasks.load', 'ProjectStateTasks.readHeader'].includes(owner) &&
+              ['load', 'readHeader', 'close', 'whenIdle'].includes(member)
+            if (file === storeFile && owner === 'ProjectStore.createStateStorage' && ts.isNewExpression(node)) allowed = true
+            if (kind === 'StateStoragePort' && ts.isCallExpression(node) && ts.isReturnStatement(parent) &&
+                ((file === storeFile && owner === 'ProjectStateStorageFactory.create') ||
+                 (file === 'runtime/AppActor.ets' && owner === 'AppActorStorageFactory.create'))) allowed = true
+            if (kind === 'StateStoragePort' && ts.isCallExpression(node) && ts.isVariableDeclaration(parent) &&
+                file === storeFile && ['ProjectStateTasks.load', 'ProjectStateTasks.readHeader'].includes(owner)) allowed = true
+            if (kind === 'StateCleanupTaskPool') allowed = file === storeFile &&
+              owner === 'ProjectStateCleanup.removeStateFilesKeepingStableLocks' &&
+              ((ts.isNewExpression(node) && ts.isVariableDeclaration(parent)) ||
+               (invoked && ['removeStateFilesKeepingStableLocks', 'close'].includes(member)))
+            if (kind === 'StateStorageFactory') allowed ||= (file === storeFile || file === 'runtime/AppActor.ets') &&
+              (ts.isNewExpression(node) || ts.isIdentifier(node) || ts.isPropertyAccessExpression(node) || ts.isBinaryExpression(node))
+            if (kind === 'StateStorageFactory' && invoked && member === 'create') allowed = file === managerFile && className === 'StateManager'
+            if (node.kind === ts.SyntaxKind.ThisKeyword &&
+                ((file === poolFile && className === 'StateIoTaskPool') ||
+                 (file === cleanupFile && className === 'StateCleanupTaskPool'))) allowed = access
+            fail(allowed, 'capability escape/access ' + file + ':' + owner + ':' + print(node))
+             if (invoked && ['commit', 'publishGeneration', 'recoverLost', 'removeStateFilesKeepingStableLocks'].includes(member) &&
+                 file !== ioFile && !(file === managerFile && className === 'StateManager')) {
+              const key = file + ':' + owner
+              if (!observed.has(key)) observed.set(key, [])
+              observed.get(key).push(canonical(print(parent.parent)))
+            }
+          }
+        }
+        ts.forEachChild(node, child => visit(child, owner, className))
+      }
+      visit(tree)
+      merge(maps)
+      if (input === sources) soleWriterFiles.set(file, {text: input.get(file), visited: visited - start, maps})
+    }
+    assert.deepEqual([...dispatchObserved].sort(), [...dispatchSites].sort(), 'sole writer: adapter dispatch inventory')
+    assert.deepEqual([...taskSites].sort(), [
+      ['StateIoTaskPool.execute', [canonical('new taskpool.Task(stateIoTask, this.root, this.options, request)')]],
+      ['StateCleanupTaskPool.execute', [canonical('new taskpool.Task(stateCleanupTask, this.root, this.options, request)')]]
+    ].sort(), 'sole writer: platform Task construction sites')
+    const expected = new Map([
+      [storeFile + ':ProjectStateCleanup.removeStateFilesKeepingStableLocks', [canonical('cleanup.removeStateFilesKeepingStableLocks(cleanupScope)')]]
+    ])
+    assert.deepEqual([...observed], [...expected], 'sole writer: reviewed cleanup write sites changed')
+  })
+  soleWriterGuard(sources)
+  let soleWriterRejections = 0
+  const rejectStorage = (name, input) => {
+    assert.throws(() => soleWriterGuard(input), /sole writer:/, name)
+    soleWriterRejections++
+  }
+  const storageFile = text => new Map(sources).set('vera/SoleWriterProbe.ets', text)
+  const storageReplace = (file, before, after) => {
+    const text = sources.get(file)
+    assert.equal(text.split(before).length, 2, 'sole writer probe anchor: ' + before)
+    return new Map(sources).set(file, text.replace(before, after))
+  }
+  for (const [name, text] of [
+    ['direct StateIo', `import { StateIo } from '../runtime/StateIo'; new StateIo(root, options).commit(request)`],
+    ['aliased StateIo', `import { StateIo as Disk } from '../runtime/StateIo'; new Disk(root, options).load(id, stamp)`],
+    ['namespace StateIo', `import * as disk from '../runtime/StateIo'; new disk.StateIo(root, options)`],
+    ['computed namespace', `import * as disk from '../runtime/StateIo'; const key = 'StateIo'; new disk[key](root, options)`],
+    ['namespace destructuring', `import * as disk from '../runtime/StateIo'; const {StateIo: Disk} = disk`],
+    ['namespace escape', `import * as disk from '../runtime/StateIo'; consume(disk)`],
+    ['sync worker alias', `import { runStateIoTask as run } from '../runtime/StateIo'; run(root, options, request)`],
+    ['cleanup worker alias', `import { runStateCleanupTask as run } from '../runtime/StateIo'; run(root, options, request)`],
+    ['protected re-export', `export { StateIo as Disk } from '../runtime/StateIo'`],
+    ['protected star export', `export * from '../runtime/StateIo'`],
+    ['protected namespace export', `export * as disk from '../runtime/StateIo'`],
+    ['pool re-export', `export { StateIoTaskPool } from '../runtime/StateIoTaskPool'`],
+    ['typed port writer', `import type { StateStoragePort } from '../runtime/shared/StatePort'; function write(p: StateStoragePort) { return p.commit(request) }`]
+  ]) rejectStorage(name, storageFile(text))
+  const poolAnchor = "let storage = this.store.createStateStorage()\n    try { return await storage.load(appId, stamp) }"
+  for (const [name, addition] of [
+    ['pool commit', 'storage.commit(request);'], ['pool publication', 'storage.publishGeneration(request);'],
+    ['pool lost recovery', 'storage.recoverLost(appId, stamp);'], ['pool extraction', 'let write = storage.commit;'],
+    ['pool computed write', 'storage["commit"](request);'], ['pool computed key', 'let key = "commit"; storage[key](request);'],
+    ['pool destructuring', 'let {commit: write} = storage;'], ['pool erased alias', 'let erased: Object = storage;'],
+    ['pool cast escape', '(storage as Object as {commit: Function}).commit(request);'],
+    ['pool argument escape', 'consume(storage);'], ['pool shorthand escape', 'consume({storage});']
+  ]) rejectStorage(name, storageReplace('vera/ProjectStore.ets', poolAnchor,
+    "let storage = this.store.createStateStorage()\n    " + addition + "\n    try { return await storage.load(appId, stamp) }"))
+  for (const [name, file, before, after] of [
+    ['Form writer', 'vera/LiveFormService.ets', 'const result = this.io.readCommittedReadOnly(appId, expectedStamp)', 'const result = this.io.load(appId, expectedStamp)'],
+    ['Form escape', 'vera/LiveFormService.ets', 'const result = this.io.readCommittedReadOnly(appId, expectedStamp)', 'consume(this.io); const result = this.io.readCommittedReadOnly(appId, expectedStamp)'],
+    ['legacy saveState declaration', 'vera/ProjectStore.ets', 'createStateStorage(): StateStoragePort {', 'saveState(): void {}\n  createStateStorage(): StateStoragePort {'],
+    ['sync on Main', 'runtime/StateIoTaskPool.ets', 'private admit(): void {', 'private admit(): void { runStateIoTask(this.root, this.options, request);'],
+    ['worker direct invocation', 'runtime/StateIoTaskPool.ets', 'private admit(): void {', 'private admit(): void { stateIoTask(this.root, this.options, request);'],
+    ['worker extraction', 'runtime/StateIoTaskPool.ets', 'private admit(): void {', 'private admit(): void { let run = stateIoTask;'],
+    ['cleanup scope change', 'vera/ProjectStore.ets', 'cleanup.removeStateFilesKeepingStableLocks(cleanupScope)', 'cleanup.removeStateFilesKeepingStableLocks(otherScope)'],
+    ['factory hidden writer', 'runtime/AppActor.ets', 'create(): StateStoragePort { return store.createStateStorage() }', 'create(): StateStoragePort { let port = store.createStateStorage(); port.commit(request); return port }'],
+    ['factory create escape', 'vera/ProjectStore.ets', 'this.storageFactory = factory', 'factory.create().commit(request); this.storageFactory = factory'],
+    ['new worker export', 'runtime/StateIoTaskPool.ets', 'function stateIoTask(', 'export function stateIoTask('],
+    ['new synchronous export', 'runtime/StateIo.ets', 'export class StateIo {', 'export function hiddenWrite() { return new StateIo(root, options) }\nexport class StateIo {'],
+    ['legacy saveState call', 'vera/ProjectStore.ets', 'createStateStorage(): StateStoragePort {', 'createStateStorage(): StateStoragePort { this.saveState();'],
+    ['legacy computed saveState', 'vera/ProjectStore.ets', 'createStateStorage(): StateStoragePort {', 'createStateStorage(): StateStoragePort { let key = "saveState"; this[key]();'],
+    ['local protected export', 'runtime/StateIoTaskPool.ets', 'function record(value:', 'export { runStateIoTask as run };\nfunction record(value:'],
+    ['StateIo module load', 'runtime/StateIo.ets', 'export class StateIo {', `new StateIo('/fixture/files/vera', { directoryFsync: 'REQUIRED' }).load('real/app', 'p1');\nexport class StateIo {`],
+    ['StateIo module initializer load', 'runtime/StateIo.ets', 'const STATE_OPEN_EXCL: number = 0o200', `const hidden = new StateIo('/fixture/files/vera', { directoryFsync: 'REQUIRED' }).load('real/app', 'p1');\nconst STATE_OPEN_EXCL: number = 0o200`],
+    ['StateIoError constructor load', 'runtime/StateIo.ets', "super(code + ' at ' + stage)", `super(code + ' at ' + stage); new StateIo('/fixture/files/vera', { directoryFsync: 'REQUIRED' }).load('real/app', 'p1')`],
+    ['read-only boundary writer', 'runtime/StateIo.ets', 'readCommittedReadOnly(appId: string, expectedStamp: string): LoadResult {', 'readCommittedReadOnly(appId: string, expectedStamp: string): LoadResult { this.load(appId, expectedStamp);'],
+    ['extra erased factory pool', 'vera/ProjectStore.ets', 'createStateStorage(): StateStoragePort {', 'createStateStorage(): StateStoragePort { (new StateIoTaskPool(this.stateRoot(), { directoryFsync: "REQUIRED" }, STATE_MAX_BYTES) as Object as { commit: Function }).commit(request);'],
+    ['fake platform Task', 'runtime/StateIoTaskPool.ets', 'let task = new taskpool.Task(stateIoTask, this.root, this.options, request)', 'let taskpool = { Task: class { constructor(target: Function, root: string, options: Object, request: Object) { target(root, options, request) } } }; let task = new taskpool.Task(stateIoTask, this.root, this.options, request)'],
+    ['load dispatch writer', 'runtime/StateIoTaskPool.ets', "check(appId(identity) && stamp(expectedStamp), 'load-request')", "check(appId(identity) && stamp(expectedStamp), 'load-request'); this.enqueue({ operationId: '', kind: 'commit', commit: request })"],
+    ['load execute writer', 'runtime/StateIoTaskPool.ets', "check(appId(identity) && stamp(expectedStamp), 'load-request')", "check(appId(identity) && stamp(expectedStamp), 'load-request'); this.execute({ operationId: '', kind: 'commit', commit: request })"],
+    ['load dispatch extraction', 'runtime/StateIoTaskPool.ets', "check(appId(identity) && stamp(expectedStamp), 'load-request')", "check(appId(identity) && stamp(expectedStamp), 'load-request'); let send = this.enqueue;"],
+    ['load duplicate dispatch', 'runtime/StateIoTaskPool.ets', "check(appId(identity) && stamp(expectedStamp), 'load-request')", "check(appId(identity) && stamp(expectedStamp), 'load-request'); this.enqueue({ operationId: '', kind: 'load', appId: identity, expectedStamp: expectedStamp })"],
+    ['legacy saveState getter', 'vera/ProjectStore.ets', 'createStateStorage(): StateStoragePort {', 'get saveState(): Function { return () => {} }\n  createStateStorage(): StateStoragePort {'],
+    ['legacy saveState setter', 'vera/ProjectStore.ets', 'createStateStorage(): StateStoragePort {', 'set saveState(value: Function) {}\n  createStateStorage(): StateStoragePort {'],
+    ['legacy computed accessor', 'vera/ProjectStore.ets', 'createStateStorage(): StateStoragePort {', 'get ["saveState"](): Function { return () => {} }\n  createStateStorage(): StateStoragePort {']
+  ]) rejectStorage(name, storageReplace(file, before, after))
+  const rejectPinnedMutation = (name, file, before, after) => {
+    const input = storageReplace(file, before, after)
+    assert.equal(parse(file, input.get(file)).parseDiagnostics.length, 0, 'parse-valid sole writer probe: ' + name)
+    assert.throws(() => soleWriterGuard(input), /sole writer: reviewed boundary changed/, name)
+    soleWriterRejections++
+  }
+  for (const expression of ['this.loadMeasured', '(this.loadMeasured)', 'this.loadMeasured!', '(this.loadMeasured)!']) {
+    for (const [name, anchor] of [
+      ['constructor', 'this.telemetryClock = telemetryClock'],
+      ['read-only helper', 'private directoryExists(paths: StatePaths): boolean {']
+    ]) rejectPinnedMutation(name + ' transitive writer ' + expression, 'runtime/StateIo.ets', anchor,
+      anchor + `; ${expression}('real/app', 'p1');`)
+  }
+  const loadCheck = "check(appId(identity) && stamp(expectedStamp), 'load-request')"
+  const hiddenCommit = `{ operationId: 'hidden', pre: { appId: identity, vmGeneration: 1, baseRevision: 0 },
+    schemaVersion: 1, stamp: expectedStamp, payload: new ArrayBuffer(0), backupDue: false }`
+  for (const expression of ['this.commit', '(this.commit)', 'this.commit!', '(this.commit)!']) {
+    rejectPinnedMutation('load hidden commit ' + expression, 'runtime/StateIoTaskPool.ets', loadCheck,
+      loadCheck + `; await ${expression}(${hiddenCommit});`)
+  }
+  rejectPinnedMutation('load conditional writer alias', 'runtime/StateIoTaskPool.ets', loadCheck,
+    loadCheck + `; let alias = true ? this.commit : this.commit; await alias(${hiddenCommit});`)
+  const cleanupIdle = 'whenIdle(): Promise<void> {'
+  const hiddenRemoval = `{ operationId: 'hidden', scope: { projectId: 'real-project' } }`
+  for (const expression of ['this.execute', '(this.execute)', 'this.execute!', '(this.execute)!']) {
+    rejectPinnedMutation('idle unrequested deletion ' + expression, 'runtime/StateCleanupTaskPool.ets', cleanupIdle,
+      cleanupIdle + ` void ${expression}(${hiddenRemoval});`)
+  }
+  rejectPinnedMutation('idle conditional deletion alias', 'runtime/StateCleanupTaskPool.ets', cleanupIdle,
+    cleanupIdle + ` let alias = true ? this.execute : this.execute; void alias(${hiddenRemoval});`)
+  for (const [file, anchor, addition] of [
+    ['runtime/StateIo.ets', 'private paths(appId: string): StatePaths {', "this.loadMeasured(appId, 'p1');"],
+    ['runtime/StateIo.ets', 'private checkRoot(): void {', "this.loadMeasured('real/app', 'p1');"],
+    ['runtime/StateIo.ets', 'private readFile(path: string, appId: string, stage: string): FileRead {', "this.loadMeasured(appId, 'p1');"],
+    ['runtime/StateIo.ets', 'function readBytes(file: fs.File, size: number, stage: string): Uint8Array {', 'fs.unlinkSync("/fixture/files/vera/real/app.state.json");'],
+    ['runtime/StateIo.ets', 'function strictUtf8(bytes: Uint8Array, stage: string): string {', 'fs.unlinkSync("/fixture/files/vera/real/app.state.json");'],
+    ['runtime/StateIo.ets', 'function fileSize(file: fs.File, stage: string): number {', 'fs.unlinkSync("/fixture/files/vera/real/app.state.json");'],
+    ['runtime/StateIo.ets', 'function closeQuietly(file: fs.File | null): void {', 'fs.unlinkSync("/fixture/files/vera/real/app.state.json");'],
+    ['runtime/StateFileFormat.ets', 'export function statePayloadBytes(payload: string): Uint8Array {', 'consume(payload);'],
+    ['runtime/StateFileFormat.ets', 'export function validateStateFile(text: string, appId: string, schemaVersion: number = 1): DecodedStateData {', 'consume(appId);'],
+    ['runtime/StateFileFormat.ets', 'constructor(text: string, complete: boolean) {', 'consume(text);'],
+    ['runtime/StateIoTaskPool.ets', 'private envelopeId(): string {', `void (this.commit)(${hiddenCommit});`],
+    ['runtime/StateCleanupTaskPool.ets', 'private admit(projectId: string): void {', `void (this.execute)(${hiddenRemoval});`]
+  ]) rejectPinnedMutation('transitive closure ' + anchor, file, anchor, anchor + addition)
+  soleWriterGuard(storageFile(`import { StateIoError } from '../runtime/StateIo'; import type { LoadResult } from '../runtime/StateIo';
+    function benign(value: LoadResult) { throw new StateIoError('STATE_READ_FAILED', 'benign') }`))
+  soleWriterGuard(storageFile('function benign(port: {commit: () => void}) { port.commit() }'))
+  soleWriterGuard(storageFile(`import * as disk from '../runtime/StateIo';
+    function benign() { throw new disk.StateIoError('STATE_READ_FAILED', 'benign') }`))
+  console.log('sole-writer acceptance: ' + soleWriterRejections + ' independent in-memory rejection probes; bounded AST review, not whole-program proof')
   const reviewedImports = [
-    ['runtime/AppActor.ets', "import { VirtualMachine, deserializeVbc2, RuntimeValue, VeraNumberValue, encodeRuntimeValue, decodeRuntimeValue } from '../vera/VeraInterpreter'"],
+    ['runtime/AppActor.ets', "import { VirtualMachine, deserializeVbc2, RuntimeValue, VeraNumberValue, NULL_VALUE, decodeRuntimeValue } from '../vera/VeraInterpreter'"],
     ['runtime/InProcessHost.ets', "import { RuntimeValue, VeraNumberValue, VeraStringValue, VeraBooleanValue } from '../vera/VeraInterpreter'"],
     ['runtime/shared/StatePort.ets', "import type { RuntimeValue } from '../../vera/VeraInterpreter'"],
     ['runtime/StateFormat.ets', "import { RuntimeValue, encodeRuntimeValue, decodeRuntimeValue } from '../vera/VeraInterpreter'"],
     ['runtime/StateManager.ets', "import type { RuntimeValue } from '../vera/VeraInterpreter'"],
+    ['vera/ProjectStore.ets', "import { BytecodeModule, VirtualMachine, EmptyHostEnvironment, NULL_VALUE, decodeRuntimeValue } from './VeraInterpreter'"],
+    ['vera/ProjectStore.ets', "import type { RuntimeValue } from './VeraInterpreter'"],
     ['vera/VeraBudget.ets', "import { BytecodeModule } from './VeraInterpreter'"],
     ['vera/VeraCompiler.ets', "import { Instruction, BytecodeFunction, BytecodeModule } from './VeraInterpreter'"],
     ['vera/VeraGfx.ets', "import { RuntimeValue, VeraNumberValue, VeraStringValue, VeraBooleanValue, VeraArrayValue, VeraObjectValue, RuntimeTrap, freshObjectValue } from './VeraInterpreter'"],
@@ -766,14 +1908,19 @@ function externalGraphChecks() {
 runtime/AppActor.ets
 @AppActorTurnCall
 ["root","readonly args: RuntimeValue[];"]
+["root","readonly value?: RuntimeValue;"]
+["signature","constructor ( value: RuntimeValue ) RuntimeValue"]
 @AppActorTurnCallbacks
 ["signature","constructor ( call: AppActorTurnCall ) RuntimeValue"]
 @AppActorTurnCoordinator.runTurn
 ["calls.length === 0",[["if","calls.length === 0","condition"]]]
-["admitted = calls.map((call: AppActorTurnCall): AppActorTurnCall => {\n    return { entry: call.entry, args: call.args.slice(), useState: call.useState };\n})",[]]
+["admitted = calls.map((call: AppActorTurnCall): AppActorTurnCall => {\n    return { entry: call.entry, args: call.args.slice(), useState: call.useState,\n        value: call.value, prepare: call.prepare };\n})",[]]
 ["admitted",[["loop","let call","admitted"],["try","body"],["try","body"]]]
 ["args = call.useState ? [this.state.getWorkingState()].concat(call.args) : call.args",[["loop","let call","admitted"],["try","body"],["try","body"]]]
-["value = this.vm.execute(call.entry, args)",[["loop","let call","admitted"],["try","body"],["try","body"]]]
+["this.state.setWorkingState(tx, this.state.getWorkingState())",[["if","!this.safety","then"],["loop","let call","admitted"],["try","body"],["try","body"]]]
+["value = call.value === undefined ? this.vm.execute(call.entry, args) : call.value",[["loop","let call","admitted"],["try","body"],["try","body"]]]
+["call.prepare !== undefined",[["if","call.prepare !== undefined","condition"],["loop","let call","admitted"],["try","body"],["try","body"]]]
+["value = call.prepare(value)",[["if","call.prepare !== undefined","then"],["loop","let call","admitted"],["try","body"],["try","body"]]]
 ["this.state.setWorkingState(tx, value)",[["loop","let call","admitted"],["try","body"],["try","body"]]]
 @AppActorTurnCoordinator.publishOwned
 ["this.executePure(call)",[]]
@@ -783,60 +1930,58 @@ runtime/AppActor.ets
 @AppActorTurnCoordinator.executePure
 ["signature","private executePure ( call: AppActorTurnCall ) RuntimeValue"]
 ["root = this.state.getWorkingState()",[]]
+["value = this.vm.execute(call.entry, call.useState ? [root].concat(call.args) : call.args)",[["try","body"],["if","!this.safety","then"]]]
+["value",[["try","body"],["if","!this.safety","then"]]]
+["this.state.setWorkingState(tx, root)",[["try","body"],["try","catch"],["if","!this.safety","then"]]]
 ["scope = this.vm.beginTurn(new Object(), root)",[]]
 ["result = this.vm.executePure(call.entry, call.useState ? [root].concat(call.args) : call.args)",[["try","body"]]]
 ["result",[["try","body"]]]
+@AppActorStateOptions
+["root","initialState: RuntimeValue = NULL_VALUE;"]
+["initialState: RuntimeValue = NULL_VALUE;",[]]
+@AppActorMemoryRuntime
+["signature","constructor ( call: AppActorTurnCall ) RuntimeValue"]
 @AppActor
-["root","private currentState: RuntimeValue | null = null;"]
-@AppActor.ready
-["!this.disposed && !this.cancelled && this.vm !== null && this.currentState !== null",[]]
-@AppActor.initialize
-["this.currentState = null",[]]
-["this.currentState = this.restoreState()",[["try","body"]]]
-["this.currentState === null",[["if","this.currentState === null","condition"],["try","body"]]]
-["this.currentState = this.seeded(this.vm!.execute('init'))",[["if","this.currentState === null","then"],["try","body"]]]
-@AppActor.reconcileState
-["restored = this.restoreState()",[["if","changed","then"]]]
-["restored !== null",[["if","restored !== null","condition"],["if","changed","then"]]]
-["this.currentState = restored",[["if","restored !== null","then"],["if","changed","then"]]]
-@AppActor.snapshot
-["JSON.stringify(encodeRuntimeValue(this.currentState!))",[]]
-@AppActor.saveNow
-["encoded = JSON.stringify(encodeRuntimeValue(this.currentState!))",[["try","body"]]]
-@AppActor.dispose
-["this.currentState = null",[]]
+["signature","constructor ( call: AppActorTurnCall ) RuntimeValue"]
+@AppActor.render
+["signature","constructor ( call: AppActorTurnCall ) RuntimeValue"]
+@AppActor.activate
+["signature","private async activate ( program: ProgramRef options: AcquireOptions working: RuntimeValue | null ) Promise<void>"]
+["initialKind = working !== null || options.seedState.length > 0 && options.mode !== 'PREVIEW' ? 'carry' : 'init'",[]]
+["working === null",[["if","working === null","condition"],["try","body"]]]
+["managerOptions.initialState = working === null ? NULL_VALUE : working",[["try","body"]]]
+["loaded = await this.manager!.load(working !== null)",[["try","body"]]]
+["restored = working !== null || loaded.kind === 'READY' && loaded.stamp === program.stamp",[["try","body"]]]
+["source: StateTurnSource = working !== null ? 'CARRY' : 'INIT'",[["try","body"]]]
+["call = { entry: '', args: [], useState: false, value: this.manager!.getWorkingState() }",[["if","restored","then"],["try","body"]]]
+["seed = decodeRuntimeValue(JSON.parse(payload) as Object)",[["if","options.seedState.length > 0 && this.mode !== 'PREVIEW'","then"],["if","restored","else"],["try","body"]]]
+["call = { entry: 'init', args: [], useState: false,\n    prepare: (fresh: RuntimeValue): RuntimeValue => {\n        let carried = carryState(fresh, seed, this.vm!.classShapes());\n        let allowed = this.host!.effectsAllowed;\n        this.host!.effectsAllowed = false;\n        try {\n            this.vm!.executePure('view', [carried]);\n        }\n        finally {\n            this.host!.effectsAllowed = allowed;\n        }\n        return carried;\n    }\n}",[["if","options.seedState.length > 0 && this.mode !== 'PREVIEW'","then"],["if","restored","else"],["try","body"]]]
+["await this.coordinator!.runTurn(source, true, [call])",[["try","body"]]]
+@AppActor.promote
+["working = this.manager!.getWorkingState()",[]]
+["await this.activate(program, target, working)",[["if","this.mode === 'LIVE_PERSISTENT'","then"]]]
+["await this.activate(program, target, working)",[["try","body"]]]
+@AppActor.pure
+["signature","private pure ( entry: string kind: string ) RuntimeValue"]
+["this.pureCapability === null ? this.coordinator!.pure(call) : this.pureCapability!(call)",[]]
 @AppActor.view
-["nodes = decodeVeraUi(this.vm!.execute('view', [this.currentState!]))",[]]
+["nodes = decodeVeraUi(this.pure('view', 'VIEW'))",[]]
 @AppActor.draw
-["decodeGfx(this.vm!.execute(entry, [this.currentState!]))",[]]
+["decodeGfx(this.pure(entry, 'DRAW'))",[]]
 @AppActor.buildScene
-["decodeScene(this.vm!.execute(entry, [this.currentState!]))",[]]
+["decodeScene(this.pure(entry, 'BUILD'))",[]]
+@AppActor.turn
+["await this.coordinator!.runTurn(source, persist, calls, skipIfSame)",[["try","body"]]]
 @AppActor.dispatch
-["signature","dispatch ( action: string payload: RuntimeValue persist: boolean = true kind: string = 'HANDLER' skipIfSame: boolean = false ) void"]
-["before = this.currentState!",[["try","body"]]]
-["beforeCode = skipIfSame ? this.stateCode(before) : ''",[["try","body"]]]
-["this.currentState = this.vm!.execute(action, [before, payload])",[["try","body"]]]
-["skipIfSame && this.stateCode(this.currentState!) === beforeCode",[["if","skipIfSame && this.stateCode(this.currentState!) === beforeCode","condition"],["try","body"]]]
-@AppActor.runWidgetRefresh
-["this.currentState = this.vm!.execute('widgetRefresh', [this.currentState!])",[["try","body"]]]
+["signature","dispatch ( action: string payload: RuntimeValue persist: boolean = true kind: string = 'HANDLER' skipIfSame: boolean = false ) Promise<void>"]
+["[payload]",[]]
 @AppActor.frameHandlers
-["this.currentState = this.vm!.execute(action, [this.currentState!, new VeraNumberValue(elapsed)])",[["loop","let action","actions"],["try","body"]]]
+["calls = actions.filter((action: string): boolean => action.length > 0).map((action: string): AppActorTurnCall => {\n    return { entry: action, args: [new VeraNumberValue(elapsed)], useState: true };\n})",[]]
+["calls.length === 0",[["if","calls.length === 0","condition"]]]
+["await this.turn('SURFACE', false, calls, true)",[]]
 @AppActor.move
-["signature","move ( action: string payload: RuntimeValue ) void"]
-["this.currentState = this.vm!.execute(action, [this.currentState!, payload])",[["try","body"]]]
-@AppActor.stateCode
-["signature","private stateCode ( state: RuntimeValue ) string"]
-["JSON.stringify(encodeRuntimeValue(state))",[]]
-@AppActor.seeded
-["signature","private seeded ( fresh: RuntimeValue ) RuntimeValue"]
-["fresh",[["if","this.seedState.length === 0 || this.mode === 'PREVIEW'","then"]]]
-["carried = carryState(fresh, decodeRuntimeValue(JSON.parse(this.seedState) as Object), this.vm!.classShapes())",[["try","body"]]]
-["this.vm!.execute('view', [carried])",[["try","body"]]]
-["carried",[["try","body"]]]
-["fresh",[["try","catch"]]]
-@AppActor.restoreState
-["signature","private restoreState ( ) RuntimeValue | null"]
-["decodeRuntimeValue(JSON.parse(encoded) as Object)",[["try","body"]]]
+["signature","move ( action: string payload: RuntimeValue ) Promise<void>"]
+["[payload]",[]]
 runtime/InProcessHost.ets
 @HostActor
 ["signature","dispatch ( action: string payload: RuntimeValue persist?: boolean kind?: string skipIfSame?: boolean ) void | Promise<void>"]
@@ -879,7 +2024,7 @@ runtime/StateManager.ets
 @StateManager
 ["root","private working: RuntimeValue;"]
 @StateManager.constructor
-["typeof options.appId !== 'string' || options.appId.split('/').length !== 2 ||\n    options.appId.split('/').some((part: string) => part.length === 0 || part === '.' ||\n        part === '..' || /[\\u0000-\\u001f\\\\]/.test(part)) ||\n    typeof options.stamp !== 'string' || options.stamp.indexOf('\\u0000') >= 0 ||\n    !Number.isSafeInteger(options.stateMaxBytes) || options.stateMaxBytes <= 0 ||\n    options.stateMaxBytes >= 16 * 1024 * 1024 ||\n    ['PREVIEW', 'LIVE_EPHEMERAL', 'LIVE_PERSISTENT'].indexOf(options.mode) < 0 ||\n    (options.journalMode !== undefined && options.journalMode !== 'JOURNAL') ||\n    (options.vmGeneration !== undefined && !validCounter(options.vmGeneration))",[["if","typeof options.appId !== 'string' || options.appId.split('/').length !== 2 ||\n    options.appId.split('/').some((part: string) => part.length === 0 || part === '.' ||\n        part === '..' || /[\\u0000-\\u001f\\\\]/.test(part)) ||\n    typeof options.stamp !== 'string' || options.stamp.indexOf('\\u0000') >= 0 ||\n    !Number.isSafeInteger(options.stateMaxBytes) || options.stateMaxBytes <= 0 ||\n    options.stateMaxBytes >= 16 * 1024 * 1024 ||\n    ['PREVIEW', 'LIVE_EPHEMERAL', 'LIVE_PERSISTENT'].indexOf(options.mode) < 0 ||\n    (options.journalMode !== undefined && options.journalMode !== 'JOURNAL') ||\n    (options.vmGeneration !== undefined && !validCounter(options.vmGeneration))","condition"]]]
+["typeof options.appId !== 'string' || options.appId.length === 0 ||\n    /[\\u0000-\\u001f\\\\]/.test(options.appId) ||\n    (options.mode === 'LIVE_PERSISTENT' && (options.appId.split('/').length !== 2 ||\n        options.appId.split('/').some((part: string) => part.length === 0 || part === '.' || part === '..'))) ||\n    typeof options.stamp !== 'string' || options.stamp.indexOf('\\u0000') >= 0 ||\n    !Number.isSafeInteger(options.stateMaxBytes) || options.stateMaxBytes <= 0 ||\n    options.stateMaxBytes >= 16 * 1024 * 1024 ||\n    ['PREVIEW', 'LIVE_EPHEMERAL', 'LIVE_PERSISTENT'].indexOf(options.mode) < 0 ||\n    (options.journalMode !== undefined && options.journalMode !== 'JOURNAL') ||\n    (options.vmGeneration !== undefined && !validCounter(options.vmGeneration))",[["if","typeof options.appId !== 'string' || options.appId.length === 0 ||\n    /[\\u0000-\\u001f\\\\]/.test(options.appId) ||\n    (options.mode === 'LIVE_PERSISTENT' && (options.appId.split('/').length !== 2 ||\n        options.appId.split('/').some((part: string) => part.length === 0 || part === '.' || part === '..'))) ||\n    typeof options.stamp !== 'string' || options.stamp.indexOf('\\u0000') >= 0 ||\n    !Number.isSafeInteger(options.stateMaxBytes) || options.stateMaxBytes <= 0 ||\n    options.stateMaxBytes >= 16 * 1024 * 1024 ||\n    ['PREVIEW', 'LIVE_EPHEMERAL', 'LIVE_PERSISTENT'].indexOf(options.mode) < 0 ||\n    (options.journalMode !== undefined && options.journalMode !== 'JOURNAL') ||\n    (options.vmGeneration !== undefined && !validCounter(options.vmGeneration))","condition"]]]
 ["this.safety = options.vmJournal !== false",[]]
 ["this.safety && (!options.rollbackGuard ||\n    options.rollbackGuard.coverage !== 'GRAPH_SLOTS_DEFERRED_INTENTS')",[["if","this.safety && (!options.rollbackGuard ||\n    options.rollbackGuard.coverage !== 'GRAPH_SLOTS_DEFERRED_INTENTS')","condition"]]]
 ["options.mode === 'LIVE_PERSISTENT' && !options.storage && !options.storageFactory",[["if","options.mode === 'LIVE_PERSISTENT' && !options.storage && !options.storageFactory","condition"]]]
@@ -897,6 +2042,8 @@ runtime/StateManager.ets
 ["clock = options.now",[]]
 ["this.sleeper = options.sleep === undefined ? (ms: number): Promise<void> => new Promise<void>((resolve: () => void) => { setTimeout(resolve, ms); }) : options.sleep",[]]
 ["this.diagnostic = options.diagnostic",[]]
+["this.diagnosticEnabled = options.diagnosticEnabled",[]]
+["this.durable = options.durable",[]]
 @StateManager.encode
 ["text = encodeStateFile({\n    appId: this.appId, schemaVersion: 1, vmGeneration: this.generation,\n    revision: this.revision, stamp: this.stamp\n}, this.working)",[]]
 @StateManager.decode
@@ -923,6 +2070,13 @@ runtime/StateManager.ets
 ["this.working = tx.originalRoot",[["if","this.safety","then"],["try","body"]]]
 @StateManager.confirmCommit
 ["this.decode(loaded.encodedState, this.generation, result.revision)",[["try","body"],["try","catch"]]]
+vera/ProjectStore.ets
+@ProjectInitialStateOptions
+["root","initialState: RuntimeValue = NULL_VALUE;"]
+"initialState: RuntimeValue = NULL_VALUE;"
+@ProjectStore.acceptInitialState
+"seed = decodeRuntimeValue(JSON.parse(payload) as Object)"
+"manager.setWorkingState(tx, seed)"
 vera/VeraGfx.ets
 @GfxShapeValue.constructor
 ["signature","constructor ( op: GfxOp ) "]
@@ -1095,6 +2249,12 @@ vera/VeraLiveWidget.ets
 ["root","private state: RuntimeValue;"]
 @WidgetSession.constructor
 ["this.state = saved.length > 0 ? decodeRuntimeValue(JSON.parse(saved) as Object) : this.vm.execute('init')",[]]
+@WidgetSession.executeRead
+["signature","private executeRead ( entry: string args: RuntimeValue[] ) RuntimeValue"]
+["this.vm.execute(entry, args)",[["if","!this.readOnly","then"]]]
+["scope = this.vm.beginTurn(new Object(), this.state)",[]]
+["result = this.vm.executePure(entry, args)",[["try","body"]]]
+["result",[["try","body"]]]
 @WidgetSession.encodedState
 ["JSON.stringify(encodeRuntimeValue(this.state))",[]]
 @WidgetSession.restoreTap
@@ -1114,8 +2274,8 @@ vera/VeraLiveWidget.ets
 ["tree = encodeRuntimeValue(current) as Object",[["for","step < SETTLE_MAX_STEPS && !rested && this.work < SETTLE_MAX_WORK"],["try","body"]]]
 ["this.state = current",[["if","rested","then"],["try","body"]]]
 @WidgetSession.frame
-["roots = decodeVeraUi(this.vm.execute('widget', this.hasSize ? [this.state, new VeraNumberValue(size.dimension)] : [this.state]))",[]]
-["ops = decodeGfx(this.vm.execute(node.label, [this.state]))",[]]
+["roots = decodeVeraUi(this.executeRead('widget', this.hasSize ? [this.state, new VeraNumberValue(size.dimension)] : [this.state]))",[]]
+["ops = decodeGfx(this.executeRead(node.label, [this.state]))",[]]
 @WidgetSession.refresh
 ["next = this.vm.execute('widgetRefresh', [this.state])",[["try","body"]]]
 ["this.state = next",[["try","body"]]]
@@ -1944,6 +3104,31 @@ components/WidgetPreview.ets
 ["WidgetPreview.run","this.frame = session.frame('', this.title, '', this.dimension)",[["try","body"]]]
 ["WidgetPreview.run","session === this.session",[["if","session === this.session","condition"],["try","catch"]]]
 ["WidgetPreview.run","this.session = new WidgetSession(this.vbc2, 'preview', before)",[["if","session === this.session","then"],["try","catch"]]]
+runtime/AppActor.ets
+["AppActor.ready","phase = this.manager!.status().phase",[]]
+["AppActor.version","status = this.manager!.status()",[]]
+["AppActor.closeRuntime","manager !== null",[["if","manager !== null","condition"],["if","coordinator !== null","else"],["try","body"]]]
+["AppActor.closeRuntime","await manager.close()",[["if","manager !== null","then"],["if","coordinator !== null","else"],["try","body"]]]
+["AppActor.retire","await this.closeRuntime(this.coordinator, this.manager, saveState)",[["try","body"]]]
+["AppActor.retire","this.manager = null",[["try","finally"]]]
+["AppActor.activate","this.manager = new StateManager(managerOptions)",[["try","body"]]]
+["AppActor.activate","loaded = await this.manager!.load(working !== null)",[["try","body"]]]
+["AppActor.activate","publication = await this.manager!.publishGeneration()",[["try","body"]]]
+["AppActor.activate","this.coordinator = new AppActorTurnCoordinator(this.manager!, this.vm!, this.host!, this.mode, policy, {\n    snapshot: (snapshot): void => this.publishSnapshot(snapshot.encoded, snapshot),\n    effects: (delivery): void => {\n        if (this.cancelled || this.disposed) {\n            return;\n        }\n        this.align(delivery);\n        this.callback(() => this.callbacks.effects(delivery.effects, delivery));\n    },\n    render: (version, pure): Promise<void> => this.render(version, pure),\n    durable: (): void => this.markDurable(),\n    saved: (version): void => {\n        if (this.cancelled || this.disposed) {\n            return;\n        }\n        this.align(version);\n        this.callback(() => this.callbacks.saved(this.persistKey.split('/')[0]));\n    },\n    resumed: (changed: boolean): void => {\n        if (!this.cancelled && !this.disposed) {\n            StageTrace.emit(this.traceOwner, 'RESUME_STATE_RELOAD', { changed: changed });\n        }\n    },\n    error: (error): void => {\n        reportedFailure = error;\n        StageTrace.emit(this.traceOwner, 'ERROR', { kind: error.kind });\n        if (!this.cancelled && !this.disposed) {\n            this.callback(() => this.callbacks.error(error.kind, error.code));\n        }\n    }\n}, this.safety)",[["try","body"]]]
+["AppActor.activate","this.manager!.getWorkingState()",[["if","restored","then"],["try","body"]]]
+["AppActor.captureMemoryRuntime","runtime.manager = this.manager",[]]
+["AppActor.restoreMemoryRuntime","this.manager = runtime.manager",[]]
+["AppActor.closeMemoryRuntime","await this.closeRuntime(runtime.coordinator, runtime.manager, false)",[["try","body"]]]
+["AppActor.promote","working = this.manager!.getWorkingState()",[]]
+["AppActor.promote","this.manager = null",[]]
+["AppActor.notifyStateSnapshot","snapshot = this.mode === 'LIVE_PERSISTENT' ? this.manager!.committedSnapshot() : null",[]]
+["AppActor.notifyStateSnapshot","this.publishSnapshot(this.manager!.captureWorkingSnapshot(), this.version())",[["if","this.mode === 'LIVE_EPHEMERAL'","then"],["if","snapshot !== null","else"]]]
+["AppActor.saveNow","result = await this.manager!.finalSave()",[["try","body"]]]
+["AppActor.saveNow","snapshot = this.manager!.committedSnapshot()!",[["if","result.status === 'COMMITTED'","then"],["try","body"]]]
+["AppActor.quiesce","this.manager !== null",[["if","this.manager !== null","condition"],["if","this.coordinator !== null","else"]]]
+["AppActor.quiesce","await this.manager!.whenIdle()",[["if","this.manager !== null","then"],["if","this.coordinator !== null","else"]]]
+["AppActor.dispose","this.manager = null",[["try","finally"]]]
+["AppActor.worldDirty","this.manager !== null && this.manager!.status().dirty",[]]
 runtime/InProcessHost.ets
 ["InProcessHost.createActor","actor = this.actorFactory === null ? new AppActor(callbacks, record) :\n    this.actorFactory!(callbacks, record)",[]]
 runtime/StateManager.ets
@@ -1992,6 +3177,7 @@ runtime/StateManager.ets
 ["StateManager.commitTurn","this.refuseTurn(turn, false)",[["try","catch"]]]
 ["StateManager.commitTurn","turn.settling = true",[]]
 ["StateManager.commitTurn","this.finishTurn(turn)",[["if","this.mode !== 'LIVE_PERSISTENT'","then"]]]
+["StateManager.commitTurn","this.mode === 'LIVE_EPHEMERAL' && turn.possibleMutation",[["if","this.mode === 'LIVE_EPHEMERAL' && turn.possibleMutation","condition"],["if","this.mode !== 'LIVE_PERSISTENT'","then"]]]
 ["StateManager.commitTurn","this.abandonTurn(turn)",[["try","catch"],["if","effective !== 'IMMEDIATE'","then"]]]
 ["StateManager.commitTurn","this.finishTurn(turn)",[["if","effective !== 'IMMEDIATE'","then"]]]
 ["StateManager.commitTurn","this.abandonTurn(turn)",[["if","this.isFaulted()","then"],["if","this.isFaulted() || this.needsReload","then"]]]
@@ -2000,23 +3186,30 @@ runtime/StateManager.ets
 ["StateManager.commitTurn","(turn.source === 'INIT' || turn.source === 'CARRY') && !turn.hasEffects &&\n    !turn.originalDirty && this.snapshot !== null",[["if","(turn.source === 'INIT' || turn.source === 'CARRY') && !turn.hasEffects &&\n    !turn.originalDirty && this.snapshot !== null","condition"]]]
 ["StateManager.commitTurn","this.finishTurn(turn)",[["if","equal","then"],["if","(turn.source === 'INIT' || turn.source === 'CARRY') && !turn.hasEffects &&\n    !turn.originalDirty && this.snapshot !== null","then"]]]
 ["StateManager.commitTurn","result = await this.save('IMMEDIATE', turn)",[]]
-["StateManager.save","turn === null && this.active !== null",[["if","turn === null && this.active !== null","condition"]]]
-["StateManager.save","turn === null && (!this.dirty || this.blockedPayloadSeq === this.dirtySeq)",[["if","turn === null && (!this.dirty || this.blockedPayloadSeq === this.dirtySeq)","condition"]]]
-["StateManager.save","turn !== null",[["if","turn !== null","condition"],["if","!validCounter(this.revision + 1)","then"]]]
-["StateManager.save","this.abandonTurn(turn)",[["if","turn !== null","then"],["if","!validCounter(this.revision + 1)","then"]]]
-["StateManager.save","turn === null",[["if","turn === null","condition"],["if","bytes.byteLength > this.stateMaxBytes","then"],["try","body"]]]
-["StateManager.save","await this.handleRefusal(result, turn, reason)",[["if","bytes.byteLength > this.stateMaxBytes","then"],["try","body"]]]
-["StateManager.save","turn === null",[["if","turn === null","condition"],["try","catch"]]]
-["StateManager.save","await this.handleRefusal(result, turn, reason)",[["try","catch"]]]
-["StateManager.save","turn !== null",[["if","turn !== null","condition"],["try","catch"]]]
-["StateManager.save","this.abandonTurn(turn)",[["if","turn !== null","then"],["try","catch"]]]
-["StateManager.save","this.captureInFlight = turn === null",[]]
-["StateManager.save","turn !== null",[["if","turn !== null","condition"],["if","this.isTerminal()","then"]]]
-["StateManager.save","this.abandonTurn(turn)",[["if","turn !== null","then"],["if","this.isTerminal()","then"]]]
-["StateManager.save","await this.handleRefusal(result, turn, reason)",[["if","result.status !== 'COMMITTED'","then"]]]
-["StateManager.save","turn !== null",[["if","turn !== null","condition"]]]
-["StateManager.save","this.abandonTurn(turn)",[["if","this.isFaulted()","then"],["if","turn !== null","then"]]]
-["StateManager.save","this.finishTurn(turn)",[["if","this.isFaulted()","else"],["if","turn !== null","then"]]]
+["StateManager.save","turn !== null || reason === 'THROTTLED'",[["if","turn !== null || reason === 'THROTTLED'","condition"]]]
+["StateManager.save","this.saveMeasured(reason, turn)",[["if","turn !== null || reason === 'THROTTLED'","then"]]]
+["StateManager.saveMeasured","turn === null && this.active !== null",[["if","turn === null && this.active !== null","condition"]]]
+["StateManager.saveMeasured","turn === null && (!this.dirty || this.blockedPayloadSeq === this.dirtySeq)",[["if","turn === null && (!this.dirty || this.blockedPayloadSeq === this.dirtySeq)","condition"]]]
+["StateManager.saveMeasured","turn?.source",[]]
+["StateManager.saveMeasured","turn !== null",[["if","turn !== null","condition"],["if","!validCounter(this.revision + 1)","then"]]]
+["StateManager.saveMeasured","this.abandonTurn(turn)",[["if","turn !== null","then"],["if","!validCounter(this.revision + 1)","then"]]]
+["StateManager.saveMeasured","turn === null",[["if","turn === null","condition"],["if","bytes.byteLength > this.stateMaxBytes","then"],["try","body"]]]
+["StateManager.saveMeasured","await this.handleRefusal(result, turn, reason, started)",[["if","bytes.byteLength > this.stateMaxBytes","then"],["try","body"]]]
+["StateManager.saveMeasured","turn === null",[["if","turn === null","condition"],["try","catch"]]]
+["StateManager.saveMeasured","await this.handleRefusal(result, turn, reason, started)",[["try","catch"]]]
+["StateManager.saveMeasured","turn !== null",[["if","turn !== null","condition"],["try","catch"]]]
+["StateManager.saveMeasured","this.abandonTurn(turn)",[["if","turn !== null","then"],["try","catch"]]]
+["StateManager.saveMeasured","this.captureInFlight = turn === null",[]]
+["StateManager.saveMeasured","turn !== null",[["if","turn !== null","condition"],["if","this.isTerminal()","then"]]]
+["StateManager.saveMeasured","this.abandonTurn(turn)",[["if","turn !== null","then"],["if","this.isTerminal()","then"]]]
+["StateManager.saveMeasured","await this.handleRefusal(result, turn, reason, started)",[["if","result.status !== 'COMMITTED'","then"]]]
+["StateManager.saveMeasured","turn !== null",[["if","turn !== null","condition"]]]
+["StateManager.saveMeasured","this.abandonTurn(turn)",[["if","this.isFaulted()","then"],["if","turn !== null","then"]]]
+["StateManager.saveMeasured","this.finishTurn(turn)",[["if","this.isFaulted()","else"],["if","turn !== null","then"]]]
+["StateManager.saveMeasured","turn?.source",[]]
+["StateManager.saveMeasured","turn !== null && turn.hasEffects",[["if","turn !== null && turn.hasEffects","condition"]]]
+["StateManager.saveMeasured","this.recordEffectCommit(turn.source, duration)",[["if","turn !== null && turn.hasEffects","then"]]]
+["StateManager.handleRefusal","turn?.source",[]]
 ["StateManager.handleRefusal","turn !== null",[["if","turn !== null","condition"],["if","this.isTerminal()","then"]]]
 ["StateManager.handleRefusal","this.abandonTurn(turn)",[["if","turn !== null","then"],["if","this.isTerminal()","then"]]]
 ["StateManager.handleRefusal","turn !== null",[["if","turn !== null","condition"],["if","this.lostRecoveryPending","then"]]]
@@ -2034,25 +3227,19 @@ runtime/StateManager.ets
 ["StateManager.checkOnResume","this.active !== null",[["if","this.active !== null","condition"]]]
 ["StateManager.preparePromotion","this.mode === 'LIVE_PERSISTENT' || this.active !== null || this.pending !== 0",[["if","this.mode === 'LIVE_PERSISTENT' || this.active !== null || this.pending !== 0","condition"]]]
 ["StateManager.close","this.active !== null",[["if","this.active !== null","condition"]]]
+vera/FormUpdater.ets
+["mainLiveBinding","frame = new WidgetSession(version.vbc2, version.id, saved, flags)\n    .frame(projectId, project.name, project.icon, frame.dimension)",[["if","saved.length === 0","else"],["if","version === null || version.vbc2.length === 0","else"],["if","project === null","else"],["if","projectId.length === 0","else"],["try","body"]]]
 vera/LiveFormService.ets
-["liveFrame","session = new WidgetSession(version.vbc2, version.id, saved)",[["try","body"]]]
-["liveFrame","frame = session.frame(projectId, project.name, project.icon, dimension)",[["try","body"]]]
-["liveFrame","store.saveState(projectId, version.id, veraStateStamp(version.vbc2), session.encodedState())",[["if","frame.live && saved.length === 0","then"],["try","body"]]]
-["answerSource","session",[["if","requests.length === 0","then"]]]
-["answerSource","target = now === loaded ? session : new WidgetSession(vbc2, versionId, now)",[]]
-["answerSource","target.answer(requests[0].handler, text)",[]]
-["answerSource","target",[]]
-["liveFormTap","session = new WidgetSession(version.vbc2, version.id, saved)",[["try","body"]]]
-["liveFormTap","shown = session.frame(projectId, project.name, project.icon, dimension)",[["try","body"]]]
-["liveFormTap","requests = atPoint ?\n    session.tapSurface(shown, params['token'] as string, params['handler'] as string, params['x'] as number, params['y'] as number) :\n    atSwitch ? session.tapSwitch(shown, params['token'] as string, params['handler'] as string, params['on'] as boolean) :\n        session.tap(shown, params['token'] as string, params['handler'] as string, params['value'] as number)",[["try","body"]]]
-["liveFormTap","session = await answerSource(session, requests, saved, projectId, version.id, version.vbc2, fetchSource)",[["try","body"]]]
-["liveFormTap","frame = session.frame(projectId, project.name, project.icon, formBindings.dimensionFor(formId))",[["try","body"]]]
-["liveFormTap","store.saveState(projectId, version.id, veraStateStamp(version.vbc2), session.encodedState())",[["try","body"]]]
-["liveFormRefresh","session = new WidgetSession(version.vbc2, version.id, loaded)",[["try","body"]]]
-["liveFormRefresh","!session.refreshes()",[["if","!session.refreshes()","condition"],["try","body"]]]
-["liveFormRefresh","session = await answerSource(session, session.refresh(), loaded, projectId, version.id, version.vbc2, fetchSource)",[["try","body"]]]
-["liveFormRefresh","frame = session.frame(projectId, project.name, project.icon, formBindings.dimensionFor(formId))",[["try","body"]]]
-["liveFormRefresh","store.saveState(projectId, version.id, stamp, session.encodedState())",[["try","body"]]]
+["liveFrame","session = new WidgetSession(version.vbc2, version.id, result.encodedState, store.runtimeFlags())",[["try","body"]]]
+["liveFrame","session.frame(projectId, project.name, project.icon, dimension)",[["try","body"]]]
+vera/ProjectStore.ets
+["ProjectStore.acceptInitialState","manager = new StateManager(options)",[]]
+["ProjectStore.acceptInitialState","loaded = await manager.load()",[["try","body"]]]
+["ProjectStore.acceptInitialState","published = await manager.publishGeneration()",[["try","body"]]]
+["ProjectStore.acceptInitialState","tx = manager.beginTurn('IMMEDIATE', 'CARRY')",[["try","body"]]]
+["ProjectStore.acceptInitialState","manager.setWorkingState(tx, seed)",[["try","body"]]]
+["ProjectStore.acceptInitialState","result = await manager.commitTurn(tx)",[["try","body"]]]
+["ProjectStore.acceptInitialState","await manager.close()",[["try","finally"]]]
 vera/VeraLiveWidget.ets
 ["runPreviewTap","session = new WidgetSession(request.vbc2, 'preview', request.state)",[["try","body"]]]
 ["runPreviewTap","shown = session.frame('', request.title, '', request.dimension)",[["try","body"]]]
@@ -2145,7 +3332,23 @@ vera/VeraWorldPlay.ets
     return new Application(this.span(start), imports, declarations)
   }`
   const globalsParserNode = parse('globals.ts', 'class Parser { ' + globalsParser + ' }').statements[0].members[0]
-  const guard = input => {
+  const inspectOwnershipFile = (file, actual) => {
+    assert.deepEqual(actual.ownerEntries, reviewedOwnerOrigins.get(file) || [],
+      'external inventory: ordered storage owner origin ' + file)
+    assert.deepEqual(sorted(actual.accesses), sorted(expectedAccesses.filter(([module]) => module === path.basename(file, '.ets'))),
+      'external inventory: 46 reviewed direct graph accesses ' + file)
+    assert.deepEqual(sorted(actual.imports), sorted(reviewedImports.filter(([name]) => name === file)),
+      'external inventory: protected imports changed ' + file)
+    assert.deepEqual(sorted(actual.fresh), sorted(ownership.A.fresh.filter(([module]) => file === 'vera/' + module + '.ets')
+      .map(([module, name, text]) => [module, name, canonical(text)])), 'external inventory: fresh construction changed ' + file)
+    assert.deepEqual(sorted(actual.rootsFound), sorted(ownership.B.roots.filter(([name]) => name === file).map(entry => entry.slice(0, 3))),
+      'external inventory: retained roots changed ' + file)
+    const contextual = file.startsWith('runtime/') || ownership.B.roots.some(([name]) => name === file)
+    const sites = actual.entries.map(([owner, expression, context]) =>
+      expression === 'signature' || expression === 'root' || contextual ? [owner, expression, context] : [owner, expression])
+    assert.deepEqual(sites, reviewedSurfaces.get(file) || [], 'external inventory: ordered owner/site ' + file)
+  }
+  const guard = (input, inspectFile) => {
     const compiler = parse('compiler.ts', input.get('vera/VeraCompiler.ets'))
     const parser = compiler.statements.find(node => ts.isClassDeclaration(node) && node.name?.text === 'Parser')
     const methods = parser?.members.filter(node => ts.isMethodDeclaration(node) && node.name?.text === 'parse')
@@ -2159,7 +3362,10 @@ vera/VeraWorldPlay.ets
       assert.equal(canonical(print(readers[0])), canonical(text),
         'external inventory: reviewed reader body changed ' + module + ':' + name)
     }
-    const actual = inventory(input)
+    const actual = inventory(input, undefined, (file, result) => {
+      if (inspectFile) inspectFile(file, result)
+      inspectOwnershipFile(file, result)
+    })
     assert.deepEqual([...actual.ownerOrigins.keys()].sort(), [...reviewedOwnerOrigins.keys()].sort(),
       'external inventory: storage owner origin files changed')
     for (const [file, sites] of actual.ownerOrigins) {
@@ -2215,9 +3421,9 @@ vera/VeraWorldPlay.ets
   reject('Cell write using import type', 'runtime/shared/StatePort.ets', 'import type { RuntimeValue }',
     'import type { RuntimeValue, Cell }')
   reject('destructured erased retained root', 'runtime/AppActor.ets', 'ready(): boolean {',
-    'ready(): boolean { let {currentState: opaque} = this as Object as {currentState: Object}; Object.assign(opaque, {fields: new Map()});')
+    'ready(): boolean { let {manager: opaque} = this as Object as {manager: Object}; Object.assign(opaque, {fields: new Map()});')
   reject('new root graph consumer without new imports', 'runtime/AppActor.ets', 'ready(): boolean {',
-    'ready(): boolean { (this.currentState as Object as {elements: Object[]}).elements.push({});')
+    'ready(): boolean { (this.manager!.getWorkingState() as Object as {elements: Object[]}).elements.push({});')
   reject('new function graph consumer without new imports', 'vera/VeraUi.ets',
     'function decodeNode(obj: VeraObjectValue, depth: number): VeraUiNode {',
     'function extraConsumer(obj: VeraObjectValue): void { Object.assign(obj, {fields: new Map()}) }\nfunction decodeNode(obj: VeraObjectValue, depth: number): VeraUiNode {')
@@ -2227,21 +3433,21 @@ vera/VeraWorldPlay.ets
   reject('protected interface erasure', 'runtime/StateManager.ets', 'constructor(options: StateManagerOptions) {',
     'constructor(options: StateManagerOptions) { let erased: Object = options; Object.assign((erased as {initialState: Object}).initialState, {fields: new Map()});')
   reject('computed retained root concatenation', 'runtime/AppActor.ets', 'ready(): boolean {',
-    'ready(): boolean { Object.assign(this["current" + "State"], {fields: new Map()});')
+    'ready(): boolean { Object.assign(this["man" + "ager"], {working: null});')
   reject('computed retained root variable', 'runtime/AppActor.ets', 'ready(): boolean {',
-    'ready(): boolean { let key="currentState"; Object.assign(this[key], {fields: new Map()});')
+    'ready(): boolean { let key="manager"; Object.assign(this[key], {fields: new Map()});')
   reject('retained root unreachable assignment', 'runtime/StateManager.ets', 'this.working = value',
     'if (false) { this.working = value }')
-  reject('duplicate retained root execute', 'runtime/AppActor.ets', 'this.currentState = this.vm!.execute(action, [before, payload])',
-    'this.currentState = this.vm!.execute(action, [before, payload]); this.currentState = this.vm!.execute(action, [before, payload])')
+  reject('duplicate retained root execute', 'runtime/AppActor.ets', 'let value = call.value === undefined ? this.vm.execute(call.entry, args) : call.value',
+    'let value = call.value === undefined ? this.vm.execute(call.entry, args) : call.value; this.state.setWorkingState(tx, this.vm.execute(call.entry, args))')
 
   const actorAnchor = "let actor = record.actor!\n    switch (entry.kind) {"
   reject('visible storage owner Object.assign', 'runtime/InProcessHost.ets', actorAnchor,
-    "let actor = record.actor!\n    if (actor instanceof AppActor) { Object.assign(actor, {currentState: null}); }\n    switch (entry.kind) {")
+    "let actor = record.actor!\n    if (actor instanceof AppActor) { Object.assign(actor, {manager: null}); }\n    switch (entry.kind) {")
   reject('visible storage owner erased alias', 'runtime/InProcessHost.ets', actorAnchor,
-    "let actor = record.actor!\n    if (actor instanceof AppActor) { let erased: Object=actor; Object.assign((erased as {currentState:Object}).currentState,{fields:new Map()}); }\n    switch (entry.kind) {")
+    "let actor = record.actor!\n    if (actor instanceof AppActor) { let erased: Object=actor; Object.assign((erased as {manager:Object}).manager,{fields:new Map()}); }\n    switch (entry.kind) {")
   reject('visible storage owner inferred alias', 'runtime/InProcessHost.ets', actorAnchor,
-    "let actor = record.actor!\n    if (actor instanceof AppActor) { let alias=actor; Object.assign(alias, {currentState: null}); }\n    switch (entry.kind) {")
+    "let actor = record.actor!\n    if (actor instanceof AppActor) { let alias=actor; Object.assign(alias, {manager: null}); }\n    switch (entry.kind) {")
   reject('Cell constructor remains pinned as B', interpreter, 'constructor(v: RuntimeValue) { cellBirths.set(this, nextAllocationSerial()); this.value = v; }',
     'constructor(v: RuntimeValue) { cellBirths.set(this, nextAllocationSerial()); this.value = v; this.value = v; }')
   reject('reviewed ArkUI owner erasure', 'components/WidgetPreview.ets', 'let session = this.session!',
@@ -2269,7 +3475,7 @@ vera/VeraWorldPlay.ets
       }`)
   assert.throws(() => guard(barrelProbe), /external inventory:/, 'new barrel interface consumer')
   assert.throws(() => guard(newFile(`import { AppActor } from '../runtime/AppActor'
-    function consume(actor: AppActor): void { let erased: Object = actor; Object.assign(erased, {currentState: null}) }`)),
+    function consume(actor: AppActor): void { let erased: Object = actor; Object.assign(erased, {manager: null}) }`)),
   /external inventory:/, 'new storage owner consumer without interpreter import')
 
   for (const module of ['VeraUi', 'VeraGfx', 'VeraScene', 'VeraStateCarry']) {
@@ -2279,12 +3485,16 @@ vera/VeraWorldPlay.ets
       ['Cell', "function extraMutation(cell: import('./VeraInterpreter').Cell, value: RuntimeValue): void { cell.value = value }"]
     ]) {
       const probe = new Map(sources).set(file, text + '\n' + helper)
-      const sites = inventory(probe).surfaces.get(file)
       const mutation = kind === 'graph' ? 'value.elements.pop()' : 'cell.value = value'
-      assert(sites.some(([owner, expression]) => owner === 'extraMutation' && expression === mutation),
-        module + ' inventories the mutation body, not only its added signature')
-      assert.throws(() => guard(probe), /external inventory:/,
-        module + ' appended ' + kind + ' mutation without changing protected imports')
+      let bodyChecked = false
+      assert.throws(() => guard(probe, (name, result) => {
+        if (name !== file) return
+        assert(result.entries.some(([owner, expression]) => owner === 'extraMutation' && expression === mutation),
+          module + ' inventories the mutation body, not only its added signature')
+        bodyChecked = true
+      }), /external inventory:/,
+      module + ' appended ' + kind + ' mutation without changing protected imports')
+      assert(bodyChecked, module + ' mutation body was inspected before rejection')
     }
   }
   reject('compiler mutable global bypass', 'vera/VeraCompiler.ets',
@@ -2500,6 +3710,21 @@ async function projectStateChecks() {
   const ts = require(process.env.VERA_TYPESCRIPT_PATH || 'typescript')
   const {sourceRoot} = require('./source-loader')
   const {ProjectStateMigration, FormProjectStateReader} = loadVera('ProjectStateMigration')
+  const worker = require('./state-io-check').createWorkerFixture('/fixture/files/vera')
+  const executeWorker = worker.taskpool.execute.bind(worker.taskpool)
+  let workerEntries
+  worker.taskpool.execute = (task, priority) => {
+    const entries = workerEntries
+    assert(entries, 'worker requires the current project fixture')
+    worker.disk.clear()
+    for (const [file, text] of entries) worker.disk.set(file, text)
+    return executeWorker(task, priority).finally(() => {
+      entries.clear()
+      for (const file of worker.disk.keys()) entries.set(file, worker.disk.get(file))
+      assert.equal(worker.memory.fds.size, 0, 'project read releases worker descriptors')
+      assert([...worker.memory.nodes.values()].every(node => node.owner === null), 'project read releases worker locks')
+    })
+  }
   const projectSource = fs.readFileSync(path.join(sourceRoot, 'vera/ProjectStore.ets'), 'utf8')
   const transpiled = ts.transpileModule(projectSource, {fileName: 'ProjectStore.ts',
     compilerOptions: {module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020}, reportDiagnostics: true})
@@ -2523,21 +3748,39 @@ async function projectStateChecks() {
         if (failMetadata && !name.endsWith('.state.json') && !name.endsWith('.tmp')) throw Error('metadata failed')
         const fd = nextFd++; handles.set(fd, name); entries.set(name, ''); return {fd}
       },
-      writeSync(fd, text) { entries.set(handles.get(fd), text); return text.length },
+      writeSync(fd, text) { entries.set(handles.get(fd), text); return Buffer.byteLength(text, 'utf8') },
       closeSync(file) { handles.delete(file.fd) },
       renameSync(from, to) { entries.set(to, entries.get(from)); entries.delete(from) },
       unlinkSync(name) { if (!entries.has(name)) throw missing(); entries.delete(name); events.push('unlink:' + name) },
       listFileSync(dir) { return [...entries.keys()].filter(name => path.posix.dirname(name) === dir).map(name => path.posix.basename(name)) },
       rmdirSync() { throw Error('recursive removal must not touch stable locks') }
     }
-    const mod = {exports: {}}
-    new Function('require', 'module', 'exports', transpiled.outputText)(name => {
-      if (name === '@kit.CoreFileKit') return {fileIo: disk}
-      if (name === '@kit.ArkTS') return {util: {TextEncoder: class {encodeInto(text) {return new TextEncoder().encode(text)}}}}
-      if (name === './ProjectText') return {requestHeadline: text => text}
-      throw Error('Unexpected runtime dependency: ' + name)
-    }, mod, mod.exports)
-    const store = new mod.exports.ProjectStore()
+    const cache = new Map()
+    function load(file) {
+      if (cache.has(file)) return cache.get(file).exports
+      const compiled = file === path.join(sourceRoot, 'vera/ProjectStore.ets') ? transpiled :
+        ts.transpileModule(fs.readFileSync(file, 'utf8').replace(/^@Concurrent\s*$/gm, ''), {
+          fileName: file.replace(/\.ets$/, '.ts'),
+          compilerOptions: {module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020}, reportDiagnostics: true
+        })
+      assert.deepEqual((compiled.diagnostics || []).filter(d => d.category === ts.DiagnosticCategory.Error), [])
+      const mod = {exports: {}}
+      cache.set(file, mod)
+      new Function('require', 'module', 'exports', compiled.outputText)(name => {
+        if (name === '@kit.CoreFileKit') return {fileIo: file.startsWith(path.join(sourceRoot, 'runtime/')) ? worker.filesystem : disk}
+        if (name === '@kit.ArkTS') return {util: worker.util, taskpool: worker.taskpool}
+        if (name === '@ohos.fileio') return {default: worker.legacyFilesystem}
+        if (name === '@kit.CryptoArchitectureKit') return {cryptoFramework: worker.cryptoFramework}
+        if (name === '@kit.BasicServicesKit') return {systemDateTime: {TimeType: {STARTUP: 0}, getUptime: () => 10000}}
+        if (name === './ProjectText') return {requestHeadline: text => text}
+        if (name.endsWith('/VeraInterpreter')) return loadVera('VeraInterpreter')
+        if (name.startsWith('.')) return load(path.resolve(path.dirname(file), name + '.ets'))
+        throw Error('Unexpected runtime dependency: ' + name)
+      }, mod, mod.exports)
+      return mod.exports
+    }
+    const {ProjectStore} = load(path.join(sourceRoot, 'vera/ProjectStore.ets'))
+    const store = new ProjectStore()
     store.init('/fixture/files')
     const project = store.createProject('Counter', '')
     const metadata = store.migrationMetadata()
@@ -2605,8 +3848,11 @@ async function projectStateChecks() {
     assert.deepEqual(f.events, ['check', 'prepare', 'seed', 'durable', 'publish', 'accepted'])
     assert.equal(await f.facade.commitSave(async () => false, async () => { throw Error('must short circuit') }, () => {}), false)
     assert.equal(await f.facade.commitSave(async () => true, async () => null, () => { throw Error('must not accept') }), false)
-    assert.equal(typeof f.store.loadState(f.project.id, f.store.getLatestVersion(f.project.id).id, 'other'), 'string')
-    assert.equal(f.store.loadState(f.project.id, f.store.getLatestVersion(f.project.id).id, 'other'), '')
+    workerEntries = f.entries
+    const loading = f.store.loadState(f.project.id, f.store.getLatestVersion(f.project.id).id, 'other')
+    assert(loading instanceof Promise)
+    assert.equal(typeof await loading, 'string')
+    assert.equal(await f.store.loadState(f.project.id, f.store.getLatestVersion(f.project.id).id, 'other'), '')
     assert.equal(f.facade.saveState, undefined)
     assert.equal(f.facade.commit, undefined)
   }
@@ -2952,6 +4198,7 @@ async function cleanupTaskPoolChecks(projectFixture) {
         get Task() { return pool.Task }, get Priority() { return pool.Priority }, execute: (...args) => pool.execute(...args)
       }}
       if (dependency === '@ohos.fileio' || dependency === '@kit.CryptoArchitectureKit') return {}
+      if (dependency === '@kit.BasicServicesKit') return {systemDateTime: {TimeType: {STARTUP: 0}, getUptime: () => 10000}}
       if (dependency.startsWith('./')) return load(dependency.slice(2))
       throw Error('forbidden worker dependency: ' + dependency)
     }, mod, mod.exports)

@@ -49,6 +49,8 @@ function fixture(options = {}) {
   const dependencies = {
     '@kit.AbilityKit': { UIAbility: class {} },
     '@kit.ArkTS': {},
+    '@kit.BackgroundTasksKit': {},
+    '../runtime/InProcessHost': { InProcessHost: { get() { assert.fail('launch routing must not acquire the runtime host'); } } },
     '@kit.PerformanceAnalysisKit': { hilog: { info() {}, warn() {}, error(...args) { errors.push(args); } } },
     '../components/LaunchTrust': loadSource(path.join(sourceRoot, 'components/LaunchTrust.ets')),
     '../runtime/trace/StageTrace': loadSource(path.join(sourceRoot, 'runtime/trace/StageTrace.ets')),
@@ -324,6 +326,9 @@ async function test(name, run) {
 (async () => {
   await test('Widget card runs its project in immersive shortcut mode', async () => {
     const widget = fs.readFileSync(path.join(sourceRoot, 'widget/pages/WidgetCard.ets'), 'utf8');
+    const runner = fs.readFileSync(path.join(sourceRoot, 'pages/RunnerPage.ets'), 'utf8');
+    assert.match(runner, /\.title\(this\.title\)\s*\.hideTitleBar\(false\)/);
+    assert.match(runner, /\.hideBackButton\(this\.shortcutMode\)/);
     assert.match(widget, /'action': 'router'/);
     assert.match(widget, /'abilityName': 'EntryAbility'/);
     assert.match(widget, /'params':\s*\{\s*'projectId': project\['id'\],\s*'launchMode': 'runLatest'\s*\}/);

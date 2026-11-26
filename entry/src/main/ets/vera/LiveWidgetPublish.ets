@@ -1,8 +1,7 @@
 import { formProvider } from '@kit.FormKit'
 import { Want } from '@kit.AbilityKit'
 import { formBindings } from './FormBindings'
-import { liveBinding } from './LiveFormService'
-import { refreshForms } from './FormUpdater'
+import { mainLiveBinding, refreshForms } from './FormUpdater'
 
 /** What publishLiveWidget answers when the card is on the home screen; anything else says what to do next. */
 export const WIDGET_ADDED: string = 'Widget added to home screen'
@@ -23,7 +22,7 @@ export async function publishLiveWidget(projectId: string): Promise<string> {
       formProvider.openFormManager(want)
       return 'Your launcher opened its widget list. Pick VERA live app: it will show this app.'
     }
-    let id = await formProvider.requestPublishForm(want, liveBinding(projectId))
+    let id = await formProvider.requestPublishForm(want, await mainLiveBinding(projectId))
     formBindings.bind(id, projectId)
     await refreshForms()
     return WIDGET_ADDED

@@ -27,7 +27,9 @@ import { util } from '@kit.ArkTS'
 import { enableTemplateSelect, disableTemplateSelect } from '../vera/VeraTemplateSelectFlag'
 import { setFloorGainOverride } from '../vera/VeraLook3D'
 import { startedByApp, presentDevParameters, describeCaller } from '../components/LaunchTrust'
-import { StageTrace } from '../runtime/trace/StageTrace'
+import { StageTrace, StateLifecycleDiag } from '../runtime/trace/StageTrace'
+import { InProcessHost } from '../runtime/InProcessHost'
+import { backgroundTaskManager } from '@kit.BackgroundTasksKit'
 
 const DOMAIN = 0x0000
 
@@ -49,6 +51,7 @@ export default class EntryAbility extends UIAbility {
   private routeDrainGeneration: number = -1
   private navigationSession: AppNavigationSession | null = null
   private normalLayoutFullScreen: boolean = false
+  private diagnosticForegroundCount: number = 0
   private vmSafetyLaunchMode: string = 'normal'
   private vmSafetyBenchmarkActive: boolean = false
   private vmSafetyBenchmarkTimer: number = -1
@@ -62,6 +65,7 @@ export default class EntryAbility extends UIAbility {
       if (runId.length > 0) { this.scheduleVmSafetyBenchmark(runId) }
       return
     }
+    StateLifecycleDiag.emit('MAIN', 'CREATE')
     try {
       this.context.setOnNewWantSkipScenarios(
         contextConstant.Scenarios.SCENARIO_MOVE_MISSION_TO_FRONT |
@@ -876,15 +880,103 @@ export default class EntryAbility extends UIAbility {
 
   onForeground(): void {
     if (this.vmSafetyLaunchMode !== 'normal') { return }
+    this.diagnosticForegroundCount++
+    StateLifecycleDiag.emit('MAIN', 'FOREGROUND')
     hilog.info(DOMAIN, 'VERA', 'EntryAbility onForeground')
     AppStorage.setOrCreate('veraForeground', true)
     AppStorage.setOrCreate('veraResume', Date.now())
     refreshForms()
   }
 
+  private async checkpointBackground(): Promise<void> {
+    const operation = StateLifecycleDiag.operation()
+    const started = StateLifecycleDiag.now()
+    const foregroundCount = this.diagnosticForegroundCount
+    StateLifecycleDiag.emit('MAIN', 'BG_BEGIN', operation)
+    let requestId = -1
+    let expiryTimer = -1
+    let expired = false
+    let cancelGrant = (): void => {
+      if (expiryTimer !== -1) {
+        let timer = expiryTimer
+        expiryTimer = -1
+        try { clearTimeout(timer) }
+        catch {
+          try { hilog.warn(DOMAIN, 'VERA', 'Background state timer cleanup failed') } catch {}
+        }
+      }
+      if (requestId < 0) { return }
+      let id = requestId
+      requestId = -1
+      try {
+        backgroundTaskManager.cancelSuspendDelay(id)
+        StateLifecycleDiag.emit('MAIN', 'BG_CANCEL', operation, 'CANCELLED', StateLifecycleDiag.elapsed(started),
+          this.diagnosticForegroundCount !== foregroundCount, undefined, expired)
+      } catch {
+        StateLifecycleDiag.emit('MAIN', 'BG_CANCEL', operation, 'FAILED', StateLifecycleDiag.elapsed(started),
+          this.diagnosticForegroundCount !== foregroundCount, undefined, expired)
+        try { hilog.warn(DOMAIN, 'VERA', 'Background state grant cancellation failed') } catch {}
+      }
+    }
+    let grantUnavailable = false
+    try {
+      grantUnavailable = typeof backgroundTaskManager.requestSuspendDelay !== 'function'
+      let grant = backgroundTaskManager.requestSuspendDelay('VERA state checkpoint', (): void => {
+        expired = true
+        StateLifecycleDiag.emit('MAIN', 'BG_EXPIRED', operation, 'CALLBACK', StateLifecycleDiag.elapsed(started),
+          this.diagnosticForegroundCount !== foregroundCount, undefined, true)
+        cancelGrant()
+      })
+      if (Number.isSafeInteger(grant.requestId) && grant.requestId >= 0) {
+        requestId = grant.requestId
+        StateLifecycleDiag.emit('MAIN', 'BG_GRANT', operation,
+          !Number.isFinite(grant.actualDelayTime) || grant.actualDelayTime <= 0 ? 'INVALID' : 'GRANTED',
+          StateLifecycleDiag.elapsed(started), this.diagnosticForegroundCount !== foregroundCount, undefined, expired)
+        if (expired || !Number.isFinite(grant.actualDelayTime) || grant.actualDelayTime <= 0) {
+          cancelGrant()
+        } else {
+          try {
+            expiryTimer = setTimeout((): void => {
+              expiryTimer = -1
+              expired = true
+              StateLifecycleDiag.emit('MAIN', 'BG_EXPIRED', operation, 'TIMER', StateLifecycleDiag.elapsed(started),
+                this.diagnosticForegroundCount !== foregroundCount, undefined, true)
+              cancelGrant()
+            }, Math.min(grant.actualDelayTime, 2147483647))
+          } catch {
+            StateLifecycleDiag.emit('MAIN', 'BG_TIMER_FAILED', operation, 'FAILED', StateLifecycleDiag.elapsed(started),
+              this.diagnosticForegroundCount !== foregroundCount, undefined, expired)
+            cancelGrant()
+          }
+        }
+      } else {
+        StateLifecycleDiag.emit('MAIN', 'BG_GRANT', operation, 'INVALID', StateLifecycleDiag.elapsed(started))
+        try { hilog.warn(DOMAIN, 'VERA', 'Background state grant unavailable') } catch {}
+      }
+    } catch {
+      StateLifecycleDiag.emit('MAIN', 'BG_GRANT', operation, grantUnavailable ? 'UNAVAILABLE' : 'REFUSED',
+        StateLifecycleDiag.elapsed(started))
+      try { hilog.warn(DOMAIN, 'VERA', 'Background state grant refused') } catch {}
+    }
+    let hostResolved = false
+    try {
+      await InProcessHost.get().checkpointBackground()
+      hostResolved = true
+    }
+    catch {
+      try { hilog.error(DOMAIN, 'VERA', 'Background state checkpoint failed') } catch {}
+    }
+    finally {
+      cancelGrant()
+      StateLifecycleDiag.emit('MAIN', 'BG_SETTLED', operation, hostResolved ? 'HOST_RESOLVED' : 'HOST_REJECTED',
+        StateLifecycleDiag.elapsed(started), this.diagnosticForegroundCount !== foregroundCount, undefined, expired)
+    }
+  }
+
   onBackground(): void {
     if (this.vmSafetyLaunchMode !== 'normal') { return }
     hilog.info(DOMAIN, 'VERA', 'EntryAbility onBackground')
     AppStorage.setOrCreate('veraForeground', false)
+    this.checkpointBackground()
   }
 }

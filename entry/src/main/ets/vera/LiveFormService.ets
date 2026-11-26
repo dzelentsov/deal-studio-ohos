@@ -1,9 +1,35 @@
 import { formBindingData } from '@kit.FormKit'
-import { store } from './ProjectStore'
-import { formBindings, refreshLedger } from './FormBindings'
-import { LiveFrame, WidgetSession, SourceRequest, compactFrame } from './VeraLiveWidget'
+import { store, STATE_MAX_BYTES } from './ProjectStore'
+import { formBindings } from './FormBindings'
+import { FormProjectStateReader, ProjectCommittedReadOnlyPort } from './ProjectStateMigration'
+import { StateIo, LoadResult } from '../runtime/StateIo'
+import { statePayloadBytes } from '../runtime/StateFileFormat'
+import { LiveFrame, WidgetSession, compactFrame } from './VeraLiveWidget'
 import { veraStateStamp } from './VeraStateStamp'
-import { sourceFetch } from './VeraSource'
+import { StateLifecycleDiag } from '../runtime/trace/StageTrace'
+
+class FormCommittedStateIo implements ProjectCommittedReadOnlyPort {
+  private io: StateIo
+
+  constructor(root: string) {
+    this.io = new StateIo(root, { directoryFsync: 'REQUIRED' })
+  }
+
+  readCommittedReadOnly(appId: string, expectedStamp: string): LoadResult {
+    const operation = StateLifecycleDiag.operation()
+    const started = StateLifecycleDiag.now()
+    StateLifecycleDiag.emit('FORM', 'READ_BEGIN', operation)
+    try {
+      const result = this.io.readCommittedReadOnly(appId, expectedStamp)
+      StateLifecycleDiag.emit('FORM', 'READ_END', operation, result.kind, StateLifecycleDiag.elapsed(started),
+        undefined, result.matchingStamp)
+      return result
+    } catch (error) {
+      StateLifecycleDiag.emit('FORM', 'READ_END', operation, 'REJECTED', StateLifecycleDiag.elapsed(started))
+      throw error as Error
+    }
+  }
+}
 
 export function liveFrame(projectId: string, dimension: number = 2): LiveFrame {
   let fallback = new LiveFrame()
@@ -21,35 +47,22 @@ export function liveFrame(projectId: string, dimension: number = 2): LiveFrame {
   let version = store.getLatestVersion(projectId)
   if (version === null || version.vbc2.length === 0) { fallback.status = 'Open project'; return fallback }
   try {
-    let saved = store.loadState(projectId, version.id, veraStateStamp(version.vbc2))
-    let session = new WidgetSession(version.vbc2, version.id, saved)
-    let frame = session.frame(projectId, project.name, project.icon, dimension)
-    // A clock-dependent init must not generate a different state/token on the first tap.
-    if (frame.live && saved.length === 0) {
-      store.saveState(projectId, version.id, veraStateStamp(version.vbc2), session.encodedState())
+    let reader = new FormProjectStateReader(new FormCommittedStateIo(store.stateRoot()))
+    let stamp = veraStateStamp(version.vbc2)
+    let result = reader.loadStateResult(projectId, version.id, stamp)
+    if (result.kind !== 'READY' || result.stamp !== stamp || !result.encodedState) {
+      fallback.status = result.kind === 'UNAVAILABLE' || result.kind === 'LOST' ?
+        result.code || 'Committed state unavailable; open app' : 'Open app to initialize state'
+      return fallback
     }
-    return frame
+    if (statePayloadBytes(result.encodedState).byteLength > STATE_MAX_BYTES) { throw new Error('PROJECT_READ_LIMIT') }
+    let session = new WidgetSession(version.vbc2, version.id, result.encodedState, store.runtimeFlags())
+    return session.frame(projectId, project.name, project.icon, dimension)
   } catch (e) {
     fallback.status = (e as Error).message
     console.error('VERA-FORM render: ' + fallback.status)
     return fallback
   }
-}
-
-/**
- * The program's live source call, if it asked for one, answered -- on the state saved by the time the answer arrives. The fetch
- * takes up to several seconds, and the app may save its state meanwhile (a tap in the app): then the app's state is kept and
- * the answer is handed to it, instead of the card's copy, loaded before the fetch, overwriting it. One call at most: the card's
- * update has about ten seconds, and a single GET (VeraSource.ets) fits in it.
- */
-async function answerSource(session: WidgetSession, requests: SourceRequest[], loaded: string, projectId: string,
-    versionId: string, vbc2: string, fetchSource: (params: Map<string, string>) => Promise<string>): Promise<WidgetSession> {
-  if (requests.length === 0) { return session }
-  let text = await fetchSource(requests[0].params)
-  let now = store.loadState(projectId, versionId, veraStateStamp(vbc2))
-  let target = now === loaded ? session : new WidgetSession(vbc2, versionId, now)
-  target.answer(requests[0].handler, text)
-  return target
 }
 
 export function liveBinding(projectId: string, formId: string = ''): formBindingData.FormBindingData {
@@ -58,103 +71,23 @@ export function liveBinding(projectId: string, formId: string = ''): formBinding
   return formBindingData.createFormBindingData(compactFrame(frame))
 }
 
-/**
- * Render, validate event, dispatch, re-render, THEN commit. Failed/effectful taps never save. The one call a tap may make is the
- * program's live source (Vera.Source.fetch), made here before anything is drawn.
- */
-export async function liveFormTap(formId: string, message: string,
-    fetchSource: (params: Map<string, string>) => Promise<string> = sourceFetch): Promise<formBindingData.FormBindingData> {
-  let start = Date.now()
-  let projectId = formBindings.projectFor(formId)
-  let project = store.getProject(projectId)
-  let version = store.getLatestVersion(projectId)
-  if (project === null || version === null || version.vbc2.length === 0) { return liveBinding(projectId) }
-  let saved = store.loadState(projectId, version.id, veraStateStamp(version.vbc2))
-  // The seq of the frame the card showed (LiveCard), given back on a refusal: the card is not redrawn, so nothing plays for a refused tap.
-  let shownSeq = ''
+export async function liveFormTap(formId: string, message: string): Promise<formBindingData.FormBindingData> {
+  let frame = liveFrame(formBindings.projectFor(formId), formBindings.dimensionFor(formId))
+  frame.formId = formId
   try {
     let params = JSON.parse(message) as Record<string, Object>
-    if (typeof params['seq'] === 'string') { shownSeq = params['seq'] as string }
-    // A tap on a picture carries where it fell (x, y, in the picture's own units); a button's carries a number.
-    let atPoint = typeof params['x'] === 'number' && typeof params['y'] === 'number'
-    // A tap on a toggle or a checkbox says whether it is now on.
-    let atSwitch = typeof params['on'] === 'boolean'
-    if (typeof params['token'] !== 'string' || typeof params['handler'] !== 'string' || (!atPoint && !atSwitch && typeof params['value'] !== 'number')) {
-      throw new Error('Invalid widget event')
-    }
-    console.info('VERA-FORM event action=' + String(params['handler']) + (atPoint ? ' at=' + String(params['x']) + ',' + String(params['y']) : atSwitch ? ' on=' + String(params['on']) : ' value=' + String(params['value'])))
-    let session = new WidgetSession(version.vbc2, version.id, saved)
-    let dimension = formBindings.dimensionFor(formId)
-    let shown = session.frame(projectId, project.name, project.icon, dimension)
-    let requests = atPoint ?
-      session.tapSurface(shown, params['token'] as string, params['handler'] as string, params['x'] as number, params['y'] as number) :
-      atSwitch ? session.tapSwitch(shown, params['token'] as string, params['handler'] as string, params['on'] as boolean) :
-      session.tap(shown, params['token'] as string, params['handler'] as string, params['value'] as number)
-    // A Refresh button: its live source is fetched and the answer handled before the card is drawn and saved.
-    session = await answerSource(session, requests, saved, projectId, version.id, version.vbc2, fetchSource)
-    let frame = session.frame(projectId, project.name, project.icon, formBindings.dimensionFor(formId))
-    frame.formId = formId
-    frame.seq = Date.now().toString()
-    store.saveState(projectId, version.id, veraStateStamp(version.vbc2), session.encodedState())
-    console.info('VERA-FORM tap ms=' + (Date.now() - start).toString() + ' bytes=' + JSON.stringify(compactFrame(frame)).length.toString())
-    return formBindingData.createFormBindingData(compactFrame(frame))
-  } catch (e) {
-    let frame = liveFrame(projectId, formBindings.dimensionFor(formId))
-    frame.formId = formId
-    frame.seq = shownSeq
-    frame.status = (e as Error).message
-    console.warn('VERA-FORM tap rejected: ' + frame.status)
-    return formBindingData.createFormBindingData(compactFrame(frame))
-  }
+    if (params !== null && typeof params['seq'] === 'string') { frame.seq = params['seq'] as string }
+  } catch (_error) {}
+  frame.status = 'Open app to interact; widget actions unavailable'
+  return formBindingData.createFormBindingData(compactFrame(frame))
 }
-
-/**
- * How often a project's widgetRefresh may run: under the live card's update period (form_config.json, updateDuration 1 =
- * 30 minutes), so a period's update is never skipped for arriving a little early, and over a burst of cards updated together.
- */
-export const REFRESH_EVERY_MS: number = 20 * 60 * 1000
 
 export class LiveRefresh {
   binding: formBindingData.FormBindingData
-  /** widgetRefresh ran and its state was saved: the project's other cards are to be redrawn. */
   ran: boolean = false
   constructor(binding: formBindingData.FormBindingData) { this.binding = binding }
 }
 
-/**
- * The card's periodic update. A program with widgetRefresh has it bring the state up to date with the clock, as a tap runs a
- * handler: render the result, THEN commit; an effect or a failure leaves the state as it was. The one call it may make, its
- * live source (Vera.Source.fetch), is made here and its answer handled first, so the card shows the figures fetched now. Once per project per
- * REFRESH_EVERY_MS, however many cards show it. A program without one is redrawn over its saved state.
- */
-export async function liveFormRefresh(formId: string, now: number = Date.now(),
-    fetchSource: (params: Map<string, string>) => Promise<string> = sourceFetch): Promise<LiveRefresh> {
-  let projectId = formBindings.projectFor(formId)
-  let project = store.getProject(projectId)
-  let version = store.getLatestVersion(projectId)
-  if (project === null || version === null || version.vbc2.length === 0 || now - refreshLedger.lastRun(projectId) < REFRESH_EVERY_MS) {
-    return new LiveRefresh(liveBinding(projectId, formId))
-  }
-  let stamp = veraStateStamp(version.vbc2)
-  try {
-    let loaded = store.loadState(projectId, version.id, stamp)
-    let session = new WidgetSession(version.vbc2, version.id, loaded)
-    if (!session.refreshes()) { return new LiveRefresh(liveBinding(projectId, formId)) }
-    // Marked before the fetch: the other cards of a burst updated together see it and do not fetch too.
-    refreshLedger.markRun(projectId, now)
-    // A live source widgetRefresh asked for is fetched here, and its answer handled, before anything is drawn or saved.
-    session = await answerSource(session, session.refresh(), loaded, projectId, version.id, version.vbc2, fetchSource)
-    let frame = session.frame(projectId, project.name, project.icon, formBindings.dimensionFor(formId))
-    frame.formId = formId
-    store.saveState(projectId, version.id, stamp, session.encodedState())
-    console.info('VERA-FORM refresh project=' + projectId)
-    let result = new LiveRefresh(formBindingData.createFormBindingData(compactFrame(frame)))
-    result.ran = true
-    return result
-  } catch (e) {
-    // Not tried again until the next period: a refresh that fails fails the same way every time.
-    refreshLedger.markRun(projectId, now)
-    console.warn('VERA-FORM refresh rejected: ' + (e as Error).message)
-    return new LiveRefresh(liveBinding(projectId, formId))
-  }
+export async function liveFormRefresh(formId: string): Promise<LiveRefresh> {
+  return new LiveRefresh(liveBinding(formBindings.projectFor(formId), formId))
 }

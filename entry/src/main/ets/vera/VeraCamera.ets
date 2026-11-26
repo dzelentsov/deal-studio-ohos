@@ -112,7 +112,12 @@ export class VeraCamera {
     if (context === null) { throw new Error('camera: no ability context') }
     if (!await ensureCameraPermission(context)) { throw new Error('camera permission not granted') }
     if (generation !== this.generation) { return }
-    let manager = camera.getCameraManager(context)
+    let manager: camera.CameraManager
+    try {
+      manager = camera.getCameraManager(context)
+    } catch (e) {
+      throw e as Error
+    }
     let cameras: camera.CameraDevice[] = []
     for (let attempt = 0; attempt < 10 && cameras.length === 0; attempt++) {
       try {
@@ -133,8 +138,8 @@ export class VeraCamera {
     let capability: camera.CameraOutputCapability
     try {
       capability = manager.getSupportedOutputCapability(device, camera.SceneMode.NORMAL_PHOTO)
-    } catch (_e) {
-      capability = manager.getSupportedOutputCapability(device)
+    } catch (e) {
+      throw e as Error
     }
     let previewProfile = pickPreviewProfile(capability)
     let photoProfile = pickPhotoProfile(capability)
@@ -229,8 +234,12 @@ export class VeraCamera {
         try {
           source = fs.openSync(pending.assetUri, fs.OpenMode.READ_ONLY)
           fs.copyFileSync(source.fd, path)
+        } catch (e) {
+          throw e as Error
         } finally {
-          if (source !== null) { fs.closeSync(source) }
+          if (source !== null) {
+            try { fs.closeSync(source) } catch (e) { throw e as Error }
+          }
         }
         console.info('VERA-CAMERA saved asset ' + path)
         return fileUri.getUriFromPath(path)
@@ -244,8 +253,12 @@ export class VeraCamera {
         try {
           file = fs.openSync(path, fs.OpenMode.CREATE | fs.OpenMode.WRITE_ONLY | fs.OpenMode.TRUNC)
           fs.writeSync(file.fd, component.byteBuffer)
+        } catch (e) {
+          throw e as Error
         } finally {
-          if (file !== null) { fs.closeSync(file) }
+          if (file !== null) {
+            try { fs.closeSync(file) } catch (e) { throw e as Error }
+          }
         }
         console.info('VERA-CAMERA saved ' + path)
         return fileUri.getUriFromPath(path)

@@ -48,6 +48,7 @@ export struct ProjectPage {
   @State shortcutOperation: string = ''
   @State shortcutState: ProjectShortcutState = ProjectShortcutState.Unknown
   private shortcutRefreshGeneration: number = 0
+  private widgetRefreshGeneration: number = 0
   private pageVisible: boolean = false
   private returningToIndex: boolean = false
   @State viewedSource: string = ''
@@ -128,6 +129,7 @@ export struct ProjectPage {
 
   destinationHidden(): void {
     this.pageVisible = false
+    this.widgetRefreshGeneration++
     this.closePanels()
     this.shortcutRefreshGeneration++
     this.shortcutState = ProjectShortcutState.Unknown
@@ -142,6 +144,7 @@ export struct ProjectPage {
     this.project = store.getProject(this.projectId)
     this.versions = store.listVersions(this.projectId)
     if (this.project === null) {
+      this.widgetRefreshGeneration++
       this.shortcutRefreshGeneration++
       this.shortcutState = ProjectShortcutState.Unknown
       this.returnToIndex()
@@ -152,16 +155,31 @@ export struct ProjectPage {
   }
 
   /** The widget as the home-screen card sees it: the latest version (LiveFormService) and the cards bound to it. */
-  private reloadWidget(): void {
+  private async reloadWidget(): Promise<void> {
+    const generation = ++this.widgetRefreshGeneration
+    const projectId = this.projectId
     let latest = this.versions.length > 0 ? this.versions[0] : null
     let placed = 0
-    try { placed = formBindings.formsFor(this.projectId).length } catch (e) {
+    try { placed = formBindings.formsFor(projectId).length } catch (e) {
       console.error('Read widget bindings failed: ' + (e as Error).message)
     }
     this.widget = widgetStatus(latest !== null ? latest.source : '', latest !== null ? latest.vbc2 : '', placed)
     let shows = this.widget.kind === WIDGET_READY || this.widget.kind === WIDGET_PLACED
-    this.widgetVbc2 = shows && latest !== null ? latest.vbc2 : ''
-    this.widgetSeed = shows && latest !== null ? store.loadState(this.projectId, latest.id, veraStateStamp(latest.vbc2)) : ''
+    this.widgetVbc2 = ''
+    this.widgetSeed = ''
+    if (!shows || latest === null || !this.pageVisible) { return }
+    try {
+      const saved = await store.loadState(projectId, latest.id, veraStateStamp(latest.vbc2))
+      const current = store.getLatestVersion(projectId)
+      if (!this.pageVisible || generation !== this.widgetRefreshGeneration || projectId !== this.projectId ||
+          current === null || current.id !== latest.id || current.vbc2 !== latest.vbc2) { return }
+      this.widgetSeed = saved
+      this.widgetVbc2 = latest.vbc2
+    } catch (e) {
+      if (generation === this.widgetRefreshGeneration && this.pageVisible && projectId === this.projectId) {
+        console.error('Read widget state failed: ' + (e as Error).message)
+      }
+    }
   }
 
   private returnToIndex(): void {
@@ -529,23 +547,34 @@ export struct ProjectPage {
   }
 
   /** The latest version, the one the card draws, saved again without its widget, with the app's state carried over. */
-  private doRemoveWidget(): void {
-    if (this.projectOperationPending) { return }
-    let latest = store.getLatestVersion(this.projectId)
-    if (latest === null || latest.vbc2.length === 0) { this.reload(); return }
-    let removal = removeWidget(latest.source, latest.prompt)
-    if (removal.error.length > 0) { this.showProjectMessage(removal.error); return }
-    let saved = store.loadState(this.projectId, latest.id, veraStateStamp(latest.vbc2))
+  private async doRemoveWidget(): Promise<void> {
+    if (this.projectOperationPending || !this.pageVisible) { return }
+    this.projectOperationPending = true
+    const projectId = this.projectId
     try {
-      store.createVersion(this.projectId, removal.source, removal.vbc2, WIDGET_REMOVED_NOTE, removal.prompt, latest.origin,
+      let latest = store.getLatestVersion(projectId)
+      if (latest === null || latest.vbc2.length === 0) { return }
+      let removal = removeWidget(latest.source, latest.prompt)
+      if (removal.error.length > 0) { this.showProjectMessage(removal.error); return }
+      let saved = await store.loadState(projectId, latest.id, veraStateStamp(latest.vbc2))
+      let current = store.getLatestVersion(projectId)
+      if (!this.pageVisible || projectId !== this.projectId) { return }
+      if (current === null || current.id !== latest.id || current.vbc2 !== latest.vbc2) {
+        this.showProjectMessage('The app changed. Remove the widget again.')
+        return
+      }
+      await store.createVersion(projectId, removal.source, removal.vbc2, WIDGET_REMOVED_NOTE, removal.prompt, latest.origin,
         latest.composition, '', latest.id, null, saved, veraStateStamp(removal.vbc2))
+      refreshForms()
+      if (this.pageVisible && projectId === this.projectId) { this.showProjectMessage('Widget removed') }
     } catch (e) {
-      this.showProjectMessage('Cannot remove the widget: ' + (e as Error).message)
-      return
+      if (this.pageVisible && projectId === this.projectId) {
+        this.showProjectMessage('Cannot remove the widget: ' + (e as Error).message)
+      }
+    } finally {
+      this.projectOperationPending = false
+      if (this.pageVisible && projectId === this.projectId) { this.reload() }
     }
-    this.reload()
-    refreshForms()
-    this.showProjectMessage('Widget removed')
   }
 
   /** Make, change or remake the widget: always on the latest version, the one the card draws. Fresh writes a new one. */

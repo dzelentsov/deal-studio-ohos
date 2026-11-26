@@ -115,33 +115,37 @@ function legacyPaint(b: BodySpec): boolean {
 }
 
 async function writeTexture(path: string, dir: string, pattern: string, c1: number[], c2: number[], seed: number): Promise<string> {
-  try { fs.mkdirSync(dir, true) } catch (e) {
-    if (!fs.statSync(dir).isDirectory()) { throw e as Error }
-  }
-  if (fs.accessSync(path)) {
-    let stat = fs.statSync(path)
-    if (stat.isFile() && stat.size > 0) { return path }
-  }
-  let temporary = path + '.' + Date.now().toString() + '-' + (++textureSerial).toString() + '.tmp'
-  let pixelMap: image.PixelMap | null = null
-  let packer: image.ImagePacker | null = null
   try {
-    let pixels = texturePixels(pattern, c1, c2, seed, TEXTURE_SIZE)
-    pixelMap = await image.createPixelMap(pixels.buffer, {
-      size: { width: TEXTURE_SIZE, height: TEXTURE_SIZE }, pixelFormat: image.PixelMapFormat.RGBA_8888, srcPixelFormat: image.PixelMapFormat.RGBA_8888, editable: false
-    })
-    packer = image.createImagePacker()
-    let file = fs.openSync(temporary, fs.OpenMode.CREATE | fs.OpenMode.WRITE_ONLY | fs.OpenMode.TRUNC)
-    try { await packer.packToFile(pixelMap, file.fd, { format: 'image/png', quality: 100 }) }
-    finally { fs.closeSync(file) }
-    fs.renameSync(temporary, path)
-    return path
-  } finally {
-    try { if (fs.accessSync(temporary)) { fs.unlinkSync(temporary) } }
-    finally {
-      try { if (pixelMap !== null) { await pixelMap.release() } }
-      finally { if (packer !== null) { await packer.release() } }
+    try { fs.mkdirSync(dir, true) } catch (e) {
+      if (!fs.statSync(dir).isDirectory()) { throw e as Error }
     }
+    if (fs.accessSync(path)) {
+      let stat = fs.statSync(path)
+      if (stat.isFile() && stat.size > 0) { return path }
+    }
+    let temporary = path + '.' + Date.now().toString() + '-' + (++textureSerial).toString() + '.tmp'
+    let pixelMap: image.PixelMap | null = null
+    let packer: image.ImagePacker | null = null
+    try {
+      let pixels = texturePixels(pattern, c1, c2, seed, TEXTURE_SIZE)
+      pixelMap = await image.createPixelMap(pixels.buffer, {
+        size: { width: TEXTURE_SIZE, height: TEXTURE_SIZE }, pixelFormat: image.PixelMapFormat.RGBA_8888, srcPixelFormat: image.PixelMapFormat.RGBA_8888, editable: false
+      })
+      packer = image.createImagePacker()
+      let file = fs.openSync(temporary, fs.OpenMode.CREATE | fs.OpenMode.WRITE_ONLY | fs.OpenMode.TRUNC)
+      try { await packer.packToFile(pixelMap, file.fd, { format: 'image/png', quality: 100 }) }
+      finally { fs.closeSync(file) }
+      fs.renameSync(temporary, path)
+      return path
+    } finally {
+      try { if (fs.accessSync(temporary)) { fs.unlinkSync(temporary) } }
+      finally {
+        try { if (pixelMap !== null) { await pixelMap.release() } }
+        finally { if (packer !== null) { await packer.release() } }
+      }
+    }
+  } catch (e) {
+    throw e as Error
   }
 }
 

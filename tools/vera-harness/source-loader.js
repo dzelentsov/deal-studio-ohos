@@ -5,6 +5,17 @@ const path = require('node:path')
 const ts = process.env.VERA_TYPESCRIPT_PATH ? require(process.env.VERA_TYPESCRIPT_PATH) : require('typescript')
 const sourceRoot = path.resolve(process.env.VERA_SOURCE_ROOT || path.join(__dirname, '../../entry/src/main/ets'))
 const cache = new Map()
+const forbidden = name => new Proxy({}, {get(_target, key) {
+  throw Error('Platform access is not available in the host harness: ' + name + '.' + String(key))
+}})
+const util = {
+  TextEncoder: class { encodeInto(text) { return new TextEncoder().encode(text) } },
+  TextDecoder: {create(encoding, options) {
+    const decoder = new TextDecoder(encoding, options)
+    return {decodeToString: (value, decodeOptions) => decoder.decode(value, decodeOptions)}
+  }},
+  generateRandomUUID: () => require('node:crypto').randomUUID()
+}
 function loadSource(file) {
   file = path.resolve(file)
   if (cache.has(file)) return cache.get(file).exports
@@ -23,6 +34,17 @@ function loadSource(file) {
     // The real index once a harness stands in for what it imports (host-lookup.js), the stub otherwise.
     if (name.endsWith('/VeraSdkIndex') && !(globalThis.__veraModules && globalThis.__veraModules['@kit.LocalizationKit'])) return loadSource(path.join(__dirname, 'src/VeraSdkIndex.ts'))
     // Platform modules the template/selector files import for their network calls; the host checks never reach them.
+    if (name === '@kit.CoreFileKit') return {fileIo: forbidden(name)}
+    if (name === '@ohos.fileio') return {default: forbidden(name)}
+    if (name === '@kit.ArkTS') return {util, taskpool: forbidden(name + '.taskpool')}
+    if (name === '@kit.BasicServicesKit') return {systemDateTime: {
+      TimeType: {STARTUP: 0}, getUptime: () => require('node:perf_hooks').performance.now()
+    }}
+    if (name === '@kit.CryptoArchitectureKit') return {cryptoFramework: {createMd(algorithm) {
+      if (algorithm !== 'SHA256') throw Error('Unsupported host hash: ' + algorithm)
+      const hash = require('node:crypto').createHash('sha256')
+      return {updateSync({data}) { hash.update(data) }, digestSync() { return {data: hash.digest()} }}
+    }}}
     if (name === '@kit.PerformanceAnalysisKit') return {hilog: {info() {}, warn() {}, error() {}, debug() {}}}
     // connection.getAddressesByName on node's resolver, for VeraSource.publicHostError; a check may replace it with __veraResolve.
     if (name === '@kit.NetworkKit') return {connection: {getAddressesByName: async host => typeof globalThis.__veraResolve === 'function' ? globalThis.__veraResolve(host) :

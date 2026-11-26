@@ -61,8 +61,8 @@ const worldRetained = {
   inventory: {
     'components/VeraPreview.ets': [5, 34, '6a10718813efee20c3e7edca2a29010ef3620435e41af5e42b9ce86e9d8b8ad0'],
     'components/VeraWorld3D.ets': [38, 412, '7e03d4a8f8b76bf0cc2fd2804dc0d52a769eef72d501382ac100f3f060980c45'],
-    'runtime/AppActor.ets': [1, 4, '5e5190dd00eeeb21c09f5ebe4a3be7f6c68f1642c770d04d77f7af93c13e993e'],
-    'runtime/InProcessHost.ets': [2, 19, '047babf1892945cdfc3adc8cb943ea08596c5fd39c83684d861dd1c7f58bc9b2'],
+    'runtime/AppActor.ets': [1, 4, '900563d199e4bf24f5cbfdf188ac3273d88de1f90d2bb8b5cff29ad9a07605df'],
+    'runtime/InProcessHost.ets': [2, 20, '4089b039a50ef19fe9cba80708fe54431b55a80c99541847d78a97699ad8d679'],
     'vera/VeraLocomotion.ets': [8, 54, 'acf5f400277924ed50c2dd3571b530af50a04cb5be55acad6fe79e1cfc45dc0e'],
     'vera/VeraLook3D.ets': [16, 162, 'e125634e115f70fe2be82b0f22ec71d0d90366b7c4dfc9c13a310263ee4e35e7'],
     'vera/VeraPhysics.ets': [14, 217, '6215ec5a44dbf1305ac8b41d147a32832efb0d991210d7a45ebf9b9541163e75'],

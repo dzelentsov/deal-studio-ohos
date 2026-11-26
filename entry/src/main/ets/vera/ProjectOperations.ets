@@ -250,10 +250,12 @@ export class ProjectOperations {
   public async deleteProject(context: common.UIAbilityContext | (() => common.UIAbilityContext), id: string): Promise<ProjectOperationStatus> {
     return this.runOperation(id, 'Delete project', async (): Promise<ProjectOperationStatus> => {
       const project = this.projectStore.getProject(id)
-      if (project === null) { return this.notFound(id) }
-      const status = await this.unpinProjectInternal(context, id)
-      if (this.projectStore.getProject(id) === null) { return this.notFound(id) }
-      this.projectStore.deleteProject(id)
+      if (project === null && !this.projectStore.canRetryProjectRemoval(id)) { return this.notFound(id) }
+      const status = await this.unpinProjectInternal(context, id, project === null)
+      if (this.projectStore.getProject(id) === null && !this.projectStore.canRetryProjectRemoval(id)) {
+        return this.notFound(id)
+      }
+      await this.projectStore.deleteProject(id)
       return status === ProjectOperationStatus.Success ? ProjectOperationStatus.Success :
         ProjectOperationStatus.ProjectDeletedShortcutRemovalFailed
     })
@@ -262,26 +264,20 @@ export class ProjectOperations {
   public async deleteVersion(context: common.UIAbilityContext | (() => common.UIAbilityContext), id: string, versionId: string): Promise<ProjectOperationStatus> {
     return this.runOperation(id, 'Delete Version ' + versionId, async (): Promise<ProjectOperationStatus> => {
       const project = this.projectStore.getProject(id)
-      if (project === null) { return this.notFound(id, versionId) }
-      let versions = this.projectStore.listVersions(id)
-      if (!versions.some((version: Version) => version.id === versionId)) {
+      if (project === null && !this.projectStore.canRetryVersionRemoval(id, versionId)) {
         return this.notFound(id, versionId)
       }
-      let shortcutRemovalFailed = false
-      if (versions.length === 1) {
-        const status = await this.unpinProjectInternal(context, id)
-        shortcutRemovalFailed = status !== ProjectOperationStatus.Success
-      }
-      if (this.projectStore.getProject(id) === null) {
+      const versions = this.projectStore.listVersions(id)
+      if (!versions.some((version: Version) => version.id === versionId) &&
+          !this.projectStore.canRetryVersionRemoval(id, versionId)) {
         return this.notFound(id, versionId)
       }
-      versions = this.projectStore.listVersions(id)
-      if (!versions.some((version: Version) => version.id === versionId)) {
-        return this.notFound(id, versionId)
-      }
-      const deletedProject = this.projectStore.deleteVersion(id, versionId)
-      if (deletedProject && shortcutRemovalFailed) {
-        return ProjectOperationStatus.ProjectDeletedShortcutRemovalFailed
+      const deletedProject = await this.projectStore.deleteVersion(id, versionId)
+      if (deletedProject) {
+        const status = await this.unpinProjectInternal(context, id, true)
+        if (status !== ProjectOperationStatus.Success) {
+          return ProjectOperationStatus.ProjectDeletedShortcutRemovalFailed
+        }
       }
       return deletedProject ? ProjectOperationStatus.ProjectDeleted : ProjectOperationStatus.Success
     })
@@ -349,20 +345,21 @@ export class ProjectOperations {
     return info
   }
 
-  private async unpinProjectInternal(context: common.UIAbilityContext | (() => common.UIAbilityContext), id: string): Promise<ProjectOperationStatus> {
+  private async unpinProjectInternal(context: common.UIAbilityContext | (() => common.UIAbilityContext), id: string,
+      deleted: boolean = false): Promise<ProjectOperationStatus> {
     try {
-      if (this.projectStore.getProject(id) === null) { return this.notFound(id) }
+      if (!deleted && this.projectStore.getProject(id) === null) { return this.notFound(id) }
       const bundleName = this.selfBundleName()
       const present = await desktopContains(this.shortcutId(id), bundleName)
-      if (this.projectStore.getProject(id) === null) { return this.notFound(id) }
+      if (!deleted && this.projectStore.getProject(id) === null) { return this.notFound(id) }
       if (!present) { return ProjectOperationStatus.Success }
 
       await callLauncher(this.resolveContext(context), 'deleteDesktopShortcut', this.deletion(id))
-      if (this.projectStore.getProject(id) === null) { return this.notFound(id) }
+      if (!deleted && this.projectStore.getProject(id) === null) { return this.notFound(id) }
       if (!await desktopHas(this.shortcutId(id), bundleName, false)) {
         throw new Error('the launcher did not remove the icon')
       }
-      if (this.projectStore.getProject(id) === null) { return this.notFound(id) }
+      if (!deleted && this.projectStore.getProject(id) === null) { return this.notFound(id) }
       console.info(`Shortcut "${this.shortcutId(id)}" was deleted successfully`);
 
       return ProjectOperationStatus.Success
