@@ -522,6 +522,14 @@ export class UiHostEnvironment extends HostEnvironment {
   private safetyPure: boolean = false
   private safetyInvalid: boolean = false
   private invoking: boolean = false
+  private diagnosticObserving: boolean = false
+
+  observeDiagnostics(observer: () => void): void {
+    let previous = this.diagnosticObserving
+    this.diagnosticObserving = true
+    try { observer() } catch (_error) {}
+    finally { this.diagnosticObserving = previous }
+  }
 
   beginSafetyTurn(reserve: () => void): VmHostSafetyScope {
     this.checkSafetyIdle()
@@ -540,6 +548,7 @@ export class UiHostEnvironment extends HostEnvironment {
   }
 
   private checkSafetyIdle(): void {
+    if (this.diagnosticObserving) { throw new RuntimeTrap('R-TURN', 'host operation during diagnostics') }
     if (this.invoking) {
       if (this.safetyRecord !== null) { this.safetyRecord.failed = true }
       throw new RuntimeTrap('R-TURN', 'host invoke is active')

@@ -496,8 +496,8 @@ console.log('PASS widget refinement: additive preservation, signature, catalogue
   const pageSource = readText(path.join(sourceRoot, 'pages/GeneratePage.ets'), 'utf8')
   const {OperationController, throwIfCancelled} = loadVera('OperationCancellation')
   const {GenerateRequest, GenerateResult} = loadVera('LlamaEngine')
-  const names = ['aboutToAppear', 'makeWidgetAlone', 'doServerGenerate', 'commitSave', 'widgetSaveState', 'checkWidgetSave', 'hasResult', 'versionCount',
-    'modelRequestHistory', 'prepareRequest', 'confirmScreenRemovals', 'acceptRequest', 'doRefine', 'refineWithModel', 'startAttemptOne', 'runAttempt', 'markMetricsPartial', 'callModel']
+  const names = ['aboutToAppear', 'loadWidgetState', 'isSaved', 'makeWidgetAlone', 'doServerGenerate', 'commitSave', 'widgetSaveState', 'checkWidgetSave', 'hasResult', 'versionCount',
+    'modelRequestHistory', 'prepareRequest', 'confirmScreenRemovals', 'markMetricsPartial', 'countModelCall', 'acceptRequest', 'doRefine', 'refineWithModel', 'startAttemptOne', 'runAttempt', 'markMetricsPartial', 'callModel']
   const methods = names.map(name => {
     const match = pageSource.match(new RegExp('^  (?:private )?(?:async )?' + name + '\\([^\\{]*\\{[\\s\\S]*?^  \\}', 'm'))
     assert(match, 'GeneratePage.' + name + ' must exist')
@@ -513,7 +513,7 @@ console.log('PASS widget refinement: additive preservation, signature, catalogue
     compilerOptions: {target: ts.ScriptTarget.ES2020}, reportDiagnostics: true
   })
   assert.deepEqual((transpiled.diagnostics || []).filter(d => d.category === ts.DiagnosticCategory.Error), [])
-  function fixture(original, fresh = true) {
+  async function fixture(original, fresh = true) {
     const initial = {id: 'v1', source: original, vbc2: compileVeraSource(original).vbc2,
       prompt: 'A counter\n\nRefinement:\n' + WIDGET_ASK + 'Old widget', composition: '', origin: '', lastPrompt: '', note: ''}
     const versions = [initial], writes = [], saves = [], stateReads = [], serverRequests = [], localRequests = []
@@ -521,8 +521,8 @@ console.log('PASS widget refinement: additive preservation, signature, catalogue
     const store = {
       init() {}, listVersions: () => versions, getVersion: (project, id) => versions.find(v => v.id === id) || null,
       getLatestVersion: () => latest, getProject: () => ({name: 'Counter'}),
-      loadState(project, id, stamp) { stateReads.push({id, stamp}); return savedState },
-      createVersion(...args) {
+      async loadState(project, id, stamp) { stateReads.push({id, stamp}); return savedState },
+      async createVersion(...args) {
         if (failSave) { throw Error('disk full') }
         saves.push(args)
         latest = {id: 'v' + (versions.length + 1), source: args[1], vbc2: args[2]}
@@ -559,7 +559,7 @@ console.log('PASS widget refinement: additive preservation, signature, catalogue
         if (failWrite) { return {source: '', failed: 'try again', attempts: 3, ms: 0, written: ''} }
         const written = 'import * as math from "std/math"\n' +
           'function newFigure(state: AppState): number { return state.count + 1; }\n' +
-          'function widget(state: AppState): ui.View { return ui.NumberText("metric", newFigure(state), "", "", 1); }'
+          'function widget(state: AppState): ui.View { return ui.NumberText("metric", newFigure(state) + ' + writes.length + ', "", "", 1); }'
         const source = spliceWidget(program, written), vbc2 = compileVeraSource(source).vbc2
         assert.equal(validateWidgetRefinement(program, source, vbc2, state), '')
         return {source, vbc2, failed: '', attempts: 1, ms: 0, written}
@@ -585,6 +585,13 @@ console.log('PASS widget refinement: additive preservation, signature, catalogue
       metricWork: (run, work) => work(), finishMetrics() {}, startRun() {}
     })
     page.aboutToAppear()
+    assert.equal(page.widgetStateLoading, true)
+    assert.equal(await page.checkWidgetSave(), false)
+    assert.equal(await page.commitSave(), false)
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(page.widgetStateLoading, false)
+    assert.equal(page.carriedState, savedState)
+    assert.equal(page.widgetSeed, savedState)
     return {page, initial, writes, saves, stateReads, serverRequests, localRequests,
       setServerResponse(value) { serverResponse = value }, setLocalResponse(value) { localResponse = value },
       failSave(value) { failSave = value }, failWrite(value) { failWrite = value },
@@ -621,11 +628,11 @@ console.log('PASS widget refinement: additive preservation, signature, catalogue
       '\nfunction widget(state: AppState): ui.View { return ui.NumberText("metric", time.nowSeconds(), "", "", 1); }'
   ]
   for (const [index, original] of oldPrograms.entries()) {
-    const f = fixture(original), p = f.page, baseline = withoutWidget(original)
+    const f = await fixture(original), p = f.page, baseline = withoutWidget(original)
     assert.equal(p.widgetFresh, true)
     assert.equal(p.widgetBase, baseline, 'Redo initialization must strip widget-only declarations and imports')
     assert.doesNotMatch(baseline, index === 0 ? /oldFigure/ : /std\/time/)
-    assert.equal(fixture(original, false).page.widgetBase, original, 'ordinary refinement keeps its saved baseline')
+    assert.equal((await fixture(original, false)).page.widgetBase, original, 'ordinary refinement keeps its saved baseline')
     f.failWrite(true)
     await p.makeWidgetAlone(WIDGET_ASK + 'New widget')
     assert.equal(p.widgetBase, baseline)
@@ -665,7 +672,7 @@ console.log('PASS widget refinement: additive preservation, signature, catalogue
     const state = new WidgetSession(p.compiledVbc2, 'saved', '').encodedState()
     f.setState(state)
     // The state changed since the checks ran: commitSave alone refuses rather than run them on the UI thread.
-    assert.equal(p.commitSave(), false, 'commitSave never runs the card checks itself')
+    assert.equal(await p.commitSave(), false, 'commitSave never runs the card checks itself')
     assert.match(p.status, /Save again/)
     assert.equal(f.saves.length, 0)
     assert.equal((await saveWidget(p)), true, 'Redo must save after intentional widget helper/import removal')
@@ -684,6 +691,7 @@ console.log('PASS widget refinement: additive preservation, signature, catalogue
     assert.match(p.compileErrors, /preserve existing declaration newFigure/)
     p.compiledSource = next.replace('import * as math from "std/math"', '')
     p.compiledVbc2 = compileVeraSource(p.compiledSource).vbc2
+    assert.notEqual(p.compiledVbc2, p.savedVbc2, 'the import-removal candidate must not be an already-saved no-op')
     assert.equal((await saveWidget(p)), false, 'the next refinement must preserve imports from the newly saved version')
     assert.match(p.compileErrors, /preserve existing imports/)
     assert.equal(p.widgetBase, good)
@@ -711,7 +719,7 @@ console.log('PASS widget refinement: additive preservation, signature, catalogue
   const serverBody = (program, bytecode = 'server bytecode') => ';vera-source-begin\n' +
     program.split('\n').map(line => ';|' + line).join('\n') + '\n;vera-source-end\n' + bytecode
   for (const original of oldPrograms) {
-    const f = fixture(original), p = f.page, baseline = withoutWidget(original)
+    const f = await fixture(original), p = f.page, baseline = withoutWidget(original)
     const ask = WIDGET_ASK + 'New server widget'
     assert.equal(p.widgetFresh, true)
     for (const response of [
@@ -759,7 +767,7 @@ console.log('PASS widget refinement: additive preservation, signature, catalogue
     assert.equal(p.baseVersionId, 'v2')
   }
   for (const original of oldPrograms) {
-    const f = fixture(original), p = f.page, baseline = withoutWidget(original)
+    const f = await fixture(original), p = f.page, baseline = withoutWidget(original)
     const ask = WIDGET_ASK + 'New local widget'
     await submit(p, 'New local widget', 'Local')
     assertFreshRequest(f.localRequests[0].previousSource, f.localRequests[0].userPrompt, baseline, ask)
@@ -780,7 +788,7 @@ console.log('PASS widget refinement: additive preservation, signature, catalogue
     await submit(p, 'Refine local widget', 'Local')
     assert.equal(f.localRequests[2].previousSource, good, 'later refinements must see the replacement widget')
     assert(f.localRequests[2].userPrompt.includes(ask), 'later refinements keep the replacement widget history')
-    const refine = fixture(original, false)
+    const refine = await fixture(original, false)
     await submit(refine.page, 'Change old widget', 'Local')
     assert.equal(refine.localRequests[0].previousSource, original, 'ordinary refinement keeps its widget')
     assert.match(refine.localRequests[0].userPrompt, /Old widget/)

@@ -1210,20 +1210,20 @@ function indirect(state: AppState): AppState { return mutate(state); }
     EmptyVmHostSafetyScope: '3d936bb8bb50eb7bc73718f6c88bca153bdcebe6fcda78a78e0390b1c93ab035',
     VmSafetyTurnScopeRecord: 'da8a53beb9a22b6fd9851b4dbbfb8798d7397b20a55014b8c0d9b1aafef0f98e',
     VmUndoRecord: '980a917f7ae6a2f2e77419edcba233e927b4b2dba6cf612e1b1a66bed3cb1c1b',
-    HostEnvironment: 'f15c0abe952ffc5abafd268ed277e0605fc3d5d071d1c91d088a0fe87700ca94',
+    HostEnvironment: '939a0afc6873bf0e28ce4138535aeb466b32b8488dee19d5d280dba1ce0464fc',
     'EmptyHostEnvironment.beginSafetyTurn': 'dfb3ab7652e884cb26e00b6ed151d896c860a350caeee2344e4b2b5ae58a325e',
     'EmptyHostEnvironment.setSafetyPure': '67cc84fd2e9323962aba8c231f016c63af6c89d26ef61dd7cc80d10abf977892',
     'VirtualMachine.constructor': '978b799795116ea71babc499cbc6a9bb323c824169c16d8295a9c3fd8877546f',
     'VirtualMachine.failSafety': 'f3d4b9d581bc4abff518b7ea21f8b378ca5c5b8c7e1a29eed74c472a14f7023e',
     'VirtualMachine.checkSafety': '0ea2b0195de9bed0e2445b9d0c26fb7edb03044c8f6a41ad23edf22e6c2bdff5',
-    'VirtualMachine.beginTurn': '1554f687753fd5916aa8961bc741f0bace2debcdeda3594fb5ff3bbcf299fd08',
-    'VirtualMachine.settleTurn': 'ff0d5a69f1eb8f70e9e7ac7eca1d861f1116bc88163a8ed2513ea687e139d1d1',
-    'VirtualMachine.reserveHost': 'ea3a54df434c10601045ce4281a58b70cb0881462b055e99c6abb18b2501f789',
-    'VirtualMachine.reserveJournal': 'cf0b1f82ba08e7710870b2aa2d287a46b69d38305f7328a21a037adcbe92835a',
-    'VirtualMachine.reserveWrite': 'ab89fb6e68ab4285b0e913924f16de3ad49fdc35602b8fa56e492216f7d669e8',
-    'VirtualMachine.storeCell': '60c660f5592fa938e35ed639a8e7c9b57a8625ba9e588ee9e0ff67c9819601eb',
-    'VirtualMachine.executePure': 'f1d7a87857d4c99f1080119bfe484f07953db1a947067e536bf332619dc873dc',
-    'VirtualMachine.executeSafety': '462f567bc759e94a2612757053a257e77a82989ea274fc93fe3fd7071905e9a9'
+    'VirtualMachine.beginTurn': '7854fce273ed5e2a1edb79713d02753b63c8f9994f2d2376312765cd98d9edd4',
+    'VirtualMachine.settleTurn': '4bbaf1e3602b02e2d31dcd312c3e490f3ca8a32030cb04af4aa96dd9f2ff6003',
+    'VirtualMachine.reserveHost': '5e7b6424f1ca60118c53312212a766c04566ad2741e02ea15bdea9f8412b3614',
+    'VirtualMachine.reserveJournal': 'a17660a45a2a8f3c20b941aba64bea2eb5691d8de0f4be2666586cdd7cf97610',
+    'VirtualMachine.reserveWrite': 'f3e15ca7614793325ee138e26742f184eb9deaca7819de29f7724e2993353077',
+    'VirtualMachine.storeCell': '46ecf0b820b8d84ea60207f62ed13fbd80464b7cc7833143828e3738c04da64f',
+    'VirtualMachine.executePure': '0bc0db1dfd785177ae388b7e47592abc383f1d0ed64b50f717ccbb0fde27ec59',
+    'VirtualMachine.executeSafety': '1e2fa9daee68f1b747381a386e81fc3e004603dc1c9189585a8bd219ba584f59'
   }
   const bodyHash = text => require('node:crypto').createHash('sha256').update(text).digest('hex')
   const inventory = text => {
@@ -1486,7 +1486,11 @@ class Frame {
     'a instanceof VeraStringValue && b instanceof VeraStringValue')
   allow('VirtualMachine.equal', 'ReturnStatement', 'a === b', 'a === b',
     'a instanceof VeraNullValue && b instanceof VeraNullValue', 'a.value === b.value', 'a.value === b.value', 'a.value === b.value')
-  allow('VirtualMachine.execute', 'ReturnStatement', 'this.executeSafety(entry, args, false)',
+  allow('VirtualMachine.execute', 'ReturnStatement', 'this.observedExecute(entry, args, false)')
+  allow('VirtualMachine.observedExecute', 'ReturnStatement',
+    'pure ? this.executeSafety(entry, args, true) : this.executeUnobserved(entry, args)',
+    'pure ? this.executeSafety(entry, args, true) : this.executeUnobserved(entry, args)')
+  allow('VirtualMachine.executeUnobserved', 'ReturnStatement', 'this.executeSafety(entry, args, false)',
     'this.executeBudgeted(entry, args)', 'this.run(new Frame(fn, [], args))')
   allow('VirtualMachine.executeBudgeted', 'ExpressionStatement', 'this.budgetFrame = new Frame(fn, [], args)', 'this.budgetFrame = null')
   allow('VirtualMachine.executeBudgeted', 'ReturnStatement', 'result')
@@ -1518,7 +1522,7 @@ class Frame {
       if (arr.elements.length >= 4096) {
         throw new RuntimeTrap('R0022', 'array length limit reached (4096)')
       }
-      if (this.reserveWrite(arrayBirths.get(arr.elements) || 0)) {
+      if (this.reserveWrite(arrayBirths.get(arr.elements) || 0, 'ARRAY')) {
         let record = new VmUndoRecord('push')
         record.array = arr.elements
         record.length = arr.elements.length
@@ -1533,7 +1537,7 @@ class Frame {
       if (arr.elements.length === 0) {
         throw new RuntimeTrap('R0023', 'pop from an empty array')
       }
-      if (this.reserveWrite(arrayBirths.get(arr.elements) || 0)) {
+      if (this.reserveWrite(arrayBirths.get(arr.elements) || 0, 'ARRAY')) {
         let record = new VmUndoRecord('pop')
         record.array = arr.elements
         record.index = arr.elements.length - 1
@@ -1548,7 +1552,7 @@ class Frame {
       let idx = this.index(this.pop(frame))
       let arr = this.asArray(this.pop(frame))
       this.indexValue(arr, idx)
-      if (this.reserveWrite(arrayBirths.get(arr.elements) || 0)) {
+      if (this.reserveWrite(arrayBirths.get(arr.elements) || 0, 'ARRAY')) {
         let record = new VmUndoRecord('index')
         record.array = arr.elements
         record.index = idx
@@ -1562,7 +1566,7 @@ class Frame {
       let v = this.pop(frame)
       let obj = this.asObject(this.pop(frame))
       if (!obj.fields.has(inst.name)) { throw new RuntimeTrap('R0010', \`missing field \${inst.name}\`) }
-      if (this.reserveWrite(objectBirths.get(obj.fields) || 0)) {
+      if (this.reserveWrite(objectBirths.get(obj.fields) || 0, 'OBJECT')) {
         let record = new VmUndoRecord('field')
         record.fields = obj.fields
         record.key = inst.name
@@ -1666,19 +1670,21 @@ class Frame {
     runAllow(opcode, 'ExpressionStatement', 'this.journal.push(record)')
   }
   for (const opcode of ['array-push', 'array-pop', 'store-index']) {
-    runAllow(opcode, 'IfStatement', 'this.reserveWrite(arrayBirths.get(arr.elements) || 0)')
+    runAllow(opcode, 'IfStatement', "this.reserveWrite(arrayBirths.get(arr.elements) || 0, 'ARRAY')")
     runAllow(opcode, 'ExpressionStatement', 'record.array = arr.elements')
   }
   runAllow('array-push', 'ExpressionStatement', 'record.length = arr.elements.length')
   runAllow('array-pop', 'ExpressionStatement', 'record.index = arr.elements.length - 1', 'record.value = arr.elements[record.index]')
   runAllow('store-index', 'ExpressionStatement', 'record.value = arr.elements[idx]', 'record.index = idx')
-  runAllow('store-field', 'IfStatement', 'this.reserveWrite(objectBirths.get(obj.fields) || 0)')
+  runAllow('store-field', 'IfStatement', "this.reserveWrite(objectBirths.get(obj.fields) || 0, 'OBJECT')")
   runAllow('store-field', 'ExpressionStatement', 'record.fields = obj.fields',
     'record.value = obj.fields.get(inst.name) as RuntimeValue', 'record.key = inst.name')
   const sorted = entries => entries.map(entry => JSON.stringify(entry)).sort()
   for (const [owner, signature] of [
     ['EmptyHostEnvironment.invoke', 'invoke(module: string, name: string, _args: RuntimeValue[], _awaited: boolean): RuntimeValue'],
     ['VirtualMachine.execute', 'execute(entry: string, args: RuntimeValue[] = []): RuntimeValue'],
+    ['VirtualMachine.observedExecute', 'private observedExecute(entry: string, args: RuntimeValue[], pure: boolean): RuntimeValue'],
+    ['VirtualMachine.executeUnobserved', 'private executeUnobserved(entry: string, args: RuntimeValue[]): RuntimeValue'],
     ['VirtualMachine.executeBudgeted', 'private executeBudgeted(entry: string, args: RuntimeValue[]): RuntimeValue'],
     ['VirtualMachine.run', 'private run(frame: Frame): RuntimeValue'],
     ['VirtualMachine.runFrame', 'private runFrame(frame: Frame): RuntimeValue'],
@@ -1706,7 +1712,7 @@ class Frame {
     const node = ts.isClassDeclaration(declaration.statements[0]) ? declaration.statements[0].members[0] : declaration.statements[0]
     allow('signature', owner, signatureText(node, part => printer.printNode(ts.EmitHint.Unspecified, part, declaration)))
   }
-  expected.push(['safety-pin', 'VirtualMachine.callInst', tokens('f15207a99dfc492f8d83cf457926bf1ef88db16768305af9a260abcb31f61fc0')])
+  expected.push(['safety-pin', 'VirtualMachine.callInst', tokens('6977b42615a115d17134085eb3d0a3171cff0ea0ad202abe00d42589fbc92bba')])
   for (const [owner, hash] of Object.entries(safetyPins)) expected.push(['safety-pin', owner, tokens(hash)])
   const vmFields = ts.createSourceFile('vm-fields.ts', `class Fields {
     private functions: Map<string, BytecodeFunction> = new Map<string, BytecodeFunction>()
@@ -1737,6 +1743,12 @@ class Frame {
     private safetyFailure: RuntimeTrap | null = null
     private turnToken: VmTurnToken | null = null
     private usedTransactions: WeakSet<Object> = new WeakSet<Object>()
+    private diagnostic: ((event: string, attributes: VmDiagnostic) => void) | null = null
+    private diagnosticEntry: string = 'HANDLER'
+    private diagnosticCall: number = 0
+    private diagnosticEmitting: boolean = false
+    private diagnosticEnabled: (() => boolean) | null = null
+    private diagnosticDurationMs: number = 0
   }`, ts.ScriptTarget.ES2020, true)
   for (const field of vmFields.statements[0].members) {
     expected.push(['vm-field', field.name.text, tokens(bodyHash(printer.printNode(ts.EmitHint.Unspecified, field, vmFields)))])

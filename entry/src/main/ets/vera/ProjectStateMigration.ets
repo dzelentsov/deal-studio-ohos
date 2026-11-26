@@ -1,5 +1,6 @@
-import { LoadResult, StateHeader, CommitResult } from '../runtime/StateIo'
-import { Version, VersionMetrics } from './ProjectStore'
+import type { LoadResult, StateHeader, CommitResult, StateIoError } from '../runtime/StateIo'
+import { statePayloadBytes } from '../runtime/StateFileFormat'
+import type { Version, VersionMetrics } from './ProjectStore'
 
 export interface ProjectVersionInput {
   projectId: string
@@ -50,6 +51,67 @@ export interface ProjectStateLifecyclePort {
   fenceAllAdmissions(scope: ProjectStateScope): ProjectStateRemovalBarrier
 }
 
+class ProjectStateAggregateBarrier implements ProjectStateRemovalBarrier {
+  private barriers: ProjectStateRemovalBarrier[]
+  private failure: Error
+  private failed: boolean
+
+  constructor(barriers: ProjectStateRemovalBarrier[], failure: Error, failed: boolean) {
+    this.barriers = barriers
+    this.failure = failure
+    this.failed = failed
+  }
+
+  private async drain(operation: (barrier: ProjectStateRemovalBarrier) => Promise<void>): Promise<void> {
+    let issue: Error = new Error('Project state lifecycle drain failed')
+    let drainFailed = false
+    await Promise.all(this.barriers.map(async (barrier: ProjectStateRemovalBarrier): Promise<void> => {
+      try { await operation(barrier) } catch (error) { if (!drainFailed) { issue = error as Error; drainFailed = true } }
+    }))
+    if (this.failed) { throw this.failure }
+    if (drainFailed) { throw issue }
+  }
+
+  quiesceActorsAndFinalSave(): Promise<void> {
+    return this.drain((barrier: ProjectStateRemovalBarrier): Promise<void> => barrier.quiesceActorsAndFinalSave())
+  }
+
+  drainAllCallersAndStorage(): Promise<void> {
+    return this.drain((barrier: ProjectStateRemovalBarrier): Promise<void> => barrier.drainAllCallersAndStorage())
+  }
+
+  release(outcome: ProjectRemovalOutcome): void {
+    let issue: Error = new Error('Project state lifecycle release failed')
+    let failed = false
+    for (let barrier of this.barriers) {
+      try { barrier.release(outcome) } catch (error) { if (!failed) { issue = error as Error; failed = true } }
+    }
+    if (failed) { throw issue }
+  }
+}
+
+export class ProjectStateLifecycles implements ProjectStateLifecyclePort {
+  private ports: Set<ProjectStateLifecyclePort> = new Set<ProjectStateLifecyclePort>()
+
+  register(port: ProjectStateLifecyclePort): () => void {
+    if (this.ports.has(port)) { throw new Error('Project state lifecycle already registered') }
+    this.ports.add(port)
+    return (): void => { this.ports.delete(port) }
+  }
+
+  fenceAllAdmissions(scope: ProjectStateScope): ProjectStateRemovalBarrier {
+    let barriers: ProjectStateRemovalBarrier[] = []
+    let failure: Error = new Error('Project state lifecycle fence failed')
+    let failed = false
+    for (let port of Array.from(this.ports)) {
+      try {
+        barriers.push(port.fenceAllAdmissions({ projectId: scope.projectId, versionId: scope.versionId }))
+      } catch (error) { if (!failed) { failure = error as Error; failed = true } }
+    }
+    return new ProjectStateAggregateBarrier(barriers, failure, failed)
+  }
+}
+
 export interface ProjectStateTaskPoolCleanupPort {
   removeStateFilesKeepingStableLocks(scope: ProjectStateScope): Promise<void>
 }
@@ -86,6 +148,14 @@ export class FormProjectStateReader {
   }
 }
 
+interface ProjectMetadataRemoval {
+  scope: ProjectStateScope
+  requestedOutcome: ProjectRemovalOutcome
+  outcome: ProjectRemovalOutcome
+  deletedVersionId: string
+  publish: () => void
+}
+
 export class ProjectStateMigration {
   private metadata: ProjectMigrationMetadata
   private tasks: ProjectStateTaskPoolPort
@@ -95,7 +165,9 @@ export class ProjectStateMigration {
   private blockedProjects: Set<string> = new Set<string>()
   private blockedApps: Set<string> = new Set<string>()
   private clearingApps: Set<string> = new Set<string>()
-  private pending: Map<string, Set<Promise<Object | null>>> = new Map<string, Set<Promise<Object | null>>>()
+  private retryableRemovals: Set<string> = new Set<string>()
+  private metadataRemovals: Map<string, ProjectMetadataRemoval> = new Map<string, ProjectMetadataRemoval>()
+  private pending: Map<string, Set<Promise<void>>> = new Map<string, Set<Promise<void>>>()
 
   constructor(metadata: ProjectMigrationMetadata, tasks: ProjectStateTaskPoolPort,
       initialState: ProjectInitialStatePort, lifecycle: ProjectStateLifecyclePort,
@@ -109,25 +181,44 @@ export class ProjectStateMigration {
 
   private admit(projectId: string, versionId: string): string {
     let appId = identity(projectId, versionId)
-    if (this.blockedProjects.has(projectId) || this.blockedApps.has(appId)) {
-      throw new Error('Project state admission fenced: ' + appId)
-    }
+    this.assertStateAdmission(appId)
     return appId
   }
 
-  private track<T extends Object | null>(appId: string, operation: () => Promise<T>): Promise<T> {
+  assertStateAdmission(appId: string): void {
+    let parts = appId.split('/')
+    if (parts.length !== 2) { throw new Error('Invalid project state identity') }
+    identity(parts[0], parts[1])
+    if (this.blockedProjects.has(parts[0]) || this.blockedApps.has(appId)) {
+      throw new Error('Project state admission fenced: ' + appId)
+    }
+  }
+
+  trackStateOperation<T>(appId: string, operation: () => Promise<T>): Promise<T> {
+    try {
+      this.assertStateAdmission(appId)
+      return this.track(appId, operation)
+    } catch (error) { return Promise.reject(error) }
+  }
+
+  private track<T>(appId: string, operation: () => Promise<T>): Promise<T> {
     let pending = this.pending.get(appId)
     if (pending === undefined) {
-      pending = new Set<Promise<Object | null>>()
+      pending = new Set<Promise<void>>()
       this.pending.set(appId, pending)
     }
-    let result = Promise.resolve().then(operation)
-    pending.add(result)
+    let accepted = pending
+    let resolve: (value: T | PromiseLike<T>) => void = (_value: T | PromiseLike<T>): void => {}
+    let reject: (reason: Object) => void = (_reason: Object): void => {}
+    let result = new Promise<T>((done, fail): void => { resolve = done; reject = fail })
+    let tracked = result.then((): void => {}, (error: Error): void => { throw error })
+    accepted.add(tracked)
     let settle = (): void => {
-      pending!.delete(result)
-      if (pending!.size === 0) { this.pending.delete(appId) }
+      accepted.delete(tracked)
+      if (accepted.size === 0) { this.pending.delete(appId) }
     }
-    result.then(settle, settle)
+    tracked.then(settle, settle)
+    try { resolve(operation()) } catch (error) { reject(error as Object) }
     return result
   }
 
@@ -138,8 +229,10 @@ export class ProjectStateMigration {
     } catch (error) { return Promise.reject(error) }
   }
 
-  async loadState(projectId: string, versionId: string, stamp: string): Promise<string> {
-    return restorable(await this.loadStateResult(projectId, versionId, stamp), stamp)
+  async loadState(projectId: string, versionId: string, stamp: string, maxBytes: number = 0): Promise<string> {
+    let encoded = restorable(await this.loadStateResult(projectId, versionId, stamp), stamp)
+    if (maxBytes > 0 && statePayloadBytes(encoded).byteLength > maxBytes) { throw new Error('PROJECT_READ_LIMIT') }
+    return encoded
   }
 
   readHeader(projectId: string, versionId: string): Promise<StateHeader | null> {
@@ -151,6 +244,7 @@ export class ProjectStateMigration {
 
   createVersion(input: ProjectVersionInput): Promise<Version> {
     try {
+      this.admit(input.projectId, '@project')
       let version = this.metadata.prepareVersion(input)
       let appId = this.admit(version.projectId, version.id)
       let encoded = input.initialState || ''
@@ -181,12 +275,39 @@ export class ProjectStateMigration {
   }
 
   deleteProject(projectId: string): Promise<void> {
+    for (let removal of Array.from(this.metadataRemovals.values())) {
+      if (removal.scope.projectId === projectId && removal.outcome === 'PROJECT_DELETED') {
+        return this.remove(removal.scope, removal.requestedOutcome, removal.publish, removal.deletedVersionId)
+      }
+    }
     return this.remove({ projectId: projectId }, 'PROJECT_DELETED', () => this.metadata.removeProjectMetadata(projectId))
+  }
+
+  canRetryProjectRemoval(projectId: string): boolean {
+    identity(projectId, '@project')
+    return Array.from(this.metadataRemovals.values()).some((removal: ProjectMetadataRemoval): boolean =>
+      removal.scope.projectId === projectId && removal.outcome === 'PROJECT_DELETED')
+  }
+
+  canRetryVersionRemoval(projectId: string, versionId: string): boolean {
+    identity(projectId, versionId)
+    return this.metadataRemovals.has(this.removalKey({ projectId: projectId }, 'VERSION_DELETED', versionId))
+  }
+
+  private removalKey(scope: ProjectStateScope, outcome: ProjectRemovalOutcome, deletedVersionId: string): string {
+    return JSON.stringify([scope.projectId, scope.versionId || '', outcome, deletedVersionId])
   }
 
   deleteVersion(projectId: string, versionId: string): Promise<boolean> {
     try {
-      this.admit(projectId, versionId)
+      let key = this.removalKey({ projectId: projectId }, 'VERSION_DELETED', versionId)
+      let removal = this.metadataRemovals.get(key)
+      if (removal !== undefined) {
+        let pending = removal
+        return this.remove(pending.scope, pending.requestedOutcome, pending.publish, pending.deletedVersionId)
+          .then((): boolean => pending.outcome === 'PROJECT_DELETED')
+      }
+      if (!this.retryableRemovals.has(key)) { this.admit(projectId, versionId) }
       let versions = this.metadata.listVersions(projectId)
       if (!versions.some((version: Version): boolean => version.id === versionId)) { return Promise.resolve(false) }
       let last = false
@@ -204,7 +325,12 @@ export class ProjectStateMigration {
       deletedVersionId: string = '', resolveOutcome?: () => ProjectRemovalOutcome): Promise<void> {
     try {
       let scope: ProjectStateScope = { projectId: requestedScope.projectId, versionId: requestedScope.versionId }
-      let appId = this.admit(scope.projectId, scope.versionId || deletedVersionId || '@project')
+      let key = this.removalKey(scope, outcome, deletedVersionId)
+      let appId = identity(scope.projectId, scope.versionId || deletedVersionId || '@project')
+      let metadataRemoval = this.metadataRemovals.get(key)
+      if (metadataRemoval !== undefined) { this.metadataRemovals.delete(key) }
+      else if (this.retryableRemovals.has(key)) { this.retryableRemovals.delete(key) }
+      else { this.assertStateAdmission(appId) }
       if (scope.versionId === undefined) {
         if (Array.from(this.clearingApps).some((key: string): boolean => key.startsWith(scope.projectId + '/'))) {
           throw new Error('Project state removal fenced: ' + scope.projectId)
@@ -216,20 +342,24 @@ export class ProjectStateMigration {
       }
       let lifecycleScope: ProjectStateScope = { projectId: scope.projectId, versionId: scope.versionId }
       let barrier = this.lifecycle.fenceAllAdmissions(lifecycleScope)
-      let accepted: Promise<Object | null>[] = []
-      this.pending.forEach((operations: Set<Promise<Object | null>>, key: string): void => {
+      let accepted: Promise<void>[] = []
+      this.pending.forEach((operations: Set<Promise<void>>, key: string): void => {
         if (scope.versionId === undefined ? key.startsWith(scope.projectId + '/') : key === appId) {
-          operations.forEach((operation: Promise<Object | null>): void => { accepted.push(operation) })
+          operations.forEach((operation: Promise<void>): void => { accepted.push(operation) })
         }
       })
-      return this.finishRemoval(scope, outcome, publish, barrier, accepted, deletedVersionId, resolveOutcome)
+      return this.finishRemoval(scope, outcome, publish, barrier, accepted, deletedVersionId, resolveOutcome, metadataRemoval)
     } catch (error) { return Promise.reject(error) }
   }
 
   private async finishRemoval(scope: ProjectStateScope, outcome: ProjectRemovalOutcome,
       publish: () => void, barrier: ProjectStateRemovalBarrier,
-      accepted: Promise<Object | null>[], deletedVersionId: string,
-      resolveOutcome?: () => ProjectRemovalOutcome): Promise<void> {
+      accepted: Promise<void>[], deletedVersionId: string,
+      resolveOutcome?: () => ProjectRemovalOutcome, metadataRemoval?: ProjectMetadataRemoval): Promise<void> {
+    let key = this.removalKey(scope, outcome, deletedVersionId)
+    let requestedOutcome = outcome
+    let retryable = false
+    let metadataFailed = false
     let failure: Error = new Error('Project state removal failed')
     let failed = false
     let settle = async (operation: () => Promise<Object | null | void>): Promise<void> => {
@@ -237,17 +367,28 @@ export class ProjectStateMigration {
         if (!failed) { failure = error as Error; failed = true }
       }
     }
-    let pending = accepted.map((operation: Promise<Object | null>): Promise<void> => settle(() => operation))
+    let pending = accepted.map((operation: Promise<void>): Promise<void> => settle(() => operation))
     try {
       await settle(() => barrier.quiesceActorsAndFinalSave())
       await Promise.all(pending)
       await settle(() => barrier.drainAllCallersAndStorage())
       if (failed) { throw failure }
-      if (resolveOutcome !== undefined) { outcome = resolveOutcome() }
-      let cleanupScope: ProjectStateScope = { projectId: scope.projectId, versionId: scope.versionId }
-      if (deletedVersionId.length > 0 && outcome === 'VERSION_DELETED') { cleanupScope.versionId = deletedVersionId }
-      await this.cleanup.removeStateFilesKeepingStableLocks(cleanupScope)
+      if (metadataRemoval !== undefined) { outcome = metadataRemoval.outcome }
+      else {
+        if (resolveOutcome !== undefined) { outcome = resolveOutcome() }
+        let cleanupScope: ProjectStateScope = { projectId: scope.projectId, versionId: scope.versionId }
+        if (deletedVersionId.length > 0 && outcome === 'VERSION_DELETED') { cleanupScope.versionId = deletedVersionId }
+        try { await this.cleanup.removeStateFilesKeepingStableLocks(cleanupScope) }
+        catch (error) {
+          retryable = error !== null && error !== undefined &&
+            ['STATE_VALIDATION_FAILED', 'STATE_WRITE_FAILED', 'STATE_SYNC_FAILED', 'STATE_UNAVAILABLE',
+              'STATE_LOCK_UNAVAILABLE', 'STATE_READ_FAILED', 'STATE_TASK_SUBMIT_FAILED'].indexOf((error as StateIoError).code) >= 0
+          throw error as Error
+        }
+      }
+      metadataFailed = true
       publish()
+      metadataFailed = false
       barrier.release(outcome)
       if (outcome === 'CLEARED') {
         let appId = identity(scope.projectId, scope.versionId!)
@@ -259,7 +400,16 @@ export class ProjectStateMigration {
         this.blockedProjects.delete(scope.projectId)
       }
     } catch (error) {
-      try { barrier.release('FAILED') } catch (_releaseError) {}
+      try {
+        barrier.release('FAILED')
+        if (metadataFailed) {
+          let removal: ProjectMetadataRemoval = {
+            scope: scope, requestedOutcome: requestedOutcome, outcome: outcome,
+            deletedVersionId: deletedVersionId, publish: publish
+          }
+          this.metadataRemovals.set(key, removal)
+        } else if (retryable) { this.retryableRemovals.add(key) }
+      } catch (_releaseError) {}
       throw error as Error
     }
   }

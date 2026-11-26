@@ -237,7 +237,9 @@ async function captureCameraPhoto(params: Map<string, string>): Promise<string> 
     console.warn('VERA-CAMERA copy failed ' + (e as Error).message)
     return result.resultUri
   } finally {
-    if (source !== null) { fs.closeSync(source) }
+    if (source !== null) {
+      try { fs.closeSync(source) } catch (e) { throw e as Error }
+    }
   }
   let uri = fileUri.getUriFromPath(path)
   console.info('VERA-CAMERA saved ' + uri)

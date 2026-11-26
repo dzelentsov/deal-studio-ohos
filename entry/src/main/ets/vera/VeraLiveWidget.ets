@@ -9,6 +9,7 @@ import { veraStateStamp, stateDigest } from './VeraStateStamp'
 import { SOURCE_TARGET } from './VeraSource'
 import { decodeGfx, encodeGfxOps, pointerValue, GfxOp } from './VeraGfx'
 import { driftSlices } from './GfxPaint'
+import type { ProjectRuntimeFlags } from './ProjectStore'
 import { CardNode, LiveFrame, compactFrame, CardSize, cardSize, CARD_DIMENSIONS, CARD_MAX_MOTIONS, CARD_MAX_PICTURES, CARD_MAX_SHAPES,
   CARD_MAX_TIMERS, TOUCH_ACTION, pictureCovers, splitCover, OPEN_STRIP, CARD_PADDING } from '../widget/CardModel'
 import { cardTextSize, cardTextFamily, cardLetterSpacing, cardGap, CARD_PANEL_PAD, cardPanelFill } from './CardStyle'
@@ -371,21 +372,48 @@ export class WidgetSession {
   /** What the settle under way has done so far (SETTLE_MAX_WORK). */
   private work: number = 0
 
-  constructor(vbc2: string, versionId: string, saved: string) {
+  private readOnly: boolean = false
+
+  constructor(vbc2: string, versionId: string, saved: string, readOnlyFlags: ProjectRuntimeFlags | null = null) {
     this.bytecode = vbc2
     this.versionId = versionId
+    this.readOnly = readOnlyFlags !== null
+    if (this.readOnly && saved.length === 0) { throw new Error('Open app to initialize state') }
+    if (readOnlyFlags !== null && !readOnlyFlags.vmJournal) {
+      throw new Error('Read-only widget rendering requires VM safety; open app')
+    }
     let module = deserializeVbc2(vbc2)
     this.hasWidget = module.functions.some((fn): boolean => fn.name === 'widget')
     this.hasRefresh = module.functions.some((fn): boolean => fn.name === 'widgetRefresh')
     this.hasSize = module.functions.some((fn): boolean => fn.name === 'widget' && fn.parameterCount === 2)
-    this.vm = new VirtualMachine(module, this.host, LIVE_MAX_STEPS)
+    this.vm = readOnlyFlags === null ? new VirtualMachine(module, this.host, LIVE_MAX_STEPS) :
+      new VirtualMachine(module, this.host, LIVE_MAX_STEPS, { now: (): number => Date.now(), deadlineMs: 1000 },
+        { journalMode: readOnlyFlags.journalMode })
     this.state = saved.length > 0 ? decodeRuntimeValue(JSON.parse(saved) as Object) : this.vm.execute('init')
+  }
+
+  private executeRead(entry: string, args: RuntimeValue[]): RuntimeValue {
+    if (!this.readOnly) { return this.vm.execute(entry, args) }
+    let scope = this.vm.beginTurn(new Object(), this.state)
+    try {
+      let result = this.vm.executePure(entry, args)
+      scope.accept()
+      return result
+    } catch (error) {
+      scope.rollback()
+      throw error as Error
+    }
+  }
+
+  private assertMutable(): void {
+    if (this.readOnly) { throw new Error('Open app to interact; widget actions unavailable') }
   }
 
   encodedState(): string { return JSON.stringify(encodeRuntimeValue(this.state)) }
 
   /** Puts the session where a tap from the same state got to before, settling included (VeraWidgetRefine's TapMemo), as if it had just run. */
   restoreTap(encoded: string, rested: boolean): void {
+    this.assertMutable()
     this.state = decodeRuntimeValue(JSON.parse(encoded) as Object)
     this.lastTapRested = rested
   }
@@ -499,7 +527,7 @@ export class WidgetSession {
     frame.dimension = size.dimension
     if (!this.hasWidget) { frame.status = 'Open app'; return frame }
     this.host.effectsAllowed = false
-    let roots = decodeVeraUi(this.vm.execute('widget', this.hasSize ? [this.state, new VeraNumberValue(size.dimension)] : [this.state]))
+    let roots = decodeVeraUi(this.executeRead('widget', this.hasSize ? [this.state, new VeraNumberValue(size.dimension)] : [this.state]))
     if (roots.length !== 1) { throw new Error('widget must return one root') }
     let root = roots[0]
     let theme = resolveTheme(root.kind === 'apptheme' ? root.style : 'clean',
@@ -697,7 +725,7 @@ export class WidgetSession {
     let drawingOf = (node: VeraUiNode): GfxOp[] => {
       let known = drawings.get(node)
       if (known !== undefined) { return known }
-      let ops = decodeGfx(this.vm.execute(node.label, [this.state]))
+      let ops = decodeGfx(this.executeRead(node.label, [this.state]))
       drawings.set(node, ops)
       return ops
     }
@@ -923,6 +951,7 @@ export class WidgetSession {
    * Any other phone effect is refused.
    */
   refresh(): SourceRequest[] {
+    this.assertMutable()
     let requests: SourceRequest[] = []
     if (!this.hasRefresh) { return requests }
     this.host.effectsAllowed = true
@@ -940,6 +969,7 @@ export class WidgetSession {
 
   /** A source's answer to its handler, as the app delivers one: handler(state, answer). No phone effects. */
   answer(handler: string, text: string): void {
+    this.assertMutable()
     this.host.effectsAllowed = true
     this.host.pendingEffects = []
     try {
@@ -954,6 +984,7 @@ export class WidgetSession {
 
   /** A button's handler; its live source call (Vera.Source.fetch), if it makes one, is returned for the card to make. */
   tap(frame: LiveFrame, token: string, action: string, value: number): SourceRequest[] {
+    this.assertMutable()
     if (!frame.live || token !== frame.token) { throw new Error('Widget changed; tap again') }
     // A touch on a ui.Motion that has nothing of its own to run: no handler, only a new frame, in which the movement plays.
     if (action === TOUCH_ACTION) { return [] }
@@ -979,6 +1010,7 @@ export class WidgetSession {
    * state change; the answer is the next frame.
    */
   tapSwitch(frame: LiveFrame, token: string, handler: string, on: boolean): SourceRequest[] {
+    this.assertMutable()
     if (!frame.live || token !== frame.token) { throw new Error('Widget changed; tap again') }
     let found = (nodes: CardNode[]): boolean => nodes.some((node: CardNode): boolean =>
       ((node.kind === 'toggle' || node.kind === 'checkbox') && node.enabled && node.action.length > 0 && node.action === handler) || found(node.children))
@@ -1002,6 +1034,7 @@ export class WidgetSession {
    * picture's own units), as the app's surface tells it. One state change, made together; a card has no moves.
    */
   tapSurface(frame: LiveFrame, token: string, handler: string, x: number, y: number): SourceRequest[] {
+    this.assertMutable()
     if (!frame.live || token !== frame.token) { throw new Error('Widget changed; tap again') }
     let found = (nodes: CardNode[]): boolean => nodes.some((node: CardNode): boolean =>
       (node.kind === 'surface' && node.pointer.length > 0 && node.pointer === handler) || found(node.children))

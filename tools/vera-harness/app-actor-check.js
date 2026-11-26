@@ -4,49 +4,53 @@ const fs = require('node:fs')
 const path = require('node:path')
 const ts = require(process.env.VERA_TYPESCRIPT_PATH || 'typescript')
 const crypto = require('node:crypto')
-const { TextEncoder } = require('node:util')
-const root = path.resolve(__dirname, '../../entry/src/main/ets')
+const { TextEncoder, TextDecoder } = require('node:util')
+const root = path.resolve(process.env.VERA_SOURCE_ROOT || path.join(__dirname, '../../entry/src/main/ets'))
 const cache = new Map()
-const disk = new Map()
 let records = []
 let failure = ''
 let cryptoFailure = null
 let cryptoFailureStage = 'create'
 let now = 100000
-const filesystem = {
-  OpenMode: { CREATE: 1, WRITE_ONLY: 2, TRUNC: 4 },
-  mkdirSync() {},
-  openSync(file) {
-    if (failure === 'open') throw Error('fixture open failed')
-    return { fd: file }
-  },
-  writeSync(file, value) {
-    if (failure === 'write') throw Error('fixture write failed')
-    disk.set(file, value)
-  },
-  closeSync() {
-    if (failure === 'close') throw Error('fixture close failed')
-  },
-  statSync(file) {
-    if (file.endsWith('.state.json')) records.push({ type: 'load-attempt', file })
-    if (!disk.has(file)) throw Error('absent')
-    return { size: disk.get(file).length }
-  },
-  readTextSync(file) {
-    if (!disk.has(file)) throw Error('absent')
-    if (file.endsWith('.state.json')) records.push({ type: 'load', file })
+const worker = require('./state-io-check').createWorkerFixture('/actor-fixture/vera', event => {
+  if (event.op === 'stat' && event.path.endsWith('.state.json')) records.push({ type: 'load-attempt', file: event.path })
+  if (event.op === 'read' && event.path.endsWith('.state.json')) records.push({ type: 'load', file: event.path })
+  if (event.op === 'rename' && event.to.endsWith('.state.json')) records.push({ type: 'save-attempt', file: event.to })
+}, () => failure)
+const disk = worker.disk
+const filesystem = new Proxy(worker.filesystem, { get(target, key) {
+  if (key === 'readTextSync') return file => {
+    assert(!worker.workerActive(), 'worker must use bounded byte reads')
+    if (!disk.has(file)) throw Object.assign(Error('absent'), { code: 13900002 })
     return disk.get(file)
-  },
-  renameSync(from, to) {
-    records.push({ type: 'save-attempt', file: to })
-    if (failure === 'rename') throw Error('fixture rename failed')
-    assert(disk.has(from))
-    disk.set(to, disk.get(from))
-    disk.delete(from)
-    records.push({ type: 'save', file: to, payload: JSON.parse(disk.get(to)) })
-  },
-  unlinkSync(file) { disk.delete(file) },
-  listFileSync(dir) { return [...disk.keys()].filter(file => path.dirname(file) === dir).map(file => path.basename(file)) }
+  }
+  if (key === 'mkdirSync') return file => {
+    if (worker.workerActive()) return target.mkdirSync(file)
+    if (!worker.memory.nodes.has(file)) worker.memory.put(file, '', 'dir')
+  }
+  if (key === 'statSync') return file => worker.workerActive() ? target.statSync(file) : worker.memory.statSync(file)
+  return target[key]
+} })
+const executeWorker = worker.taskpool.execute.bind(worker.taskpool)
+worker.taskpool.execute = (task, priority) => {
+  records.push({ type: 'task-submit', request: structuredClone(task.args[2]) })
+  return executeWorker(task, priority).then(reply => {
+    records.push({ type: 'task-result', reply })
+    if (reply.result?.status === 'COMMITTED') {
+      const request = task.args[2]
+      const appId = request.commit?.pre.appId || request.publication.appId
+      const file = '/actor-fixture/vera/' + appId + '.state.json'
+      const decoded = format2.validateStateFile(disk.get(file), appId, 1)
+      assert.equal(decoded.format, 'FORMAT2')
+      assert.equal(decoded.revision, reply.result.revision)
+      if (request.commit) {
+        assert.equal(decoded.vmGeneration, request.commit.pre.vmGeneration)
+        assert.equal(decoded.revision, request.commit.pre.baseRevision + 1)
+      } else assert.equal(decoded.vmGeneration, request.publication.nextVmGeneration)
+      records.push({ type: request.kind === 'commit' ? 'save' : 'publication', file, payload: JSON.parse(disk.get(file)), result: reply.result })
+    }
+    return reply
+  })
 }
 const forbidden = name => new Proxy({}, { get(_target, key) {
   throw Error('Forbidden platform access: ' + name + '.' + String(key))
@@ -54,7 +58,7 @@ const forbidden = name => new Proxy({}, { get(_target, key) {
 function load(file) {
   file = path.resolve(file)
   if (cache.has(file)) return cache.get(file).exports
-  const source = fs.readFileSync(file, 'utf8')
+  const source = fs.readFileSync(file, 'utf8').replace(/^@Concurrent\s*$/gm, '')
   const compiled = ts.transpileModule(source, {
     fileName: file.replace(/\.ets$/, '.ts'),
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020, experimentalDecorators: true },
@@ -66,9 +70,20 @@ function load(file) {
   cache.set(file, module)
   const importer = name => {
     if (name === '@kit.CoreFileKit') return { fileIo: filesystem }
-    if (name === '@kit.ArkTS') return { util: { TextEncoder: class {
-      encodeInto(text) { return text.length === 0 ? undefined : new TextEncoder().encode(text) }
-    } } }
+    if (name === '@ohos.fileio') return { default: worker.legacyFilesystem }
+    if (name === '@kit.BasicServicesKit') return { systemDateTime: {
+      TimeType: { STARTUP: 0 }, getUptime: () => now
+    } }
+    if (name === '@kit.ArkTS') return { taskpool: worker.taskpool, util: {
+      TextEncoder: class {
+        encodeInto(text) { return text.length === 0 ? undefined : new TextEncoder().encode(text) }
+      },
+      TextDecoder: { create(encoding, options) {
+        const decoder = new TextDecoder(encoding, options)
+        return { decodeToString: (value, decodeOptions) => decoder.decode(value, decodeOptions) }
+      } },
+      generateRandomUUID: () => crypto.randomUUID()
+    } }
     if (name === '@kit.CryptoArchitectureKit') return { cryptoFramework: { createMd(algorithm) {
       assert.equal(algorithm, 'SHA256')
       if (cryptoFailure && cryptoFailureStage === 'create') throw cryptoFailure
@@ -264,8 +279,9 @@ function edited(encoded, changes) {
 const options = (mode = 'LIVE_PERSISTENT', persistKey = 'project/version', seedState = '') => ({ mode, persistKey, seedState })
 const stateFile = (key = 'project/version') => '/actor-fixture/vera/' + key.split('/')[0] + '/' + key.slice(key.indexOf('/') + 1) + '.state.json'
 function saveExternal(program, encoded, key = 'project/version') {
-  const slash = key.indexOf('/')
-  store.saveState(key.slice(0, slash), key.slice(slash + 1), program.stamp, encoded)
+  const prior = disk.has(stateFile(key)) ? JSON.parse(disk.get(stateFile(key))) : null
+  disk.set(stateFile(key), format2.assembleStateFile({ appId: key, schemaVersion: 1,
+    vmGeneration: prior?.vmGeneration || 1, revision: (prior?.revision || 0) + 1, stamp: program.stamp }, encoded))
 }
 function probe() {
   const events = []
@@ -312,20 +328,21 @@ function probe() {
   })
   return { actor, events, snapshots, frames, effects, render, error,
     reset() { events.length = 0; snapshots.length = 0; frames.length = 0; effects.length = 0 },
-    state() { return stateOf(actor.snapshot()) },
+    async state() { return stateOf(await actor.snapshot()) },
     paint(entry = 'draw') {
+      const before = events.length
       try {
         const ops = actor.draw(entry)
         events.push({ type: 'draw', entry, ops: JSON.parse(JSON.stringify(ops)) })
         return ops
       } catch (e) {
-        error('DRAW', 'Draw error: ' + e.message)
+        assert(events.slice(before).some(event => event.type === 'ui-error' && event.message === e.message), 'actor reports the rejected pure draw')
         return null
       }
     }
   }
 }
-const sequence = p => p.events.filter(e => ['execute', 'snapshot', 'frame', 'save', 'saved', 'effect', 'ui-error', 'stop', 'draw', 'reload', 'load'].includes(e.type))
+const sequence = p => p.events.filter(e => ['execute', 'snapshot', 'frame', 'save', 'saved', 'effect', 'ui-error', 'stop', 'draw', 'reload'].includes(e.type))
   .map(e => e.type === 'execute' ? e.entry : e.type === 'effect' ? 'effect:' + e.params[0][1] : e.type === 'ui-error' || e.type === 'stop' ? e.type + ':' + e.kind : e.type)
 const entries = p => p.events.filter(e => e.type === 'execute').map(e => e.entry)
 const count = (p, type) => p.events.filter(e => e.type === type).length
@@ -336,13 +353,13 @@ const tests = []
 function test(name, run) { tests.push({ name, run }) }
 let fresh
 
-test('current-source identity and private ownership; preview has no second execution/state path', () => {
+test('current-source identity and private ownership; preview has no second execution/state path', async () => {
   assert.strictEqual(vera('ProjectStore').store, store)
   assert.strictEqual(load(path.join(root, 'runtime/../vera/VeraInterpreter.ets')), vera('VeraInterpreter'))
   const actorSource = fs.readFileSync(path.join(root, 'runtime/AppActor.ets'), 'utf8')
   const actorAst = ts.createSourceFile('AppActor.ts', actorSource, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
   const actorClass = actorAst.statements.find(node => ts.isClassDeclaration(node) && node.name.text === 'AppActor')
-  for (const name of ['vm', 'host', 'currentState', 'diskState', 'mode', 'program', 'persistKey', 'seedState']) {
+  for (const name of ['vm', 'host', 'manager', 'coordinator', 'pureCapability', 'mode', 'program', 'persistKey']) {
     const field = actorClass.members.find(member => member.name && member.name.getText(actorAst) === name)
     assert(field && field.modifiers.some(modifier => modifier.kind === ts.SyntaxKind.PrivateKeyword), name + ' is private')
   }
@@ -362,46 +379,56 @@ test('current-source identity and private ownership; preview has no second execu
   assert.match(facing, /from ['"]\.\/VeraInterpreter['"]/)
 })
 
-test('uninitialized and empty program readiness; real init trap and init effects never publish ready', () => {
+test('uninitialized and empty program readiness; rejected init never publishes and persistent init effects commit first', async () => {
   const p = probe()
   assert.equal(p.actor.ready(), false)
-  assert.equal(p.actor.snapshot(), '')
+  assert.equal(await p.actor.snapshot(), '')
   assert.equal(p.actor.view(), null)
   assert.deepEqual(p.actor.draw('draw'), [])
-  p.actor.initialize({ vbc2: '', stamp: '' }, options())
+  await assert.rejects(p.actor.initialize({ vbc2: '', stamp: '' }, options()), /STATE_VALIDATION_FAILED/)
   assert.equal(p.actor.ready(), false)
-  assert.deepEqual(p.events, [])
+  assert.equal(p.snapshots.length + p.frames.length + p.effects.length, 0)
   for (const program of [programs.initTrap, programs.initEffect, { vbc2: 'not bytecode', stamp: 'bad' }]) {
     p.reset()
-    p.actor.replaceProgram(program, options())
-    assert.equal(p.actor.ready(), false)
-    assert.equal(p.actor.snapshot(), '')
-    assert.equal(count(p, 'snapshot') + count(p, 'frame') + count(p, 'saved') + count(p, 'effect'), 0)
-    assert.equal(count(p, 'ui-error'), 1)
-    assert.equal(p.events.find(e => e.type === 'ui-error').kind, 'INIT')
-    assert.equal(count(p, 'stop'), 0)
-    assert.equal(count(p, 'save'), 0)
-    p.actor.dispatch('change', number(5))
-    assert.equal(count(p, 'ui-error'), 1)
+    if (program === programs.initEffect) {
+      await p.actor.replaceProgram(program, options())
+      assert(p.actor.ready())
+      assert.equal(count(p, 'save'), 1)
+      assert.equal(p.effects.length, 1)
+      assert(p.events.findIndex(e => e.type === 'save') < p.events.findIndex(e => e.type === 'effect'))
+      assert.equal(count(p, 'saved'), 1)
+    } else {
+      await assert.rejects(p.actor.replaceProgram(program, options()))
+      assert.equal(p.actor.ready(), false)
+      assert.equal(await p.actor.snapshot(), '')
+      assert.equal(p.snapshots.length + p.frames.length + p.effects.length + count(p, 'saved'), 0)
+      assert.equal(count(p, 'save'), 0)
+      assert.equal(count(p, 'ui-error'), 1)
+      assert.equal(p.events.find(event => event.type === 'ui-error').kind, 'init')
+      await p.actor.dispatch('change', number(5))
+      assert.equal(count(p, 'ui-error'), 1)
+    }
+    assert.equal(count(p, 'task-submit'), count(p, 'task-result'))
   }
   p.reset()
-  p.actor.replaceProgram(programs.basic, options('LIVE_EPHEMERAL', ''))
+  await p.actor.replaceProgram(programs.basic, options('LIVE_EPHEMERAL', ''))
   assert(p.actor.ready())
-  fresh = p.actor.snapshot()
-  assert.deepEqual(p.state(), { n: 1, calls: 0, refreshes: 0, marks: [], badView: false })
+  fresh = await p.actor.snapshot()
+  assert.deepEqual(await p.state(), { n: 1, calls: 0, refreshes: 0, marks: [], badView: false })
   assert.deepEqual(sequence(p), ['init', 'snapshot', 'view', 'frame'])
 })
 
-test('persistent initialization order: snapshot/view precede refresh snapshot/view/save/effects', () => {
+test('persistent initialization order: snapshot/view precede refresh snapshot/view/save/effects', async () => {
   const p = probe()
-  p.actor.initialize(programs.refreshed, options())
-  assert.deepEqual(sequence(p), ['init', 'snapshot', 'view', 'frame', 'widgetRefresh', 'snapshot', 'view', 'frame', 'save', 'saved', 'effect:refresh'])
+  await p.actor.initialize(programs.refreshed, options())
+  assert.deepEqual(sequence(p), ['init', 'save', 'snapshot', 'saved', 'view', 'frame', 'widgetRefresh', 'save', 'snapshot', 'effect:refresh', 'saved', 'view', 'frame'])
   assert.deepEqual(p.snapshots.map(s => stateOf(s).n), [1, 11])
   assert.deepEqual(p.frames.map(f => f.root.text), ['n=1', 'n=11'])
   assert(p.frames.every(f => f.paint && !f.reveal))
-  assert.equal(p.state().refreshes, 1)
-  assert.equal(p.events.find(e => e.type === 'saved').projectId, 'project')
-  assert.equal(store.loadState('project', 'version', programs.refreshed.stamp), p.actor.snapshot())
+  assert.equal((await p.state()).refreshes, 1)
+  assert.equal(count(p, 'saved'), 2)
+  assert.equal(count(p, 'task-submit'), count(p, 'task-result'))
+  assert.equal(await store.loadState('project', 'version', programs.refreshed.stamp), (await p.actor.snapshot()))
   assert.deepEqual(p.effects[0].params, [['label', 'refresh'], ['value', '11']])
   assert.equal(p.effects[0].target, target)
   assert.equal(p.effects[0].handler, 'answered')
@@ -409,81 +436,83 @@ test('persistent initialization order: snapshot/view precede refresh snapshot/vi
   noErrors(p)
 })
 
-test('saved persistent state beats seed and init; mismatched stamp uses seed', () => {
-  saveExternal(programs.basic, edited(fresh, { n: 40, calls: 6 }))
+test('saved persistent state beats seed and init; mismatched stamp uses seed', async () => {
+  await saveExternal(programs.basic, edited(fresh, { n: 40, calls: 6 }))
   const p = probe()
-  p.actor.initialize(programs.basic, options('LIVE_PERSISTENT', 'project/version', edited(fresh, { n: 9 })))
-  assert.equal(p.state().n, 40)
-  assert.equal(p.state().calls, 6)
-  assert.deepEqual(sequence(p), ['load', 'snapshot', 'view', 'frame'])
+  await p.actor.initialize(programs.basic, options('LIVE_PERSISTENT', 'project/version', edited(fresh, { n: 9 })))
+  assert.equal((await p.state()).n, 40)
+  assert.equal((await p.state()).calls, 6)
+  assert.deepEqual(sequence(p), ['restore', 'snapshot', 'view', 'frame'])
+  assert.equal(count(p, 'publication'), 1)
+  assert.equal(count(p, 'task-submit'), count(p, 'task-result'))
   assert.equal(count(p, 'save'), 0)
   p.reset()
-  p.actor.replaceProgram(programs.newer, options('LIVE_PERSISTENT', 'project/version', edited(fresh, { n: 9 })))
-  assert.deepEqual(sequence(p), ['load', 'init', 'view', 'snapshot', 'view', 'frame', 'widgetRefresh', 'snapshot', 'view', 'frame', 'save', 'saved', 'effect:refresh'])
-  assert.equal(p.state().n, 19)
-  assert.equal(p.state().added, 42)
+  await p.actor.replaceProgram(programs.newer, options('LIVE_PERSISTENT', 'project/version', edited(fresh, { n: 9 })))
+  assert.deepEqual(sequence(p), ['init', 'save', 'snapshot', 'saved', 'view', 'frame', 'widgetRefresh', 'save', 'snapshot', 'effect:refresh', 'saved', 'view', 'frame'])
+  assert.equal((await p.state()).n, 19)
+  assert.equal((await p.state()).added, 42)
 })
 
-test('malformed disk and seed fall back; carry view validation fails without a second init', () => {
+test('malformed disk and seed reject activation; carry view validation fails without a second init', async () => {
   for (const stored of ['{broken', JSON.stringify({ stamp: programs.basic.stamp, value: ['unknown'] })]) {
     disk.set(stateFile(), stored)
     for (const seed of ['', '{broken', JSON.stringify(['unknown'])]) {
       const p = probe()
-      p.actor.initialize(programs.basic, options('LIVE_PERSISTENT', 'project/version', seed))
-      assert.equal(p.state().n, 1)
-      assert.equal(entries(p).filter(e => e === 'init').length, 1)
-      assert.equal(p.snapshots.length, 1)
-      assert.equal(p.frames.length, 1)
-      noErrors(p)
+      await assert.rejects(p.actor.initialize(programs.basic, options('LIVE_PERSISTENT', 'project/version', seed)), /STATE_LOST/)
+      assert.equal(p.actor.ready(), false)
+      assert.equal(entries(p).filter(e => e === 'init').length, 0)
+      assert.equal(p.snapshots.length + p.frames.length + p.effects.length, 0)
       assert.equal(count(p, 'save'), 0)
+      assert.equal(disk.get(stateFile()), stored)
+      assert.equal(count(p, 'task-submit'), count(p, 'task-result'))
     }
   }
-  disk.set(stateFile(), JSON.stringify({ stamp: programs.basic.stamp, value: ['unknown'] }))
+  disk.delete(stateFile())
   const p = probe()
-  p.actor.initialize(programs.basic, options('LIVE_PERSISTENT', 'project/version', edited(fresh, { n: 8 })))
-  assert.equal(p.state().n, 8)
-  assert.deepEqual(entries(p), ['init', 'view', 'view'])
+  await assert.rejects(p.actor.initialize(programs.basic, options('LIVE_PERSISTENT', 'project/version', '{broken')))
+  assert.equal(p.actor.ready(), false)
+  assert.equal(disk.has(stateFile()), false)
+  assert.equal(p.snapshots.length + p.frames.length + count(p, 'save'), 0)
   const q = probe()
-  q.actor.initialize(programs.basic, options('LIVE_EPHEMERAL', '', edited(fresh, { n: -4 })))
-  assert.equal(q.state().n, 1)
-  assert.deepEqual(entries(q), ['init', 'view', 'view'])
-  assert.deepEqual(q.snapshots.map(stateOf).map(s => s.n), [1])
-  assert(q.events.some(e => e.type === 'log-warn' && e.message.includes('could not carry')))
-  noErrors(q)
+  await assert.rejects(q.actor.initialize(programs.basic, options('LIVE_EPHEMERAL', '', edited(fresh, { n: -4 }))))
+  assert.equal(q.actor.ready(), false)
+  assert.deepEqual(entries(q), ['init'])
+  assert.equal(q.snapshots.length + q.frames.length + q.effects.length, 0)
+  noIo(q)
 })
 
-test('carry uses new class shape and defaults, preserving compatible state only', () => {
+test('carry uses new class shape and defaults, preserving compatible state only', async () => {
   const p = probe()
-  p.actor.initialize(programs.newer, options('LIVE_EPHEMERAL', '', edited(fresh, { n: 7, calls: 3 })))
-  assert.equal(p.state().n, 17)
-  assert.equal(p.state().calls, 3)
-  assert.equal(p.state().added, 42)
-  assert.equal(p.state().refreshes, 1)
-  assert.deepEqual(entries(p), ['init', 'view', 'view', 'widgetRefresh', 'view'])
+  await p.actor.initialize(programs.newer, options('LIVE_EPHEMERAL', '', edited(fresh, { n: 7, calls: 3 })))
+  assert.equal((await p.state()).n, 17)
+  assert.equal((await p.state()).calls, 3)
+  assert.equal((await p.state()).added, 42)
+  assert.equal((await p.state()).refreshes, 1)
+  assert.deepEqual(entries(p), ['init', 'view', 'widgetRefresh', 'view'])
   noIo(p)
   noErrors(p)
 })
 
-test('preview ignores disk and seed; dispatch/move/frame/refresh/snapshot/save remain inert', () => {
-  saveExternal(programs.refreshed, edited(fresh, { n: 80 }))
+test('preview ignores disk and seed; dispatch/move/frame/refresh/snapshot/save remain inert', async () => {
+  await saveExternal(programs.refreshed, edited(fresh, { n: 80 }))
   for (const seed of [edited(fresh, { n: 99 }), '{broken']) {
     const p = probe()
-    p.actor.initialize(programs.refreshed, options('PREVIEW', 'project/version', seed))
+    await p.actor.initialize(programs.refreshed, options('PREVIEW', 'project/version', seed))
     assert(p.actor.ready())
     assert.deepEqual(sequence(p), ['init', 'view', 'frame'])
     assert.equal(p.frames[0].root.text, 'n=1')
-    assert.equal(p.actor.snapshot(), '')
+    assert.equal((await p.actor.snapshot()), '')
     p.reset()
-    p.actor.dispatch('change', number(100))
-    p.actor.dispatch('fail', number(100))
-    p.actor.move('pointer', pointerValue('move', 1, 2, 3))
-    p.actor.frameHandlers(['frameA', 'frameB'], 16)
-    p.actor.runWidgetRefresh()
-    p.actor.resume()
-    p.actor.notifyStateSnapshot()
-    p.actor.persistState()
+    await p.actor.dispatch('change', number(100))
+    await p.actor.dispatch('fail', number(100))
+    await p.actor.move('pointer', pointerValue('move', 1, 2, 3))
+    await p.actor.frameHandlers(['frameA', 'frameB'], 16)
+    await p.actor.runWidgetRefresh()
+    await p.actor.resume()
+    await p.actor.notifyStateSnapshot()
+    await p.actor.persistState()
     p.actor.beginSurfaceLoop(now)
-    assert.equal(p.actor.surfaceSave(now + 6000, false), 'NOT_DUE')
+    assert.equal(await p.actor.surfaceSave(now + 6000, false), 'NOT_DUE')
     assert.deepEqual(p.events, [])
     p.render()
     assert.equal(p.frames[0].root.text, 'n=1')
@@ -493,247 +522,261 @@ test('preview ignores disk and seed; dispatch/move/frame/refresh/snapshot/save r
   }
 })
 
-test('ephemeral seed/refresh/handlers/effect answers work without reading or writing disk', () => {
+test('ephemeral seed/refresh/handlers/effect answers work without reading or writing disk', async () => {
   const p = probe()
-  p.actor.initialize(programs.refreshed, options('LIVE_EPHEMERAL', 'ignored/key', edited(fresh, { n: 4 })))
-  assert.deepEqual(sequence(p), ['init', 'view', 'snapshot', 'view', 'frame', 'widgetRefresh', 'snapshot', 'view', 'frame', 'effect:refresh'])
-  assert.equal(p.state().n, 14)
+  await p.actor.initialize(programs.refreshed, options('LIVE_EPHEMERAL', 'ignored/key', edited(fresh, { n: 4 })))
+  assert.deepEqual(sequence(p), ['init', 'snapshot', 'view', 'frame', 'widgetRefresh', 'snapshot', 'effect:refresh', 'view', 'frame'])
+  assert.equal((await p.state()).n, 14)
   p.reset()
-  p.actor.dispatch('change', number(2))
-  assert.deepEqual(sequence(p), ['change', 'snapshot', 'view', 'frame', 'effect:change'])
-  assert.equal(p.state().n, 16)
+  await p.actor.dispatch('change', number(2))
+  assert.deepEqual(sequence(p), ['change', 'snapshot', 'effect:change', 'view', 'frame'])
+  assert.equal((await p.state()).n, 16)
   assert(p.frames[0].paint && p.frames[0].reveal)
-  p.actor.dispatch('answered', new VeraStringValue('ok'), true, 'EFFECT_RESULT')
-  assert.equal(p.state().n, 18)
-  assert.equal(p.state().calls, 2)
-  p.actor.persistState()
-  p.actor.resume()
-  assert.equal(p.state().n, 28)
+  await p.actor.dispatch('answered', new VeraStringValue('ok'), true, 'EFFECT_RESULT')
+  assert.equal((await p.state()).n, 18)
+  assert.equal((await p.state()).calls, 2)
+  await p.actor.persistState()
+  await p.actor.resume()
+  assert.equal((await p.state()).n, 28)
   noIo(p)
   noErrors(p)
 })
 
-test('dispatch snapshot/view/save/effects order and persist=false suppresses only save', () => {
+test('dispatch commits before snapshot/effects/view and effects override persist=false', async () => {
   const p = probe()
-  p.actor.initialize(programs.basic, options())
+  await p.actor.initialize(programs.basic, options())
   p.reset()
-  p.actor.dispatch('change', number(2))
-  assert.deepEqual(sequence(p), ['change', 'snapshot', 'view', 'frame', 'save', 'saved', 'effect:change'])
+  await p.actor.dispatch('change', number(2))
+  assert.deepEqual(sequence(p), ['change', 'save', 'snapshot', 'effect:change', 'saved', 'view', 'frame'])
   assert.equal(stateOf(p.snapshots[0]).n, 3)
   assert.equal(p.frames[0].root.text, 'n=3')
   const saved = disk.get(stateFile())
   p.reset()
-  p.actor.dispatch('change', number(4), false, 'TICK')
-  assert.deepEqual(sequence(p), ['change', 'snapshot', 'view', 'frame', 'effect:change'])
-  assert.equal(p.state().n, 7)
-  assert.equal(disk.get(stateFile()), saved)
+  await p.actor.dispatch('change', number(4), false, 'TICK')
+  assert.deepEqual(sequence(p), ['change', 'save', 'snapshot', 'effect:change', 'saved', 'view', 'frame'])
+  assert.equal((await p.state()).n, 7)
+  assert.notEqual(disk.get(stateFile()), saved)
+  assert.equal(count(p, 'task-submit'), count(p, 'task-result'))
   p.reset()
-  p.actor.dispatch('answered', new VeraStringValue('ok'), true, 'EFFECT_RESULT')
-  assert.deepEqual(sequence(p), ['answered', 'snapshot', 'view', 'frame', 'save', 'saved'])
-  assert.equal(p.state().n, 9)
+  await p.actor.dispatch('answered', new VeraStringValue('ok'), true, 'EFFECT_RESULT')
+  assert.deepEqual(sequence(p), ['answered', 'save', 'snapshot', 'saved', 'view', 'frame'])
+  assert.equal((await p.state()).n, 9)
   noErrors(p)
 })
 
-test('promotion preserves VM, state and effect sequence; no init, disk reload or refresh', () => {
-  saveExternal(programs.refreshed, edited(fresh, { n: 90 }))
+test('promotion preserves VM, state and effect sequence; no init, disk reload or refresh', async () => {
+  await saveExternal(programs.refreshed, edited(fresh, { n: 90 }))
   const p = probe()
-  p.actor.initialize(programs.refreshed, options('PREVIEW', 'project/version', edited(fresh, { n: 70 })))
+  await p.actor.initialize(programs.refreshed, options('PREVIEW', 'project/version', edited(fresh, { n: 70 })))
   p.reset()
   const live = options('LIVE_PERSISTENT', 'project/version', edited(fresh, { n: 60 }))
-  p.actor.promote(live)
-  assert.deepEqual(sequence(p), ['snapshot', 'view', 'frame'])
-  assert.equal(p.state().n, 1)
-  assert.equal(p.state().refreshes, 0)
-  p.actor.dispatch('change', number(3))
+  await p.actor.promote(live)
+  assert.deepEqual(sequence(p), ['restore', 'save', 'snapshot', 'saved', 'view', 'frame'])
+  assert.equal(count(p, 'publication'), 1)
+  assert.equal(count(p, 'task-submit'), count(p, 'task-result'))
+  assert.equal((await p.state()).n, 1)
+  assert.equal((await p.state()).refreshes, 0)
+  await p.actor.dispatch('change', number(3))
   const id = p.effects[0].id
-  const snapshot = p.actor.snapshot()
+  const snapshot = (await p.actor.snapshot())
   p.reset()
-  p.actor.promote(live)
+  await p.actor.promote(live)
   assert.deepEqual(p.events, [])
-  assert.equal(p.actor.snapshot(), snapshot)
-  p.actor.promote(options('LIVE_EPHEMERAL', ''))
-  assert.deepEqual(sequence(p), ['snapshot', 'view', 'frame'])
-  assert.equal(p.actor.snapshot(), snapshot)
+  assert.equal((await p.actor.snapshot()), snapshot)
+  await p.actor.promote(options('LIVE_EPHEMERAL', ''))
+  assert.deepEqual(sequence(p), ['restore', 'snapshot', 'view', 'frame'])
+  assert.equal((await p.actor.snapshot()), snapshot)
   p.reset()
-  p.actor.dispatch('change', number(1))
+  await p.actor.dispatch('change', number(1))
   assert.equal(p.effects[0].id, id + 1)
   noIo(p)
   p.reset()
-  p.actor.promote(options('PREVIEW', 'project/version'))
-  assert.deepEqual(sequence(p), ['view', 'frame'])
-  assert.equal(p.actor.snapshot(), '')
+  await p.actor.promote(options('PREVIEW', 'project/version'))
+  assert.deepEqual(sequence(p), ['restore', 'view', 'frame'])
+  assert.equal((await p.actor.snapshot()), '')
   p.reset()
-  p.actor.dispatch('change', number(100))
+  await p.actor.dispatch('change', number(100))
   assert.deepEqual(p.events, [])
-  p.actor.promote(live)
-  assert.equal(p.state().n, 5)
-  assert.equal(p.state().calls, 2)
-  assert.equal(p.state().refreshes, 0)
+  await p.actor.promote(live)
+  assert.equal((await p.state()).n, 5)
+  assert.equal((await p.state()).calls, 2)
+  assert.equal((await p.state()).refreshes, 0)
 })
 
-test('both watcher orders replace with complete latest options and converge, with and without saved live state', () => {
+test('both watcher orders replace with complete latest options and converge, with and without saved live state', async () => {
   for (const stored of [false, true]) {
     const outcomes = []
     for (const order of ['promote-first', 'replace-first']) {
       disk.clear()
-      if (stored) saveExternal(programs.newer, edited(fresh, { n: 70, calls: 8 }), 'latest/new-version')
+      if (stored) await saveExternal(programs.newer, edited(fresh, { n: 70, calls: 8 }), 'latest/new-version')
       const p = probe()
-      p.actor.initialize(programs.basic, options('PREVIEW', 'old/version', edited(fresh, { n: 99 })))
+      await p.actor.initialize(programs.basic, options('PREVIEW', 'old/version', edited(fresh, { n: 99 })))
       p.reset()
       const latest = options('LIVE_PERSISTENT', 'latest/new-version', edited(fresh, { n: 20 }))
       if (order === 'promote-first') {
-        p.actor.promote(latest)
-        assert.equal(p.state().n, 1)
+        await p.actor.promote(latest)
+        assert.equal((await p.state()).n, 1)
         assert(!entries(p).includes('widgetRefresh'))
         p.reset()
       }
-      p.actor.replaceProgram(programs.newer, latest)
-      assert.equal(p.state().n, stored ? 80 : 30)
-      assert.equal(p.state().refreshes, 1)
-      assert.equal(entries(p).filter(entry => entry === 'init').length, stored ? 0 : 1)
-      assert.equal(p.frames[0].root.text, stored ? 'n=70' : 'n=20')
+      await p.actor.replaceProgram(programs.newer, latest)
+      const restored = stored && order === 'replace-first'
+      assert.equal((await p.state()).n, restored ? 80 : 30)
+      assert.equal((await p.state()).refreshes, 1)
+      assert.equal(entries(p).filter(entry => entry === 'init').length, restored ? 0 : 1)
+      assert.equal(p.frames[0].root.text, restored ? 'n=70' : 'n=20')
       assert.equal(p.events.find(e => e.type === 'save').file, stateFile('latest/new-version'))
       assert(p.events.filter(e => e.type === 'saved').every(e => e.projectId === 'latest'))
-      const encoded = p.actor.snapshot()
+      const encoded = (await p.actor.snapshot())
       p.reset()
-      p.actor.promote(latest)
+      await p.actor.promote(latest)
       assert.deepEqual(p.events, [])
-      assert.equal(store.loadState('latest', 'new-version', programs.newer.stamp), encoded)
-      assert.equal(store.loadState('latest', 'new-version', programs.basic.stamp), '')
+      assert.equal(await store.loadState('latest', 'new-version', programs.newer.stamp), encoded)
+      assert.equal(await store.loadState('latest', 'new-version', programs.basic.stamp), '')
       outcomes.push(encoded)
       noErrors(p)
     }
-    assert.equal(outcomes[0], outcomes[1])
+    if (stored) {
+      assert.equal(stateOf(outcomes[0]).n, 30)
+      assert.equal(stateOf(outcomes[1]).n, 80)
+    } else assert.equal(outcomes[0], outcomes[1])
   }
 })
 
-test('replacement resets old runtime and installs new mode, key and seed, including live-to-preview', () => {
+test('replacement resets old runtime and installs new mode, key and seed, including live-to-preview', async () => {
   const p = probe()
-  p.actor.initialize(programs.refreshed, options())
-  p.actor.dispatch('change', number(2))
+  await p.actor.initialize(programs.refreshed, options())
+  await p.actor.dispatch('change', number(2))
   p.reset()
-  p.actor.replaceProgram(programs.newer, options('LIVE_EPHEMERAL', '', edited(fresh, { n: 8 })))
-  assert.equal(p.state().n, 18)
-  assert.equal(p.state().calls, 0)
-  assert.equal(p.state().added, 42)
+  await p.actor.replaceProgram(programs.newer, options('LIVE_EPHEMERAL', '', edited(fresh, { n: 8 })))
+  assert.equal((await p.state()).n, 18)
+  assert.equal((await p.state()).calls, 0)
+  assert.equal((await p.state()).added, 42)
   noIo(p)
   p.reset()
-  p.actor.replaceProgram(programs.refreshed, options('PREVIEW', 'new/project', edited(fresh, { n: 50 })))
+  await p.actor.replaceProgram(programs.refreshed, options('PREVIEW', 'new/project', edited(fresh, { n: 50 })))
   assert.deepEqual(sequence(p), ['init', 'view', 'frame'])
-  assert.equal(p.actor.snapshot(), '')
+  assert.equal((await p.actor.snapshot()), '')
   assert.equal(p.frames[0].root.text, 'n=1')
-  p.actor.resume()
-  p.actor.runWidgetRefresh()
+  await p.actor.resume()
+  await p.actor.runWidgetRefresh()
   noIo(p)
 })
 
-test('resume adopts external Form state before view/refresh/save and does not roll back unsaved live state for identical disk', () => {
+test('resume adopts external Form state before view/refresh/save and does not roll back unsaved live state for identical disk', async () => {
   const p = probe()
-  p.actor.initialize(programs.refreshed, options())
-  p.actor.dispatch('change', number(5), false)
-  assert.equal(p.state().n, 16)
+  await p.actor.initialize(programs.refreshed, options())
+  await p.actor.dispatch('change', number(5), false)
+  assert.equal((await p.state()).n, 16)
   p.reset()
-  p.actor.resume()
-  assert.deepEqual(sequence(p), ['load', 'reload', 'view', 'frame', 'widgetRefresh', 'snapshot', 'view', 'frame', 'save', 'saved', 'effect:refresh'])
-  assert.equal(p.events.find(e => e.type === 'reload').changed, false)
+  await p.actor.resume()
+  assert.deepEqual(sequence(p), ['reload', 'view', 'frame', 'widgetRefresh', 'save', 'snapshot', 'effect:refresh', 'saved', 'view', 'frame'])
+  assert.equal(count(p, 'publication'), 0)
+  assert.equal(count(p, 'task-submit'), count(p, 'task-result'))
   assert.equal(p.frames[0].root.text, 'n=16')
-  assert.equal(p.state().n, 26)
-  saveExternal(programs.refreshed, edited(p.actor.snapshot(), { n: 100, calls: 50 }))
+  assert.equal((await p.state()).n, 26)
+  await saveExternal(programs.refreshed, edited((await p.actor.snapshot()), { n: 100, calls: 50 }))
   p.reset()
-  p.actor.resume()
-  assert.deepEqual(sequence(p), ['load', 'reload', 'load', 'view', 'frame', 'widgetRefresh', 'snapshot', 'view', 'frame', 'save', 'saved', 'effect:refresh'])
-  assert.equal(p.events.find(e => e.type === 'reload').changed, true)
+  await p.actor.resume()
+  assert.deepEqual(sequence(p), ['reload', 'snapshot', 'view', 'frame', 'widgetRefresh', 'save', 'snapshot', 'effect:refresh', 'saved', 'view', 'frame'])
+  assert.equal(count(p, 'publication'), 1)
+  assert.equal(count(p, 'task-submit'), count(p, 'task-result'))
   assert.equal(p.frames[0].root.text, 'n=100')
-  assert.equal(p.state().n, 110)
-  assert.equal(p.state().calls, 50)
-  assert.equal(stateOf(store.loadState('project', 'version', programs.refreshed.stamp)).n, 110)
+  assert.equal((await p.state()).n, 110)
+  assert.equal((await p.state()).calls, 50)
+  assert.equal(stateOf(await store.loadState('project', 'version', programs.refreshed.stamp)).n, 110)
   noErrors(p)
 })
 
-test('resume malformed or missing external state retains live state; no unconditional overwrite without refresh', () => {
-  const p = probe()
-  p.actor.initialize(programs.basic, options())
-  p.actor.dispatch('change', number(2))
-  p.actor.dispatch('change', number(3), false)
+test('resume malformed or missing external state retains live state; no unconditional overwrite without refresh', async () => {
   for (const value of ['{broken', JSON.stringify({ stamp: programs.basic.stamp, value: ['unknown'] }), null]) {
+    disk.clear()
+    const p = probe()
+    await p.actor.initialize(programs.basic, options())
+    await p.actor.dispatch('change', number(2))
+    await p.actor.dispatch('change', number(3), false)
     if (value === null) disk.delete(stateFile())
     else disk.set(stateFile(), value)
     p.reset()
-    p.actor.resume()
-    assert.equal(p.state().n, 6)
-    assert.equal(p.frames[0].root.text, 'n=6')
+    await assert.rejects(p.actor.resume(), value === null ? /STATE_RECREATE_REQUIRED/ : /STATE_RELOAD_PENDING/)
+    if (value === null) assert.equal(await p.actor.snapshot(), '')
+    else await assert.rejects(p.actor.snapshot(), /STATE_RELOAD_PENDING/)
+    assert.equal(p.frames.length, 0)
     assert.equal(count(p, 'save') + count(p, 'snapshot'), 0)
+    assert.equal(count(p, 'task-submit'), count(p, 'task-result'))
     assert.equal(disk.get(stateFile()), value === null ? undefined : value)
-    noErrors(p)
+    assert.equal(count(p, 'ui-error'), 1)
+    assert.equal(p.events.find(e => e.type === 'ui-error').kind, 'state')
   }
 })
 
-test('handler traps retain partial in-place mutations, suppress queued effects and stop only after error', () => {
+test('handler traps roll back in-place mutations, suppress queued effects and report once before recovery', async () => {
   const p = probe()
-  p.actor.initialize(programs.basic, options())
-  p.actor.persistState()
+  await p.actor.initialize(programs.basic, options())
+  await p.actor.persistState()
   const saved = disk.get(stateFile())
   p.reset()
-  p.actor.dispatch('fail', number(7))
-  assert.deepEqual(sequence(p), ['fail', 'ui-error:HANDLER', 'stop:HANDLER'])
-  assert.match(p.events.find(e => e.type === 'ui-error').message, /^Action error:/)
-  assert.deepEqual(p.state(), { n: 8, calls: 1, refreshes: 0, marks: [7], badView: false })
+  await assert.rejects(p.actor.dispatch('fail', number(7)), /array index out of bounds/)
+  assert.deepEqual(sequence(p), ['fail', 'ui-error:handler', 'stop:handler'])
+  assert.match(p.events.find(e => e.type === 'ui-error').message, /array index out of bounds/)
+  assert.deepEqual(await p.state(), { n: 1, calls: 0, refreshes: 0, marks: [], badView: false })
   assert.equal(disk.get(stateFile()), saved)
   assert.equal(p.snapshots.length + p.frames.length + p.effects.length, 0)
   p.reset()
-  p.actor.dispatch('recover', number(1))
-  assert.equal(p.state().n, 9)
-  assert.equal(p.state().calls, 2)
+  await p.actor.dispatch('recover', number(1))
+  assert.equal((await p.state()).n, 2)
+  assert.equal((await p.state()).calls, 1)
   assert.equal(p.effects.length, 0)
   assert.deepEqual(entries(p), ['recover', 'view'])
-  assert.equal(stateOf(store.loadState('project', 'version', programs.basic.stamp)).n, 9)
+  assert.equal(stateOf(await store.loadState('project', 'version', programs.basic.stamp)).n, 2)
+  assert.equal(count(p, 'task-submit'), count(p, 'task-result'))
 })
 
-test('view trap after successful handler keeps last tree; snapshot/save/effects continue without rerun or timer stop', () => {
+test('view trap after successful handler keeps last tree; snapshot/save/effects continue without rerun or timer stop', async () => {
   const p = probe()
-  p.actor.initialize(programs.basic, options())
+  await p.actor.initialize(programs.basic, options())
   const lastFrame = p.frames[0]
   p.reset()
-  p.actor.dispatch('breakView', number(4))
-  assert.deepEqual(sequence(p), ['breakView', 'snapshot', 'view', 'ui-error:VIEW', 'save', 'saved', 'effect:breakView'])
-  assert.equal(p.state().n, 5)
-  assert.equal(p.state().calls, 1)
+  await p.actor.dispatch('breakView', number(4))
+  assert.deepEqual(sequence(p), ['breakView', 'save', 'snapshot', 'effect:breakView', 'saved', 'view', 'ui-error:VIEW'])
+  assert.equal((await p.state()).n, 5)
+  assert.equal((await p.state()).calls, 1)
   assert.equal(p.frames.length, 0)
   assert.equal(lastFrame.root.text, 'n=1')
   assert.equal(count(p, 'stop'), 0)
   assert.equal(stateOf(p.snapshots[0]).n, 5)
-  assert.equal(stateOf(store.loadState('project', 'version', programs.basic.stamp)).n, 5)
+  assert.equal(stateOf(await store.loadState('project', 'version', programs.basic.stamp)).n, 5)
   p.reset()
-  p.actor.dispatch('recover', number(1))
+  await p.actor.dispatch('recover', number(1))
   assert.equal(p.frames[0].root.text, 'n=6')
-  assert.equal(p.state().calls, 2)
+  assert.equal((await p.state()).calls, 2)
   assert.deepEqual(entries(p), ['recover', 'view'])
 })
 
-test('view effects forbidden during initial render and after handlers without leaking effects', () => {
+test('view effects forbidden during initial render and after handlers without leaking effects', async () => {
   const p = probe()
-  p.actor.initialize(programs.viewEffect, options())
+  await p.actor.initialize(programs.viewEffect, options())
   assert(p.actor.ready())
-  assert.deepEqual(sequence(p), ['init', 'snapshot', 'view', 'ui-error:VIEW'])
-  assert.match(p.events.find(e => e.type === 'ui-error').message, /sdk.call may only be called from a handler/)
+  assert.deepEqual(sequence(p), ['init', 'save', 'snapshot', 'saved', 'view', 'ui-error:VIEW'])
+  assert.match(p.events.find(e => e.type === 'ui-error').message, /sdk.call is unavailable during pure execution/)
   p.reset()
-  p.actor.dispatch('change', number(2))
-  assert.deepEqual(sequence(p), ['change', 'snapshot', 'view', 'ui-error:VIEW', 'save', 'saved', 'effect:change'])
-  assert.equal(p.state().calls, 1)
+  await p.actor.dispatch('change', number(2))
+  assert.deepEqual(sequence(p), ['change', 'save', 'snapshot', 'effect:change', 'saved', 'view', 'ui-error:VIEW'])
+  assert.equal((await p.state()).calls, 1)
   assert.equal(count(p, 'stop'), 0)
 })
 
-test('draw effects forbidden; independent draw trap cannot rerun or undo completed handler/save/effects', () => {
+test('draw effects forbidden; independent draw trap cannot rerun or undo completed handler/save/effects', async () => {
   const p = probe()
-  p.actor.initialize(programs.basic, options())
+  await p.actor.initialize(programs.basic, options())
   p.reset()
-  p.actor.dispatch('change', number(2))
-  const snapshot = p.actor.snapshot()
+  await p.actor.dispatch('change', number(2))
+  const snapshot = (await p.actor.snapshot())
   for (const entry of ['drawEffect', 'drawTrap']) {
     const before = p.events.length
     assert.equal(p.paint(entry), null)
-    assert.deepEqual(sequence({ events: p.events.slice(before) }), [entry, 'ui-error:DRAW', 'stop:DRAW'])
-    assert.equal(p.actor.snapshot(), snapshot)
+    assert.deepEqual(sequence({ events: p.events.slice(before) }), [entry, 'ui-error:view', 'stop:view'])
+    assert.equal((await p.actor.snapshot()), snapshot)
   }
   assert.equal(entries(p).filter(e => e === 'change').length, 1)
   assert.equal(p.effects.length, 1)
@@ -743,292 +786,307 @@ test('draw effects forbidden; independent draw trap cannot rerun or undo complet
   assert.equal(ops.length, 1)
   assert.equal(ops[0].x, 3)
   assert.deepEqual(p.actor.draw(''), [])
-  p.actor.dispatch('recover', number(1))
+  await p.actor.dispatch('recover', number(1))
   assert.equal(p.effects.length, 0)
-  assert.equal(p.state().calls, 2)
+  assert.equal((await p.state()).calls, 2)
 })
 
-test('save failures are log-only; successful handler snapshot/render/effects continue and retry saves current state', () => {
+test('save failures roll back handler state and suppress publication/effects; retry commits through TaskPool', async () => {
   for (const stage of ['open', 'write', 'close', 'rename']) {
     const p = probe()
-    p.actor.initialize(programs.basic, options())
-    p.actor.persistState()
+    await p.actor.initialize(programs.basic, options())
+    await p.actor.persistState()
     const saved = disk.get(stateFile())
     p.reset()
     failure = stage
-    p.actor.dispatch('change', number(3))
+    await assert.rejects(p.actor.dispatch('change', number(3)), /STATE_/)
     failure = ''
-    assert.equal(p.state().n, 4)
-    assert.equal(p.state().calls, 1)
-    assert.equal(p.snapshots.length, 1)
-    assert.equal(p.frames.length, 1)
-    assert.equal(p.effects.length, 1)
-    assert.equal(count(p, 'saved') + count(p, 'stop'), 0)
+    if (stage === 'close') for (const fd of [...worker.memory.fds.keys()]) worker.memory.closeSync(fd)
+    assert.equal((await p.state()).n, 1)
+    assert.equal((await p.state()).calls, 0)
+    assert.equal(p.snapshots.length + p.frames.length + p.effects.length + count(p, 'saved'), 0)
     assert.equal(disk.get(stateFile()), saved)
-    assert(p.events.some(e => e.type === 'log-error' && e.message.includes('save failed')))
-    noErrors(p)
-    const at = p.events.findIndex(e => e.type === 'log-error' && e.message.includes('save failed'))
-    assert(at > p.events.findIndex(e => e.type === 'frame'))
-    assert(at < p.events.findIndex(e => e.type === 'effect'))
+    assert(p.events.some(e => e.type === 'task-result' && e.reply.result?.status === 'FAILED'))
+    assert.equal(count(p, 'task-submit'), count(p, 'task-result'))
+    assert.equal(count(p, 'ui-error'), 1)
     assert(![...disk.keys()].some(file => file.endsWith('.tmp')))
     p.reset()
-    p.actor.persistState()
-    assert.deepEqual(sequence(p), ['save', 'saved'])
-    assert.equal(stateOf(store.loadState('project', 'version', programs.basic.stamp)).n, 4)
+    await p.actor.dispatch('change', number(3))
+    assert.deepEqual(sequence(p), ['change', 'save', 'snapshot', 'effect:change', 'saved', 'view', 'frame'])
+    assert.equal(stateOf(await store.loadState('project', 'version', programs.basic.stamp)).n, 4)
+    assert.equal((await p.state()).calls, 1)
+    assert.equal(count(p, 'task-submit'), count(p, 'task-result'))
+    await p.actor.dispose()
     disk.clear()
   }
 })
 
-test('refresh traps are log-only, discard effects, retain mutations and create no snapshot/save/render', () => {
+test('refresh traps reject, roll back mutations and effects, and publish no failed turn state', async () => {
   const p = probe()
-  p.actor.initialize(programs.refreshTrap, options())
-  assert.deepEqual(sequence(p), ['init', 'snapshot', 'view', 'frame', 'widgetRefresh'])
+  await assert.rejects(p.actor.initialize(programs.refreshTrap, options()), /array index out of bounds/)
+  assert.deepEqual(sequence(p), ['init', 'save', 'snapshot', 'saved', 'view', 'frame', 'widgetRefresh', 'ui-error:handler', 'stop:handler'])
   assert.equal(p.frames[0].root.text, 'n=1')
   assert.equal(stateOf(p.snapshots[0]).n, 1)
-  assert.equal(p.state().n, 101)
-  assert.equal(p.state().refreshes, 1)
-  assert(p.events.some(e => e.type === 'log-warn' && e.message.includes('widgetRefresh failed')))
-  assert.equal(count(p, 'save') + count(p, 'stop') + p.effects.length, 0)
-  noErrors(p)
-  p.reset()
-  p.actor.runWidgetRefresh()
-  assert.deepEqual(sequence(p), ['widgetRefresh'])
-  assert.equal(p.state().n, 201)
-  assert.equal(p.state().refreshes, 2)
-  p.reset()
-  p.actor.dispatch('recover', number(1))
-  assert.equal(p.state().n, 202)
+  assert.equal((await p.state()).n, 1)
+  assert.equal((await p.state()).refreshes, 0)
+  assert.equal(count(p, 'save'), 1)
   assert.equal(p.effects.length, 0)
-  assert.equal(stateOf(store.loadState('project', 'version', programs.refreshTrap.stamp)).n, 202)
+  p.reset()
+  await assert.rejects(p.actor.runWidgetRefresh(), /array index out of bounds/)
+  assert.deepEqual(sequence(p), ['widgetRefresh', 'ui-error:handler', 'stop:handler'])
+  assert.equal((await p.state()).n, 1)
+  assert.equal((await p.state()).refreshes, 0)
+  p.reset()
+  await p.actor.dispatch('recover', number(1))
+  assert.equal((await p.state()).n, 2)
+  assert.equal(p.effects.length, 0)
+  assert.equal(stateOf(await store.loadState('project', 'version', programs.refreshTrap.stamp)).n, 2)
+  assert.equal(count(p, 'task-submit'), count(p, 'task-result'))
 })
 
-test('refresh view failure still saves and delivers effects; no handler rerun or timer stop', () => {
+test('refresh view failure still saves and delivers effects; no handler rerun or timer stop', async () => {
   const p = probe()
-  p.actor.initialize(programs.refreshed, options())
-  p.actor.dispatch('breakView', number(1), false)
+  await p.actor.initialize(programs.refreshed, options())
+  await p.actor.dispatch('breakView', number(1), false)
   p.reset()
-  p.actor.runWidgetRefresh()
-  assert.deepEqual(sequence(p), ['widgetRefresh', 'snapshot', 'view', 'ui-error:VIEW', 'save', 'saved', 'effect:refresh'])
-  assert.equal(p.state().n, 22)
-  assert.equal(p.state().refreshes, 2)
+  await p.actor.runWidgetRefresh()
+  assert.deepEqual(sequence(p), ['widgetRefresh', 'save', 'snapshot', 'effect:refresh', 'saved', 'view', 'ui-error:VIEW'])
+  assert.equal((await p.state()).n, 22)
+  assert.equal((await p.state()).refreshes, 2)
   assert.equal(count(p, 'stop'), 0)
 })
 
 const worldEvent = (kind, speed = 0) => sceneEventValue(kind, 'body', '', 0, 0, 0, speed, [], [])
 
-test('world build decodes actor state with effects disabled, propagates traps and is inert when unavailable', () => {
+test('world build decodes actor state with effects disabled, propagates traps and is inert when unavailable', async () => {
   const p = probe()
   assert.deepEqual(p.actor.buildScene('build'), new WorldSpec())
-  p.actor.initialize(programs.world, options())
+  await p.actor.initialize(programs.world, options())
   p.reset()
-  const before = p.actor.snapshot()
+  const before = (await p.actor.snapshot())
   const scene = p.actor.buildScene('build')
   assert(scene instanceof WorldSpec)
   assert.deepEqual(scene.bodies[0].position, [1, 2, 3])
   assert.equal(scene.bodies[0].id, 'body')
   assert(scene.floor)
   assert.deepEqual(sequence(p), ['build'])
-  assert.equal(p.actor.snapshot(), before)
-  assert.throws(() => p.actor.buildScene('buildEffect'), /sdk.call may only be called from a handler/)
+  assert.equal((await p.actor.snapshot()), before)
+  assert.throws(() => p.actor.buildScene('buildEffect'), /sdk.call is unavailable during pure execution/)
   assert.throws(() => p.actor.buildScene('buildTrap'))
   assert.throws(() => p.actor.buildScene('buildInvalid'), /at most one scene.floor/)
   assert.deepEqual(p.actor.buildScene(''), new WorldSpec())
   assert.equal(p.effects.length + p.frames.length + p.snapshots.length, 0)
   noIo(p)
-  p.actor.dispatch('recover', number(1))
+  await p.actor.dispatch('recover', number(1))
   assert.equal(p.effects.length, 0)
   assert.equal(p.actor.buildScene('build').bodies[0].position[0], 2)
-  p.actor.initialize(programs.world, options('PREVIEW'))
+  await p.actor.initialize(programs.world, options('PREVIEW'))
   p.reset()
   assert.equal(p.actor.buildScene('build').bodies[0].position[0], 1)
-  p.actor.dispatch('worldEvent', worldEvent('hit', 3), false, 'WORLD', true)
+  await p.actor.dispatch('worldEvent', worldEvent('hit', 3), false, 'WORLD', true)
   assert.equal(p.actor.worldDirty(), false)
-  assert.equal(p.actor.worldSave(now + 5000, false, true), 'NOT_DUE')
-  p.actor.dispose()
+  assert.equal(await p.actor.worldSave(now + 5000, false, true), 'NOT_DUE')
+  await p.actor.dispose()
   assert.deepEqual(p.actor.buildScene('build'), new WorldSpec())
 })
 
-test('unchanged world handlers drain effects without snapshot/render/save; encoded equality detects in-place changes', () => {
+test('world effects commit before publication even for unchanged handlers; encoded equality detects in-place changes', async () => {
   const p = probe()
-  p.actor.initialize(programs.world, options())
+  await p.actor.initialize(programs.world, options())
   p.reset()
-  p.actor.dispatch('worldEvent', worldEvent('tap'), true, 'WORLD', true)
-  assert.deepEqual(sequence(p), ['worldEvent', 'effect:world'])
+  await p.actor.dispatch('worldEvent', worldEvent('tap'), true, 'WORLD', true)
+  assert.deepEqual(sequence(p), ['worldEvent', 'save', 'snapshot', 'effect:world', 'saved', 'view', 'frame'])
   assert.equal(p.actor.worldDirty(), false)
   p.reset()
-  p.actor.dispatch('worldCopy', number(0), true, 'WORLD', true)
-  assert.deepEqual(sequence(p), ['worldCopy'])
+  await p.actor.dispatch('worldCopy', number(0), true, 'WORLD', true)
+  assert.deepEqual(sequence(p), ['worldCopy', 'save', 'snapshot', 'saved'])
   p.reset()
-  p.actor.dispatch('worldEvent', worldEvent('hit', 2), false, 'WORLD', true)
-  assert.deepEqual(sequence(p), ['worldEvent', 'snapshot', 'view', 'frame', 'effect:world'])
-  assert.equal(p.state().n, 3)
-  assert.equal(p.actor.worldDirty(), true)
-  noIo(p)
-  p.reset()
-  p.actor.dispatch('worldEvent', worldEvent('hit'), false, 'WORLD', true)
-  assert.deepEqual(sequence(p), ['worldEvent', 'effect:world'])
-  assert.equal(p.actor.worldDirty(), true)
-  p.reset()
-  p.actor.dispatch('worldEvent', worldEvent('settled'), true, 'WORLD', true)
-  assert.deepEqual(sequence(p), ['worldEvent', 'save', 'saved', 'effect:world'])
+  await p.actor.dispatch('worldEvent', worldEvent('hit', 2), false, 'WORLD', true)
+  assert.deepEqual(sequence(p), ['worldEvent', 'save', 'snapshot', 'effect:world', 'saved', 'view', 'frame'])
+  assert.equal((await p.state()).n, 3)
   assert.equal(p.actor.worldDirty(), false)
-  assert.equal(stateOf(store.loadState('project', 'version', programs.world.stamp)).n, 3)
+  assert.equal(count(p, 'task-submit'), count(p, 'task-result'))
   p.reset()
-  p.actor.dispatch('worldCopy', number(0))
-  assert.deepEqual(sequence(p), ['worldCopy', 'snapshot', 'view', 'frame', 'save', 'saved'])
+  await p.actor.dispatch('worldEvent', worldEvent('hit'), false, 'WORLD', true)
+  assert.deepEqual(sequence(p), ['worldEvent', 'save', 'snapshot', 'effect:world', 'saved', 'view', 'frame'])
+  assert.equal(p.actor.worldDirty(), false)
+  p.reset()
+  await p.actor.dispatch('worldEvent', worldEvent('settled'), true, 'WORLD', true)
+  assert.deepEqual(sequence(p), ['worldEvent', 'save', 'snapshot', 'effect:world', 'saved', 'view', 'frame'])
+  assert.equal(p.actor.worldDirty(), false)
+  assert.equal(stateOf(await store.loadState('project', 'version', programs.world.stamp)).n, 3)
+  p.reset()
+  await p.actor.dispatch('worldCopy', number(0))
+  assert.deepEqual(sequence(p), ['worldCopy', 'save', 'snapshot', 'saved', 'view', 'frame'])
   noErrors(p)
 })
 
-test('world save shares the 5000ms gate, defers drafts, bypasses time when stopping and never snapshots', () => {
+test('world save shares the 5000ms gate, defers drafts, bypasses time when stopping and publishes committed snapshots', async () => {
   const p = probe()
-  p.actor.initialize(programs.world, options())
+  await p.actor.initialize(programs.world, options())
   p.actor.beginSurfaceLoop(now)
-  assert.equal(p.actor.worldSave(now + 6000, false, true), 'NOT_DUE')
-  p.actor.dispatch('worldEvent', worldEvent('hit', 2), false, 'WORLD', true)
+  assert.equal(await p.actor.worldSave(now + 6000, false, true), 'NOT_DUE')
+  await p.actor.dispatch('recover', number(2), false, 'WORLD', true)
   p.reset()
-  assert.equal(p.actor.worldSave(now + 4999, false, false), 'NOT_DUE')
-  assert.equal(p.actor.worldSave(now + 5000, true, false), 'DEFERRED')
-  assert.equal(p.actor.worldSave(now + 5000, true, true), 'DEFERRED')
+  assert.equal(await p.actor.worldSave(now + 4999, false, false), 'NOT_DUE')
+  assert.equal(await p.actor.worldSave(now + 5000, true, false), 'DEFERRED')
+  assert.equal(await p.actor.worldSave(now + 5000, true, true), 'DEFERRED')
   assert.deepEqual(p.events, [])
   assert.equal(p.actor.worldDirty(), true)
-  assert.equal(p.actor.worldSave(now + 5000, false, false), 'DONE')
-  assert.deepEqual(sequence(p), ['save', 'saved'])
+  assert.equal(await p.actor.worldSave(now + 5000, false, false), 'DONE')
+  assert.deepEqual(sequence(p), ['save', 'snapshot', 'saved'])
   assert.equal(p.actor.worldDirty(), false)
-  p.actor.dispatch('worldEvent', worldEvent('hit', 3), false, 'WORLD', true)
+  await p.actor.dispatch('recover', number(3), false, 'WORLD', true)
   p.reset()
-  assert.equal(p.actor.surfaceSave(now + 9999, false), 'NOT_DUE')
-  assert.equal(p.actor.worldSave(now + 9999, false, false), 'NOT_DUE')
-  assert.equal(p.actor.worldSave(now + 9999, false, true), 'DONE')
-  assert.deepEqual(sequence(p), ['save', 'saved'])
-  assert.equal(stateOf(store.loadState('project', 'version', programs.world.stamp)).n, 6)
+  assert.equal(await p.actor.surfaceSave(now + 9999, false), 'NOT_DUE')
+  assert.equal(await p.actor.worldSave(now + 9999, false, false), 'NOT_DUE')
+  assert.equal(await p.actor.worldSave(now + 9999, false, true), 'DONE')
+  assert.deepEqual(sequence(p), ['save', 'snapshot', 'saved'])
+  assert.equal(stateOf(await store.loadState('project', 'version', programs.world.stamp)).n, 6)
   assert.equal(p.actor.worldDirty(), false)
 })
 
-test('failed world persistence retains dirty state and deadline for immediate retries and unchanged saving events', () => {
+test('failed world persistence retains dirty state and deadline for immediate retries and unchanged saving events', async () => {
   for (const stage of ['open', 'write', 'close', 'rename']) {
     disk.clear()
     const p = probe()
-    p.actor.initialize(programs.world, options())
-    assert.equal(p.actor.persistState(), true)
+    await p.actor.initialize(programs.world, options())
+    assert.equal(await p.actor.persistState(), true)
     const saved = disk.get(stateFile())
     p.actor.beginSurfaceLoop(now)
-    p.actor.dispatch('worldEvent', worldEvent('hit', 2), false, 'WORLD', true)
+    await p.actor.dispatch('recover', number(2), false, 'WORLD', true)
     p.reset()
     failure = stage
-    assert.equal(p.actor.worldSave(now + 5000, false, false), 'ERROR')
+    if (stage === 'write' || stage === 'close') assert.equal(await p.actor.worldSave(now + 5000, false, false), 'ERROR')
+    else await assert.rejects(p.actor.worldSave(now + 5000, false, false), /STATE_/)
     assert.equal(p.actor.worldDirty(), true)
     assert.equal(disk.get(stateFile()), saved)
     assert.equal(p.snapshots.length + p.frames.length + count(p, 'saved'), 0)
-    p.actor.dispatch('worldEvent', worldEvent('settled'), true, 'WORLD', true)
+    assert(p.events.some(e => e.type === 'task-result' && e.reply.result?.status === 'FAILED'))
+    assert.equal(count(p, 'task-submit'), count(p, 'task-result'))
+    await assert.rejects(p.actor.dispatch('worldEvent', worldEvent('settled'), true, 'WORLD', true), /STATE_/)
     assert.equal(p.actor.worldDirty(), true)
-    assert.deepEqual(sequence(p), ['worldEvent', 'effect:world'])
+    assert.equal(p.effects.length + p.snapshots.length + p.frames.length, 0)
     failure = ''
+    if (stage === 'close') for (const fd of [...worker.memory.fds.keys()]) worker.memory.closeSync(fd)
     p.reset()
-    assert.equal(p.actor.worldSave(now + 5000, false, false), 'DONE')
+    assert.equal(await p.actor.worldSave(now + 5000, false, false), 'DONE')
     assert.equal(p.actor.worldDirty(), false)
-    assert.deepEqual(sequence(p), ['save', 'saved'])
+    assert.deepEqual(sequence(p), ['save', 'snapshot', 'saved'])
     noErrors(p)
   }
 })
 
-test('world dirty clears on any successful persist, initialization and dispose, but not on unavailable persistence', () => {
+test('world dirty clears on any successful persist, initialization and dispose, but not on unavailable persistence', async () => {
   const p = probe()
   assert.equal(p.actor.worldDirty(), false)
-  assert.equal(p.actor.worldSave(now, false, true), 'NOT_DUE')
-  assert.equal(p.actor.persistState(), false)
+  assert.equal(await p.actor.worldSave(now, false, true), 'NOT_DUE')
+  assert.equal(await p.actor.persistState(), false)
   for (const opts of [options('LIVE_EPHEMERAL', ''), options('LIVE_PERSISTENT', 'invalid')]) {
-    p.actor.initialize(programs.world, opts)
-    p.actor.dispatch('worldEvent', worldEvent('hit', 2), false, 'WORLD', true)
+    if (opts.mode === 'LIVE_PERSISTENT') {
+      const q = probe()
+      await assert.rejects(q.actor.initialize(programs.world, opts), /Invalid project state identity/)
+      assert.equal(q.actor.ready(), false)
+      assert.equal(q.actor.worldDirty(), false)
+      continue
+    }
+    await p.actor.initialize(programs.world, opts)
+    await p.actor.dispatch('recover', number(2), false, 'WORLD', true)
     p.reset()
-    assert.equal(p.actor.worldSave(now, false, true), 'ERROR')
-    assert.equal(p.actor.worldDirty(), true)
-    assert.equal(p.actor.persistState(), false)
-    assert.equal(p.actor.worldDirty(), true)
+    assert.equal(await p.actor.worldSave(now, false, true), 'NOT_DUE')
+    assert.equal(p.actor.worldDirty(), false)
+    assert.equal(await p.actor.persistState(), false)
     noIo(p)
   }
-  p.actor.initialize(programs.world, options())
+  records = p.events
+  await p.actor.initialize(programs.world, options())
   assert.equal(p.actor.worldDirty(), false)
-  p.actor.dispatch('worldEvent', worldEvent('hit', 2), false, 'WORLD', true)
-  assert.equal(p.actor.persistState(), true)
+  await p.actor.dispatch('recover', number(2), false, 'WORLD', true)
+  assert.equal(p.actor.worldDirty(), true)
+  assert.equal(await p.actor.persistState(), true)
   assert.equal(p.actor.worldDirty(), false)
-  p.actor.dispatch('worldEvent', worldEvent('hit', 2), false, 'WORLD', true)
-  p.actor.dispatch('recover', number(1))
+  await p.actor.dispatch('worldEvent', worldEvent('hit', 2), false, 'WORLD', true)
+  await p.actor.dispatch('recover', number(1))
   assert.equal(p.actor.worldDirty(), false)
-  p.actor.dispatch('worldEvent', worldEvent('hit', 2), false, 'WORLD', true)
-  p.actor.dispose()
+  await p.actor.dispatch('worldEvent', worldEvent('hit', 2), false, 'WORLD', true)
+  await p.actor.dispose()
   assert.equal(p.actor.worldDirty(), false)
-  assert.equal(p.actor.worldSave(now + 6000, false, true), 'NOT_DUE')
+  await assert.rejects(p.actor.worldSave(now + 6000, false, true), /STATE_UNAVAILABLE/)
 })
 
-test('surface frame handlers execute in caller order; effects precede explicit UI draw/view and periodic save/snapshot', () => {
+test('surface frame handlers execute in caller order; effects precede explicit UI draw/view and periodic save/snapshot', async () => {
   const p = probe()
-  p.actor.initialize(programs.basic, options())
+  await p.actor.initialize(programs.basic, options())
   p.actor.beginSurfaceLoop(now)
   p.reset()
   now += 5000
-  p.actor.frameHandlers(['frameA', '', 'frameB'], 16)
-  assert.deepEqual(sequence(p), ['frameA', 'frameB', 'effect:frameA', 'effect:frameB'])
-  assert.equal(p.state().n, 112)
-  assert.deepEqual(p.state().marks, [16, 16])
-  assert.equal(p.snapshots.length + p.frames.length, 0)
+  await p.actor.frameHandlers(['frameA', '', 'frameB'], 16)
+  assert.deepEqual(sequence(p), ['save', 'snapshot', 'effect:frameA', 'effect:frameB', 'saved'])
+  assert.equal((await p.state()).n, 112)
+  assert.deepEqual((await p.state()).marks, [16, 16])
+  assert.equal(p.snapshots.length, 1)
+  assert.equal(p.frames.length, 0)
+  assert.equal(count(p, 'task-submit'), count(p, 'task-result'))
   assert(p.actor.viewDue(now))
   assert.equal(p.paint()[0].x, 112)
   p.render(false)
-  assert.equal(p.actor.surfaceSave(now, false), 'DONE')
-  assert.deepEqual(sequence(p), ['frameA', 'frameB', 'effect:frameA', 'effect:frameB', 'draw', 'draw', 'view', 'frame', 'save', 'saved', 'snapshot'])
+  assert.equal(await p.actor.surfaceSave(now, false), 'NOT_DUE')
+  assert.deepEqual(sequence(p), ['save', 'snapshot', 'effect:frameA', 'effect:frameB', 'saved', 'draw', 'draw', 'view', 'frame'])
   assert(!p.frames[0].paint && !p.frames[0].reveal)
   assert.equal(stateOf(p.snapshots[0]).n, 112)
   noErrors(p)
 })
 
-test('surface move effects precede UI drawing, with no actor render, snapshot or durable save', () => {
+test('surface move effects precede UI drawing, with no actor render, snapshot or durable save', async () => {
   const p = probe()
-  p.actor.initialize(programs.basic, options())
+  await p.actor.initialize(programs.basic, options())
   p.reset()
-  p.actor.move('pointer', pointerValue('move', 2, 3, 4))
-  assert.deepEqual(sequence(p), ['pointer', 'effect:pointer'])
-  assert.equal(p.state().n, 10)
-  assert.equal(p.state().calls, 1)
-  assert.equal(p.snapshots.length + p.frames.length, 0)
-  noIo(p)
+  await p.actor.move('pointer', pointerValue('move', 2, 3, 4))
+  assert.deepEqual(sequence(p), ['save', 'snapshot', 'effect:pointer', 'saved'])
+  assert.equal((await p.state()).n, 10)
+  assert.equal((await p.state()).calls, 1)
+  assert.equal(p.snapshots.length, 1)
+  assert.equal(p.frames.length, 0)
+  assert.equal(count(p, 'task-submit'), count(p, 'task-result'))
   p.paint()
-  assert.deepEqual(sequence(p), ['pointer', 'effect:pointer', 'draw', 'draw'])
+  assert.deepEqual(sequence(p), ['save', 'snapshot', 'effect:pointer', 'saved', 'draw', 'draw'])
   now += 100
   assert(p.actor.viewDue(now))
   p.render(false)
   assert.equal(p.frames[0].root.text, 'n=10')
-  noIo(p)
+  assert.equal(count(p, 'save'), 1)
+  assert.equal(count(p, 'saved'), 1)
 })
 
-test('frame and move traps propagate for caller reporting, suppress effects and retain partial mutation', () => {
+test('frame and move traps propagate for caller reporting, suppress effects and retain partial mutation', async () => {
   for (const kind of ['FRAME', 'MOVE']) {
     disk.clear()
     const p = probe()
-    p.actor.initialize(programs.basic, options())
+    await p.actor.initialize(programs.basic, options())
     p.reset()
     let trapped
     try {
-      if (kind === 'FRAME') p.actor.frameHandlers(['frameA', 'fail', 'frameB'], 4)
-      else p.actor.move('fail', number(4))
+      if (kind === 'FRAME') await p.actor.frameHandlers(['frameA', 'fail', 'frameB'], 4)
+      else await p.actor.move('fail', number(4))
     } catch (e) {
       trapped = e
-      p.error(kind, e.message)
     }
-    assert(trapped && trapped.trapCode)
-    assert.deepEqual(entries(p), kind === 'FRAME' ? ['frameA', 'fail'] : ['fail'])
-    assert.deepEqual(sequence(p).slice(-2), ['ui-error:' + kind, 'stop:' + kind])
-    assert.equal(p.state().n, kind === 'FRAME' ? 15 : 5)
-    assert.equal(p.state().calls, kind === 'FRAME' ? 2 : 1)
+    assert(trapped && /array index out of bounds/.test(trapped.message))
+    assert.equal(count(p, 'ui-error'), 1)
+    assert.deepEqual(sequence(p).slice(-2), ['ui-error:handler', 'stop:handler'])
+    assert.equal((await p.state()).n, 1)
+    assert.equal((await p.state()).calls, 0)
+    assert.deepEqual((await p.state()).marks, [])
     assert.equal(p.snapshots.length + p.frames.length + p.effects.length + count(p, 'save'), 0)
     p.reset()
-    p.actor.dispatch('recover', number(1))
+    await p.actor.dispatch('recover', number(1))
     assert.equal(p.effects.length, 0)
   }
 })
 
-test('view cadence boundary and surface edit gate defer without advancing save deadline', () => {
+test('view cadence boundary and surface edit gate defer without advancing save deadline', async () => {
   const p = probe()
-  p.actor.initialize(programs.basic, options())
+  await p.actor.initialize(programs.basic, options())
   assert.equal(p.actor.viewDue(now + 99), false)
   assert.equal(p.actor.viewDue(now + 100), true)
   now += 100
@@ -1037,96 +1095,121 @@ test('view cadence boundary and surface edit gate defer without advancing save d
   assert.equal(p.actor.viewDue(now + 100), true)
   p.actor.beginSurfaceLoop(now)
   p.reset()
-  p.actor.frameHandlers(['frameA'], 16)
+  await p.actor.move('recover', number(10))
   p.reset()
-  assert.equal(p.actor.surfaceSave(now + 4999, false), 'NOT_DUE')
-  assert.equal(p.actor.surfaceSave(now + 5000, true), 'DEFERRED')
-  assert.equal(p.actor.surfaceSave(now + 9000, true), 'DEFERRED')
+  assert.equal(await p.actor.surfaceSave(now + 4999, false), 'NOT_DUE')
+  assert.equal(await p.actor.surfaceSave(now + 5000, true), 'DEFERRED')
+  assert.equal(await p.actor.surfaceSave(now + 9000, true), 'DEFERRED')
   assert.deepEqual(p.events, [])
-  assert.equal(p.actor.surfaceSave(now + 9000, false), 'DONE')
-  assert.deepEqual(sequence(p), ['save', 'saved', 'snapshot'])
+  assert.equal(await p.actor.surfaceSave(now + 9000, false), 'DONE')
+  assert.deepEqual(sequence(p), ['save', 'snapshot', 'saved'])
   assert.equal(stateOf(p.snapshots[0]).n, 11)
   p.reset()
-  assert.equal(p.actor.surfaceSave(now + 13999, false), 'NOT_DUE')
-  assert.equal(p.actor.surfaceSave(now + 14000, false), 'DONE')
+  assert.equal(await p.actor.surfaceSave(now + 13999, false), 'NOT_DUE')
+  assert.equal(await p.actor.surfaceSave(now + 14000, false), 'NOT_DUE')
+  await p.actor.move('recover', number(0))
   p.actor.beginSurfaceLoop(now + 15000)
   p.reset()
-  assert.equal(p.actor.surfaceSave(now + 19999, false), 'NOT_DUE')
+  assert.equal(await p.actor.surfaceSave(now + 19999, false), 'NOT_DUE')
   assert.deepEqual(p.events, [])
-  assert.equal(p.actor.surfaceSave(now + 20000, false), 'DONE')
+  assert.equal(await p.actor.surfaceSave(now + 20000, false), 'DONE')
 })
 
-test('failed surface save publishes no snapshot, retains deadline and retries immediately', () => {
+test('failed surface save publishes no snapshot, retains deadline and retries immediately', async () => {
   const p = probe()
-  p.actor.initialize(programs.basic, options())
-  p.actor.persistState()
+  await p.actor.initialize(programs.basic, options())
+  await p.actor.persistState()
   const saved = disk.get(stateFile())
   p.actor.beginSurfaceLoop(now)
-  p.actor.frameHandlers(['frameA'], 16)
+  await p.actor.move('recover', number(10))
   p.reset()
   failure = 'rename'
-  assert.equal(p.actor.surfaceSave(now + 5000, false), 'NOT_SAVED')
+  await assert.rejects(p.actor.surfaceSave(now + 5000, false), /STATE_PUBLISH_FAILED/)
   failure = ''
-  assert.deepEqual(sequence(p), [])
+  assert.deepEqual(sequence(p), ['ui-error:state', 'stop:state'])
   assert.equal(p.snapshots.length, 0)
   assert.equal(count(p, 'save-attempt'), 1)
   assert.equal(count(p, 'saved'), 0)
   assert.equal(disk.get(stateFile()), saved)
-  assert(p.events.some(e => e.type === 'log-error' && e.message.includes('save failed')))
-  noErrors(p)
+  assert(p.events.some(e => e.type === 'task-result' && e.reply.result?.status === 'FAILED'))
+  assert.equal(count(p, 'task-submit'), count(p, 'task-result'))
+  assert.equal(count(p, 'ui-error'), 1)
   p.reset()
-  assert.equal(p.actor.surfaceSave(now + 5000, false), 'DONE')
-  assert.deepEqual(sequence(p), ['save', 'saved', 'snapshot'])
+  assert.equal(await p.actor.surfaceSave(now + 5000, false), 'DONE')
+  assert.deepEqual(sequence(p), ['save', 'snapshot', 'saved'])
   assert.equal(stateOf(p.snapshots[0]).n, 11)
-  assert.equal(stateOf(store.loadState('project', 'version', programs.basic.stamp)).n, 11)
+  assert.equal(stateOf(await store.loadState('project', 'version', programs.basic.stamp)).n, 11)
   p.reset()
-  assert.equal(p.actor.surfaceSave(now + 9999, false), 'NOT_DUE')
+  assert.equal(await p.actor.surfaceSave(now + 9999, false), 'NOT_DUE')
   assert.deepEqual(p.events, [])
-  assert.equal(p.actor.surfaceSave(now + 10000, false), 'DONE')
-  assert.deepEqual(sequence(p), ['save', 'saved', 'snapshot'])
+  assert.equal(await p.actor.surfaceSave(now + 10000, false), 'NOT_DUE')
+  assert.deepEqual(sequence(p), [])
+  await p.actor.move('recover', number(0))
+  assert.equal(await p.actor.surfaceSave(now + 10000, false), 'DONE')
+  assert.deepEqual(sequence(p), ['save', 'snapshot', 'saved'])
 })
 
-test('ephemeral and malformed-key periodic saves return NOT_SAVED without snapshot or IO', () => {
+test('ephemeral periodic saves are not due and malformed persistent keys reject before publication', async () => {
   for (const opts of [options('LIVE_EPHEMERAL', ''), options('LIVE_PERSISTENT', ''), options('LIVE_PERSISTENT', 'invalid'), options('LIVE_PERSISTENT', '/version')]) {
     const p = probe()
-    p.actor.initialize(programs.basic, opts)
+    if (opts.mode === 'LIVE_PERSISTENT') {
+      await assert.rejects(p.actor.initialize(programs.basic, opts), /Invalid project state identity/)
+      assert.equal(p.actor.ready(), false)
+      assert.equal(p.snapshots.length + p.frames.length + p.effects.length + count(p, 'save'), 0)
+      assert.equal(count(p, 'task-submit'), count(p, 'task-result'))
+      continue
+    }
+    await p.actor.initialize(programs.basic, opts)
     p.actor.beginSurfaceLoop(now)
     p.reset()
-    p.actor.frameHandlers(['frameA'], 16)
-    assert.equal(p.actor.surfaceSave(now + 5000, false), 'NOT_SAVED')
-    assert.equal(p.actor.surfaceSave(now + 5000, false), 'NOT_SAVED')
-    assert.equal(p.snapshots.length, 0)
-    assert.equal(p.state().n, 11)
+    await p.actor.frameHandlers(['frameA'], 16)
+    assert.equal(await p.actor.surfaceSave(now + 5000, false), 'NOT_DUE')
+    assert.equal(await p.actor.surfaceSave(now + 5000, false), 'NOT_DUE')
+    assert.equal(p.snapshots.length, 1)
+    assert.equal((await p.state()).n, 11)
     noIo(p)
   }
 })
 
-test('real ProjectStore roundtrip retains legacy stamp/value object and failure leaves previous atomic record', () => {
+test('real ProjectStore TaskPool roundtrip retains Format 2 identity and refusal leaves previous atomic record', async () => {
   const other = new ProjectStore()
   other.init('/actor-fixture')
   const encoded = edited(fresh, { n: 23 })
-  other.saveState('roundtrip', 'version', programs.basic.stamp, encoded)
+  const p = probe()
+  await p.actor.initialize(programs.basic, options('LIVE_PERSISTENT', 'roundtrip/version', encoded))
   const file = stateFile('roundtrip/version')
   const payload = JSON.parse(disk.get(file))
-  assert.deepEqual(Object.keys(payload).sort(), ['stamp', 'value'])
-  assert(Array.isArray(payload.value))
+  assert.deepEqual(Object.keys(payload), ['format', 'appId', 'schemaVersion', 'vmGeneration', 'revision', 'payloadLength', 'payloadHash', 'stamp', 'value'])
+  assert.equal(payload.format, 2)
+  assert.equal(payload.appId, 'roundtrip/version')
+  assert.equal(payload.revision, 1)
   assert.deepEqual(payload.value, JSON.parse(encoded))
   assert.equal(payload.stamp, programs.basic.stamp)
-  assert.equal(store.loadState('roundtrip', 'version', programs.basic.stamp), encoded)
-  assert.equal(other.loadState('roundtrip', 'version', 'wrong-stamp'), '')
+  assert.equal(await store.loadState('roundtrip', 'version', programs.basic.stamp), encoded)
+  assert.equal(await other.loadState('roundtrip', 'version', 'wrong-stamp'), '')
   const previous = disk.get(file)
   for (const stage of ['open', 'write', 'close', 'rename']) {
+    p.reset()
     failure = stage
-    assert.throws(() => other.saveState('roundtrip', 'version', programs.basic.stamp, edited(fresh, { n: 99 })), /fixture .* failed/)
+    await assert.rejects(p.actor.dispatch('change', number(76)), /STATE_/)
     failure = ''
+    if (stage === 'close') for (const fd of [...worker.memory.fds.keys()]) worker.memory.closeSync(fd)
     assert.equal(disk.get(file), previous)
-    assert.equal(store.loadState('roundtrip', 'version', programs.basic.stamp), encoded)
+    assert.equal((await p.state()).n, 23)
+    assert.equal(p.snapshots.length + p.frames.length + p.effects.length, 0)
+    assert(p.events.some(e => e.type === 'task-result' && e.reply.result?.status === 'FAILED'))
+    assert.equal(count(p, 'task-submit'), count(p, 'task-result'))
+    assert.equal(await store.loadState('roundtrip', 'version', programs.basic.stamp), encoded)
     assert(![...disk.keys()].some(key => key.endsWith('.tmp')))
   }
-  assert.throws(() => other.saveState('roundtrip', 'version', programs.basic.stamp, '{broken'), SyntaxError)
+  await p.actor.dispose()
+  const q = probe()
+  await assert.rejects(q.actor.initialize(programs.basic, options('LIVE_PERSISTENT', 'roundtrip/invalid', '{broken')))
+  assert.equal(q.snapshots.length + q.frames.length + q.effects.length + count(q, 'save'), 0)
+  assert.equal(disk.has(stateFile('roundtrip/invalid')), false)
   assert.equal(disk.get(file), previous)
-  other.clearState('roundtrip', 'version')
-  assert.equal(other.loadState('roundtrip', 'version', programs.basic.stamp), '')
+  await other.clearState('roundtrip', 'version')
+  assert.equal(await other.loadState('roundtrip', 'version', programs.basic.stamp), '')
 })
 
 const format2 = load(path.join(root, 'runtime/StateFormat.ets'))
@@ -1134,7 +1217,7 @@ const codec = vera('VeraInterpreter')
 const stateMeta = { appId: 'format/version', schemaVersion: 1, vmGeneration: 3, revision: 7, stamp: 'program-λ😀' }
 const corruptState = run => assert.throws(run, error => error.code === 'STATE_CORRUPTED')
 
-test('Format 2 roundtrip preserves tagged insertion order, arrays and class identity with SHA-256 over UTF-8', () => {
+test('Format 2 roundtrip preserves tagged insertion order, arrays and class identity with SHA-256 over UTF-8', async () => {
   const entries = [['10', ['n', -0]], ['2', ['s', 'λ😀\u0000\\\"']], ['é', ['b', true]],
     ['é', ['z']], ['😀', ['a', [['n', 2], ['n', 1]]]]]
   const value = codec.decodeRuntimeValue(['o', 'AppState#identity', entries])
@@ -1165,7 +1248,7 @@ test('Format 2 roundtrip preserves tagged insertion order, arrays and class iden
   }
 })
 
-test('canonical JSON explicitly sorts properties by UTF-16 but never sorts tagged fields or ordinary arrays', () => {
+test('canonical JSON explicitly sorts properties by UTF-16 but never sorts tagged fields or ordinary arrays', async () => {
   const pairs = [['10', 10], ['2', 2], ['é', 3], ['😀', 4], ['\ue000', 5], ['a', -0]]
   const expected = '{"10":10,"2":2,"a":0,"é":3,"😀":4,"\ue000":5}'
   assert.equal(format2.canonicalPayload(Object.fromEntries(pairs)), expected)
@@ -1180,7 +1263,7 @@ test('canonical JSON explicitly sorts properties by UTF-16 but never sorts tagge
   assert.equal(format2.canonicalPayload([shared, shared]), '[[1],[1]]')
 })
 
-test('Format 2 detects payload, stamp, length, schema, identity, counter and header corruption', () => {
+test('Format 2 detects payload, stamp, length, schema, identity, counter and header corruption', async () => {
   const text = format2.encodeStateFile(stateMeta, codec.decodeRuntimeValue(['s', 'safe']))
   for (const [from, to] of [
     ['"safe"', '"evil"'], ['program-λ😀', 'program-λ😈'], ['"format":2', '"format":3'],
@@ -1208,7 +1291,7 @@ test('Format 2 detects payload, stamp, length, schema, identity, counter and hea
   assert.throws(() => format2.encodeStateFile(stateMeta, new codec.FunctionValue('f', [])), error => error.code === 'STATE_VALIDATION_FAILED')
 })
 
-test('header scanner stops before payload and requests full read for oversized or split headers', () => {
+test('header scanner stops before payload and requests full read for oversized or split headers', async () => {
   const text = format2.encodeStateFile(stateMeta, new codec.VeraStringValue('x'.repeat(4096)))
   const prefix = text.slice(0, format2.STATE_HEADER_WINDOW_BYTES)
   const header = format2.readStateHeader(prefix)
@@ -1226,7 +1309,7 @@ test('header scanner stops before payload and requests full read for oversized o
   corruptState(() => format2.readStateHeader(large.slice(0, 1024), true))
 })
 
-test('Format 2 validates hashes against literal payload bytes rather than reserialized JSON', () => {
+test('Format 2 validates hashes against literal payload bytes rather than reserialized JSON', async () => {
   const payload = '["s","\\u03bb"]'
   const text = format2.assembleStateFile(stateMeta, payload)
   const decoded = format2.decodeStateFile(text, stateMeta.appId)
@@ -1247,18 +1330,18 @@ test('Format 2 validates hashes against literal payload bytes rather than reseri
   } finally { cryptoFailure = null; cryptoFailureStage = 'create' }
 })
 
-test('Format 2 and old ProjectStore alternate without state loss; legacy counters are zero and backup is ignored', () => {
+test('Format 2 and old ProjectStore alternate without state loss; legacy counters are zero and backup is ignored', async () => {
   const value = codec.decodeRuntimeValue(JSON.parse(edited(fresh, { n: 23 })))
   const meta = { ...stateMeta, appId: 'roundtrip/version', stamp: programs.basic.stamp }
   const file = stateFile(meta.appId)
   disk.set(file, format2.encodeStateFile(meta, value))
-  const oldRead = store.loadState('roundtrip', 'version', meta.stamp)
+  const oldRead = await store.loadState('roundtrip', 'version', meta.stamp)
   assert.deepEqual(JSON.parse(oldRead), codec.encodeRuntimeValue(value))
   const mismatch = format2.decodeStateFile(disk.get(file), meta.appId)
   assert.equal(mismatch.stamp, meta.stamp)
   assert.equal(mismatch.revision, meta.revision)
-  assert.equal(store.loadState('roundtrip', 'version', 'new-program'), '')
-  store.saveState('roundtrip', 'version', meta.stamp, oldRead)
+  assert.equal(await store.loadState('roundtrip', 'version', 'new-program'), '')
+  disk.set(file, JSON.stringify({ stamp: meta.stamp, value: JSON.parse(oldRead) }))
   disk.set(file + '.bak', 'invalid stale backup')
   const legacy = format2.decodeStateFile(disk.get(file), meta.appId)
   assert.equal(legacy.format, 'LEGACY')
@@ -1266,8 +1349,17 @@ test('Format 2 and old ProjectStore alternate without state loss; legacy counter
   assert.equal(legacy.revision, 0)
   assert.equal(legacy.ignoreBackup, true)
   assert.deepEqual(codec.encodeRuntimeValue(legacy.value), codec.encodeRuntimeValue(value))
-  const restored = format2.encodeStateFile({ ...meta, vmGeneration: 1, revision: 1 }, legacy.value)
-  assert.equal(format2.decodeStateFile(restored, meta.appId).revision, 1)
+  const p = probe()
+  await p.actor.initialize(programs.basic, options('LIVE_PERSISTENT', meta.appId))
+  const restored = format2.decodeStateFile(disk.get(file), meta.appId)
+  assert.equal(restored.format, 'FORMAT2')
+  assert.equal(restored.revision, 0)
+  assert(restored.vmGeneration > 0)
+  assert.equal(await p.actor.snapshot(), oldRead)
+  assert.equal(count(p, 'publication'), 1)
+  assert.equal(count(p, 'save'), 0)
+  assert.equal(count(p, 'task-submit'), count(p, 'task-result'))
+  await p.actor.dispose()
   for (const bad of [null, {}, ['n'], ['n', null], ['n', '1'], ['s', 3], ['b', 1], ['z', 1],
     ['a', {}], ['o', 1, []], ['o', 'C', [['x', ['z']], ['x', ['z']]]], ['o', 'C', [['x']]], ['f', 'fn']]) {
     corruptState(() => format2.decodeStateFile(JSON.stringify({ stamp: meta.stamp, value: bad }), meta.appId))
@@ -1277,42 +1369,44 @@ test('Format 2 and old ProjectStore alternate without state loss; legacy counter
   }
 })
 
-test('actors own independent real VM/state/host; dispose is idempotent and all execution becomes inert', () => {
+test('actors own independent real VM/state/host; dispose is idempotent and all execution becomes inert', async () => {
   const p = probe()
-  p.actor.initialize(programs.basic, options('LIVE_EPHEMERAL', ''))
-  p.actor.dispatch('change', number(2))
+  await p.actor.initialize(programs.basic, options('LIVE_EPHEMERAL', ''))
+  await p.actor.dispatch('change', number(2))
   const q = probe()
-  q.actor.initialize(programs.basic, options('LIVE_EPHEMERAL', ''))
-  assert.equal(q.state().n, 1)
-  q.actor.dispatch('change', number(8))
-  assert.equal(p.state().n, 3)
-  assert.equal(q.state().n, 9)
+  await q.actor.initialize(programs.basic, options('LIVE_EPHEMERAL', ''))
+  assert.equal((await q.state()).n, 1)
+  await q.actor.dispatch('change', number(8))
+  assert.equal((await p.state()).n, 3)
+  assert.equal((await q.state()).n, 9)
   assert.equal(p.effects[0].id, q.effects[0].id)
-  p.actor.dispose()
+  await p.actor.dispose()
   assert.equal(p.actor.ready(), false)
   p.reset()
   records = p.events
-  p.actor.dispose()
-  p.actor.initialize(programs.refreshed, options())
-  p.actor.replaceProgram(programs.refreshed, options())
-  p.actor.promote(options())
-  p.actor.resume()
-  p.actor.runWidgetRefresh()
-  p.actor.dispatch('change', number(5))
-  p.actor.move('pointer', pointerValue('move', 0, 1, 2))
-  p.actor.frameHandlers(['frameA'], 16)
+  await p.actor.dispose()
+  for (const operation of [
+    () => p.actor.initialize(programs.refreshed, options()),
+    () => p.actor.replaceProgram(programs.refreshed, options()),
+    () => p.actor.promote(options()),
+    () => p.actor.resume(),
+    () => p.actor.runWidgetRefresh(),
+    () => p.actor.dispatch('change', number(5)),
+    () => p.actor.move('pointer', pointerValue('move', 0, 1, 2)),
+    () => p.actor.frameHandlers(['frameA'], 16),
+    () => p.actor.persistState(),
+    () => p.actor.notifyStateSnapshot(),
+    () => p.actor.snapshot()
+  ]) await assert.rejects(operation(), /STATE_UNAVAILABLE/)
   p.actor.beginSurfaceLoop(now)
-  p.actor.persistState()
-  p.actor.notifyStateSnapshot()
   p.actor.clearEffects()
-  assert.equal(p.actor.snapshot(), '')
   assert.equal(p.actor.view(), null)
   assert.deepEqual(p.actor.draw('draw'), [])
   assert.equal(p.actor.viewDue(now + 10000), false)
-  assert.equal(p.actor.surfaceSave(now + 10000, false), 'NOT_DUE')
+  await assert.rejects(p.actor.surfaceSave(now + 10000, false), /STATE_UNAVAILABLE/)
   assert.deepEqual(p.events, [])
-  assert.equal(q.state().n, 9)
-  q.actor.dispose()
+  assert.equal((await q.state()).n, 9)
+  await q.actor.dispose()
 })
 
 const legacyTestCount = tests.length
@@ -1890,7 +1984,7 @@ test('coordinator snapshot barrier waits for commit and asynchronous render, exc
   await turnBounded(enteredRender.promise)
   assert.equal(p.actor.phase(), 'PUBLISHING')
   await assert.rejects(p.actor.snapshotBarrier(), turnError('STATE_TURN_PENDING', 'state'))
-  assert.throws(() => savedPure(turnCall('view')), turnError('STATE_TURN_PENDING', 'view'))
+  assert.equal(decodeVeraUi(savedPure(turnCall('view')))[0].text, 'n=3')
   await turnMicrotasks()
   assert.equal(barrierDone, false)
   renderGate.resolve()
@@ -2334,37 +2428,67 @@ test('coordinator shutdown drains render/storage, caches cleanup failure and loc
   }
 })
 
-test('default AppActor never activates coordinator/StateManager/safety and retains synchronous legacy ordering and partial traps', () => {
+test('default AppActor activates coordinator/StateManager/journal safety and publishes only accepted async turns', async () => {
   const source = fs.readFileSync(path.join(root, 'runtime/AppActor.ets'), 'utf8')
   const ast = ts.createSourceFile('AppActor.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
   const actorClass = ast.statements.find(node => ts.isClassDeclaration(node) && node.name.text === 'AppActor')
-  assert.doesNotMatch(actorClass.getText(ast), /\b(?:AppActorTurnCoordinator|StateManager|CommitPolicy|executePure|beginTurn|snapshotBarrier|checkpoint|checkpointIfDue|whenSettled|shutdown|fence)\b/)
+  const coordinatorClass = ast.statements.find(node => ts.isClassDeclaration(node) && node.name.text === 'AppActorTurnCoordinator')
+  const body = (owner, name) => {
+    const members = owner.members.filter(member => member.name && member.name.getText(ast) === name)
+    assert.equal(members.length, 1, name + ' has exactly one implementation')
+    assert(members[0].body, name + ' retains a guarded body')
+    return members[0].body.getText(ast)
+  }
+  for (const name of ['AppActorTurnCoordinator', 'StateManager', 'CommitPolicy', 'executePure', 'beginTurn', 'snapshotBarrier', 'checkpoint', 'checkpointIfDue', 'whenSettled', 'shutdown', 'fence']) {
+    assert(new RegExp('\\b' + name + '\\b').test(source), name + ' remains in the activated ownership path')
+  }
+  assert.match(body(actorClass, 'activate'), /new StateManager\(managerOptions\)/)
+  assert.match(body(actorClass, 'activate'), /new AppActorTurnCoordinator\(this\.manager!, this\.vm!, this\.host!, this\.mode, policy/)
+  assert.match(body(actorClass, 'activate'), /rollbackGuard = this\.safety \? this\.vm! : undefined/)
+  assert.match(body(actorClass, 'activate'), /vmJournal = this\.safety/)
+  assert.match(body(actorClass, 'turn'), /await this\.coordinator!\.runTurn\(source, persist, calls, skipIfSame\)/)
+  assert.match(body(actorClass, 'snapshot'), /this\.coordinator!\.snapshotBarrier\(\)/)
+  assert.match(body(actorClass, 'surfaceSave'), /await this\.coordinator!\.checkpointIfDue\(now\)/)
+  assert.match(body(actorClass, 'worldSave'), /await this\.coordinator!\.checkpoint\('BACKGROUND'\)/)
+  assert.match(body(actorClass, 'quiesce'), /await this\.coordinator!\.whenSettled\(\)/)
+  assert.match(body(actorClass, 'retire'), /await this\.closeRuntime\(this\.coordinator, this\.manager, saveState\)/)
+  assert.match(body(actorClass, 'closeMemoryRuntime'), /await this\.closeRuntime\(runtime\.coordinator, runtime\.manager, false\)/)
+  assert.match(body(actorClass, 'closeRuntime'), /if \(coordinator !== null\) \{ await coordinator\.shutdown\(saveState\) \}/)
+  assert.match(body(actorClass, 'closeRuntime'), /else if \(manager !== null\) \{ await manager\.close\(\) \}/)
+  assert.match(body(actorClass, 'closeRuntime'), /if \(\(coordinator === null \|\| !coordinator\.closureConfirmed\(\)\) && this\.closureFailure === null\) \{\s*this\.closureFailure = error as Error\s*\}\s*throw error as Error/)
+  assert.match(body(coordinatorClass, 'shutdownState'), /await this\.state\.close\(\)\s*this\.closed = true/)
+  assert.match(body(actorClass, 'closureConfirmed'), /return this\.disposalSettled && this\.closureFailure === null/)
+  assert.match(body(coordinatorClass, 'runTurn'), /this\.state\.beginTurn\(/)
+  for (const guard of [/this\.fenced = true/, /this\.epoch\+\+/, /this\.currentPhase = 'FAULTED'/, /this\.checkpointDelivery = null/, /this\.host\.effectsAllowed = false/, /this\.host\.pendingEffects = \[\]/]) {
+    assert.match(body(coordinatorClass, 'fence'), guard)
+  }
+  assert.doesNotMatch(actorClass.getText(ast), /store\.(?:saveState|loadState)\(|private (?:currentState|diskState)\b/)
   let machines = 0
   function visit(node) {
     if (ts.isNewExpression(node) && node.expression.getText(ast) === 'VirtualMachine') {
       machines++
-      assert.equal(node.arguments.length, 2, 'legacy VM does not opt into budget/journal/safety')
+      assert.equal(node.arguments.length, 5, 'VM retains instruction budget, deadline and journal options')
+      assert.match(node.arguments[3].getText(ast), /deadlineMs: 1000/)
+      assert.match(node.arguments[4].getText(ast), /journalMode: flags\.journalMode/)
     }
     ts.forEachChild(node, visit)
   }
   visit(actorClass)
   assert.equal(machines, 1)
   const p = probe()
-  assert.equal(p.actor.runTurn, undefined)
-  assert.equal(p.actor.snapshotBarrier, undefined)
-  assert.equal(p.actor.phase, undefined)
-  for (const method of ['checkpoint', 'checkpointIfDue', 'whenSettled', 'shutdown', 'fence']) assert.equal(p.actor[method], undefined)
-  assert.equal(p.actor.initialize(programs.basic, options()), undefined)
+  await p.actor.initialize(programs.basic, options())
   p.reset()
-  assert.equal(p.actor.dispatch('change', number(2)), undefined)
-  assert.deepEqual(sequence(p), ['change', 'snapshot', 'view', 'frame', 'save', 'saved', 'effect:change'])
-  const payload = JSON.parse(disk.get(stateFile()))
-  assert.deepEqual(Object.keys(payload).sort(), ['stamp', 'value'])
+  await p.actor.dispatch('change', number(2))
+  assert.deepEqual(sequence(p), ['change', 'save', 'snapshot', 'effect:change', 'saved', 'view', 'frame'])
+  const payload = format2.validateStateFile(disk.get(stateFile()), 'project/version')
+  assert.equal(payload.format, 'FORMAT2')
+  assert.equal(payload.revision, 2)
+  assert.equal(count(p, 'task-submit'), count(p, 'task-result'))
   p.reset()
-  assert.equal(p.actor.dispatch('fail', number(4)), undefined)
-  assert.equal(p.state().n, 7)
-  assert.deepEqual(p.state().marks, [2, 4])
-  assert.equal(stateOf(JSON.stringify(payload.value)).n, 3)
+  await assert.rejects(p.actor.dispatch('fail', number(4)), /array index out of bounds/)
+  assert.equal((await p.state()).n, 3)
+  assert.deepEqual((await p.state()).marks, [2])
+  assert.equal(stateOf(payload.encodedState).n, 3)
   assert.equal(p.snapshots.length + p.effects.length + count(p, 'save'), 0)
   assert.equal(count(p, 'ui-error'), 1)
 })
@@ -2403,6 +2527,6 @@ async function main() {
     Object.assign(console, originalConsole)
   }
   console.log(`app-actor-check: ${passed}/${tests.length} focused actor scenarios passed; legacy ${legacyPassed}/${legacyTestCount}, added ${passed - legacyPassed}/${tests.length - legacyTestCount}`)
-  console.log('Scope: unchanged legacy AppActor scenarios plus AppActorTurnCoordinator with real compiler/VM/UI host/StateManager/CommitPolicy and isolated in-memory storage; no InProcessHost/mailbox, ArkUI/device, network or model execution.')
+  console.log('Scope: existing AppActor scenarios migrated to async TaskPool/StateManager plus AppActorTurnCoordinator with real compiler/VM/UI host/CommitPolicy and isolated in-memory storage; no InProcessHost/mailbox, ArkUI/device, network or model execution.')
 }
 main().catch(error => { originalConsole.error(error.stack); process.exitCode = 1 })

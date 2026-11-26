@@ -400,6 +400,7 @@ export struct GeneratePage {
   @State setupHint: string = ''
   /** The bytecode last saved as a version: Save is off while the program on screen is the one already saved. */
   @State savedVbc2: string = ''
+  @State saving: boolean = false
   /** The window that asks for a new app's name, open from the first Save; the name is what it offers or what was typed. */
   @State naming: boolean = false
   @State saveName: string = ''
@@ -467,6 +468,7 @@ export struct GeneratePage {
   @State widgetAdding: boolean = false
   /** checkWidgetSave is running the card's checks in a worker: Save waits for them. */
   @State widgetChecking: boolean = false
+  @State widgetStateLoading: boolean = false
   /** What to do next when the card could not be added here (a launcher with no add dialog, an error). */
   @State widgetNote: string = ''
   /** Set once the card was put on the home screen from this page: the button then says so. */
@@ -831,7 +833,26 @@ export struct GeneratePage {
     return context
   }
 
+  private async loadWidgetState(version: Version): Promise<void> {
+    const project = this.projectId
+    const run = this.runId
+    const current = (): boolean => !this.disposed && project === this.projectId && version.id === this.baseVersionId &&
+      run === this.runId && this.compiledVbc2 === version.vbc2 && this.makeWidget
+    this.widgetStateLoading = true
+    try {
+      const saved = await store.loadState(project, version.id, veraStateStamp(version.vbc2))
+      if (!current()) { return }
+      this.carriedState = saved
+      this.widgetSeed = saved
+    } catch (e) {
+      if (current()) { this.baseError = 'Could not load app state: ' + (e as Error).message }
+    } finally {
+      this.widgetStateLoading = false
+    }
+  }
+
   aboutToAppear(): void {
+    let widgetStateReady: Promise<void> = Promise.resolve()
     let params = this.params as GeneratePageParams
     this.projectId = params.projectId
     this.baseVersionId = params.baseVersionId
@@ -872,8 +893,7 @@ export struct GeneratePage {
           // The person says what the widget shows; the app and the widget start from the data the app has saved.
           let project = store.getProject(this.projectId)
           if (project !== null) { this.widgetTitle = project.name }
-          this.carriedState = store.loadState(this.projectId, v.id, veraStateStamp(v.vbc2))
-          this.widgetSeed = this.carriedState
+          widgetStateReady = this.loadWidgetState(v)
           this.tab = TAB_WIDGET
           // Redo, from the project page: the widget there is not shown to the model (withoutWidget).
           this.widgetFresh = params.widgetFresh === '1' && hasWidgetFunction(v.source)
@@ -901,7 +921,7 @@ export struct GeneratePage {
       this.keyboardWindow = win
       win.on('keyboardHeightChange', this.keyboardListener)
     }).catch((e: Error) => { console.warn('VERA keyboard listener unavailable: ' + e.message) })
-    this.loadResources().then((): void => {
+    Promise.all([this.loadResources(), widgetStateReady]).then((): void => {
       // The request came with "send it": it goes now that the prompt and the catalogue are loaded.
       if (!this.disposed && this.runOnOpen) {
         this.runOnOpen = false
@@ -1226,7 +1246,8 @@ export struct GeneratePage {
   }
 
   private doGenerate(): void {
-    if (this.disposed || this.prompt.trim().length === 0 || this.baseError.length > 0 || this.generating || this.snapshotting) { return }
+    if (this.disposed || this.prompt.trim().length === 0 || this.baseError.length > 0 || this.generating || this.snapshotting ||
+        this.saving || this.widgetStateLoading) { return }
     // Sent before the prompt and the catalogue were read: it goes when they are (aboutToAppear).
     if (!this.resourcesLoaded) { this.runOnOpen = true; return }
     if (this.mode === MODE_DEEPSEEK && settings.useLocalSelector() && !localJev.isReady()) {
@@ -2132,7 +2153,8 @@ export struct GeneratePage {
    */
   private async doRefine(): Promise<void> {
     let ask = this.refinePrompt.trim()
-    if (this.disposed || ask.length === 0 || this.compiledSource.length === 0 || this.generating || this.snapshotting || this.baseError.length > 0) { return }
+    if (this.disposed || ask.length === 0 || this.compiledSource.length === 0 || this.generating || this.snapshotting ||
+        this.saving || this.widgetStateLoading || this.baseError.length > 0) { return }
     // What the person typed is what the widget shows; the instructions for a widget are the system prompt's (widgetRefinementPrompt).
     if (this.makeWidget) { ask = WIDGET_ASK + ask }
     // What the person typed into the preview is kept through the refine. The widget screen draws no app preview: what it
@@ -2563,8 +2585,9 @@ host.worldGuide = this.worldGuide
   }
 
   /** Save: a new app is named first, an app that already exists takes the result as its next version. */
-  private doSave(): void {
-    if (this.disposed || this.generating || this.compiledSource.length === 0 || !this.hasResult()) { return }
+  private async doSave(): Promise<void> {
+    if (this.disposed || this.generating || this.saving || this.widgetAdding || this.widgetChecking || this.widgetStateLoading ||
+        this.compiledSource.length === 0 || !this.hasResult() || this.isSaved()) { return }
     if (this.projectId.length === 0) {
       this.saveName = suggestAppName(this.compiledSource, this.acceptedRequest)
       let icon = suggestAppIcon(this.saveName, this.acceptedRequest)
@@ -2574,29 +2597,43 @@ host.worldGuide = this.worldGuide
       return
     }
     if (this.makeWidget) {
-      if (!this.widgetChecking) { void this.saveWidget() }
+      await this.saveWidget()
       return
     }
-    if (this.commitSave()) { this.afterSave() } else { this.leaveAfterSave = false; this.widgetAfterSave = false }
+    if (await this.commitSave()) { this.afterSave() } else { this.leaveAfterSave = false; this.widgetAfterSave = false }
   }
 
   /** Save for a widget: its checks first, off the UI thread when what they found at Generate no longer holds (checkWidgetSave). */
   private async saveWidget(): Promise<void> {
-    if (await this.checkWidgetSave() && this.commitSave()) { this.afterSave() } else { this.leaveAfterSave = false; this.widgetAfterSave = false }
+    if (this.saving || this.widgetChecking || this.widgetAdding) { return }
+    if (await this.checkWidgetSave() && await this.commitSave()) { this.afterSave() } else { this.leaveAfterSave = false; this.widgetAfterSave = false }
   }
 
   /**
    * The state a widget is saved with: the base version's saved state, read at Save, not at Generate, so widget/app taps during
    * generation are not lost. null when the app changed under the widget (status says so).
    */
-  private widgetSaveState(): string | null {
-    let base = store.getVersion(this.projectId, this.baseVersionId)
-    let latest = store.getLatestVersion(this.projectId)
-    if (base === null || latest === null || latest.id !== base.id || this.compiledVbc2.length === 0) {
+  private async widgetSaveState(): Promise<string | null> {
+    const project = this.projectId
+    const version = this.baseVersionId
+    const program = this.compiledVbc2
+    const source = this.compiledSource
+    const run = this.runId
+    let base = store.getVersion(project, version)
+    let latest = store.getLatestVersion(project)
+    if (base === null || latest === null || latest.id !== base.id || program.length === 0) {
       this.status = 'The app changed while this widget was being made. Make the widget again.'
       return null
     }
-    return store.loadState(this.projectId, base.id, veraStateStamp(base.vbc2))
+    let saved = await store.loadState(project, base.id, veraStateStamp(base.vbc2))
+    if (this.disposed || this.generating || run !== this.runId || project !== this.projectId ||
+        version !== this.baseVersionId || program !== this.compiledVbc2 || source !== this.compiledSource) { return null }
+    latest = store.getLatestVersion(project)
+    if (latest === null || latest.id !== base.id || latest.vbc2 !== base.vbc2) {
+      this.status = 'The app changed while this widget was being made. Make the widget again.'
+      return null
+    }
+    return saved
   }
 
   /**
@@ -2606,19 +2643,32 @@ host.worldGuide = this.worldGuide
    */
   private async checkWidgetSave(): Promise<boolean> {
     if (!this.makeWidget) { return true }
-    if (this.widgetChecking || this.disposed || this.generating || this.compiledSource.length === 0 || !this.hasResult()) { return false }
-    let preserved = this.widgetSaveState()
-    if (preserved === null) { return false }
-    let key = this.compiledVbc2 + '\u0000' + preserved
-    if (this.widgetPassed === key || widgetRefinementError(this.widgetBase, this.compiledSource).length > 0) { return true }
+    if (this.widgetChecking || this.saving || this.widgetStateLoading || this.disposed || this.generating ||
+        this.compiledSource.length === 0 || !this.hasResult()) { return false }
     this.widgetChecking = true
-    this.status = 'Checking the widget...'
+    const project = this.projectId
+    const version = this.baseVersionId
+    const program = this.compiledVbc2
+    const source = this.compiledSource
+    const base = this.widgetBase
+    const run = this.runId
+    const current = (): boolean => !this.disposed && !this.generating && run === this.runId &&
+      project === this.projectId && version === this.baseVersionId && program === this.compiledVbc2 &&
+      source === this.compiledSource && base === this.widgetBase
     try {
-      let validation = await validateWidgetOffMain(this.widgetBase, this.compiledSource, this.compiledVbc2, preserved)
-      if (this.disposed) { return false }
+      let preserved = await this.widgetSaveState()
+      if (preserved === null || !current()) { return false }
+      let key = program + '\u0000' + preserved
+      if (this.widgetPassed === key || widgetRefinementError(base, source).length > 0) { return true }
+      this.status = 'Checking the widget...'
+      let validation = await validateWidgetOffMain(base, source, program, preserved)
+      if (!current()) { return false }
       if (validation.length > 0) { this.compileErrors = validation; this.status = 'Widget not saved'; return false }
       this.widgetPassed = key
       return true
+    } catch (e) {
+      if (current()) { this.status = 'Widget check failed: ' + (e as Error).message }
+      return false
     } finally {
       this.widgetChecking = false
     }
@@ -2630,7 +2680,7 @@ host.worldGuide = this.worldGuide
    * asked for if it has none, where Save and then Make widget were two.
    */
   private startWidget(): void {
-    if (this.disposed || this.generating || !this.hasResult() || this.makeWidget) { return }
+    if (this.disposed || this.generating || this.saving || !this.hasResult() || this.makeWidget) { return }
     let refused = appUsesWidgetError(this.compiledSource)
     if (refused.length > 0) {
       try { this.getUIContext().getPromptAction().showToast({ message: 'A widget cannot be added to this app.' }) } catch (e) {
@@ -2645,14 +2695,14 @@ host.worldGuide = this.worldGuide
   }
 
   /** The name was confirmed: the project is made now, with the default picture, and the result is its first version. */
-  private confirmName(): void {
-    if (this.disposed || !this.naming || this.generating || !this.hasResult()) { return }
+  private async confirmName(): Promise<void> {
+    if (this.disposed || !this.naming || this.generating || this.saving || !this.hasResult()) { return }
     let name = this.saveName.trim()
     if (name.length === 0) { return }
     let project = store.createProject(name, this.saveIcon)
     this.projectId = project.id
     this.naming = false
-    if (this.commitSave()) {
+    if (await this.commitSave()) {
       // A new app, just saved: the moment to say it can live on the home screen too.
       this.widgetOffer = !this.leaveAfterSave && !this.widgetAfterSave && !hasWidgetFunction(this.compiledSource) &&
         appUsesWidgetError(this.compiledSource).length === 0
@@ -2723,46 +2773,60 @@ host.worldGuide = this.worldGuide
   }
 
   /** Whether the result was saved: a widget that does not keep the app as it was is refused. */
-  private commitSave(): boolean {
-    if (this.disposed || this.generating || this.compiledSource.length === 0 || !this.hasResult()) { return false }
-    let note = this.makeWidget && this.requestLabel.length > 0 ? WIDGET_ASK + this.requestLabel : this.acceptedRequest
-    if (note.length > 100) { note = note.substring(0, 100) + '...' }
-    let preserved = ''
-    if (this.makeWidget) {
-      let state = this.widgetSaveState()
-      if (state === null) { return false }
-      preserved = state
-      // The card's checks ran for this bytecode and this state (checkWidgetSave, or at Generate): only that the app around the
-      // widget was kept is checked again (cheap). They are never run here: on the UI thread they froze the app.
-      let preservation = widgetRefinementError(this.widgetBase, this.compiledSource)
-      if (preservation.length > 0) { this.compileErrors = preservation; this.status = 'Widget not saved'; return false }
-      if (this.widgetPassed !== this.compiledVbc2 + '\u0000' + preserved) {
-        this.status = 'The app changed while the widget was checked. Save again.'
-        return false
+  private async commitSave(): Promise<boolean> {
+    if (this.disposed || this.generating || this.saving || this.widgetChecking || this.widgetStateLoading ||
+        this.compiledSource.length === 0 || !this.hasResult() || this.isSaved()) { return false }
+    this.saving = true
+    const project = this.projectId
+    const version = this.baseVersionId
+    const run = this.runId
+    let program = this.compiledVbc2
+    let source = this.compiledSource
+    const current = (): boolean => !this.disposed && !this.generating && run === this.runId &&
+      project === this.projectId && version === this.baseVersionId && program === this.compiledVbc2 && source === this.compiledSource
+    try {
+      let note = this.makeWidget && this.requestLabel.length > 0 ? WIDGET_ASK + this.requestLabel : this.acceptedRequest
+      if (note.length > 100) { note = note.substring(0, 100) + '...' }
+      let preserved = ''
+      if (this.makeWidget) {
+        let state = await this.widgetSaveState()
+        if (state === null || !current()) { return false }
+        preserved = state
+        let preservation = widgetRefinementError(this.widgetBase, source)
+        if (preservation.length > 0) { this.compileErrors = preservation; this.status = 'Widget not saved'; return false }
+        if (this.widgetPassed !== program + '\u0000' + preserved) {
+          this.status = 'The app changed while the widget was checked. Save again.'
+          return false
+        }
       }
-    }
-    let widgetLost = !this.makeWidget && this.keepWidget()
-    let saved: Version
-    try {
-      saved = store.createVersion(this.projectId, this.compiledSource, this.compiledVbc2, note,
-        this.requestHistory, this.acceptedOrigin, this.acceptedComposition, this.acceptedRequest, this.baseVersionId,
-        this.acceptedMetrics, preserved, veraStateStamp(this.compiledVbc2))
-    } catch (e) { this.status = 'Save failed: ' + (e as Error).message; return false }
-    // Stay here: the next change is a refinement of what was just saved, and the next Save its own version.
-    this.baseVersionId = saved.id
-    if (this.makeWidget) { this.widgetBase = this.compiledSource }
-    this.baseVersionNumber = this.nextVersionNumber
-    this.nextVersionNumber = this.versionCount() + 1
-    this.savedVbc2 = this.compiledVbc2
-    this.status = 'Saved as version ' + this.baseVersionNumber.toString() +
-      (widgetLost ? '. It has no widget: your home-screen card shows "Open app"' : '')
-    refreshForms()
-    try {
-      this.getUIContext().getPromptAction().showToast({ message: this.status })
+      let widgetLost = !this.makeWidget && this.keepWidget()
+      program = this.compiledVbc2
+      source = this.compiledSource
+      const number = this.nextVersionNumber
+      const saved = await store.createVersion(project, source, program, note,
+        this.requestHistory, this.acceptedOrigin, this.acceptedComposition, this.acceptedRequest, version,
+        this.acceptedMetrics, preserved, veraStateStamp(program))
+      refreshForms()
+      if (!current()) { return false }
+      this.baseVersionId = saved.id
+      if (this.makeWidget) { this.widgetBase = source }
+      this.baseVersionNumber = number
+      this.nextVersionNumber = this.versionCount() + 1
+      this.savedVbc2 = program
+      this.status = 'Saved as version ' + this.baseVersionNumber.toString() +
+        (widgetLost ? '. It has no widget: your home-screen card shows "Open app"' : '')
+      try {
+        this.getUIContext().getPromptAction().showToast({ message: this.status })
+      } catch (e) {
+        console.error('Show save toast failed: ' + (e as Error).message)
+      }
+      return true
     } catch (e) {
-      console.error('Show save toast failed: ' + (e as Error).message)
+      if (current()) { this.status = 'Save failed: ' + (e as Error).message }
+      return false
+    } finally {
+      this.saving = false
     }
-    return true
   }
 
   /**
@@ -4154,7 +4218,7 @@ host.worldGuide = this.worldGuide
 
   /** A suggestion or Try again: sent as if typed into the box. */
   private sendWidget(ask: string, label: string = ''): void {
-    if (this.generating || this.snapshotting) { return }
+    if (this.generating || this.snapshotting || this.saving || this.widgetStateLoading) { return }
     this.chipLabel = label
     this.draft = ask
     this.send()
@@ -4182,21 +4246,26 @@ host.worldGuide = this.worldGuide
    * Cards already there draw the saved version on their own (commitSave refreshes them).
    */
   private async addToHomeScreen(leave: boolean): Promise<void> {
-    if (this.disposed || this.generating || this.widgetAdding || this.widgetChecking) { return }
-    if (!this.isSaved() && !(await this.checkWidgetSave() && this.commitSave())) { return }
+    if (this.disposed || this.generating || this.saving || this.widgetAdding || this.widgetChecking || this.widgetStateLoading) { return }
     this.widgetAdding = true
     this.widgetNote = ''
+    const project = this.projectId
+    const run = this.runId
     let placed = false
     try {
+      if (!this.isSaved() && !(await this.checkWidgetSave() && await this.commitSave())) { return }
+      if (this.disposed || this.generating || project !== this.projectId || run !== this.runId) { return }
       if (this.bindFormId.length > 0) {
-        await bindLiveForm(this.bindFormId, this.projectId)
+        await bindLiveForm(this.bindFormId, project)
+        if (this.disposed || project !== this.projectId || run !== this.runId) { return }
         this.bindFormId = ''
         this.widgetAdding = false
         returnToLibrary(this.pathStack)
         return
       }
       if (this.readWidgetCards() === 0) {
-        let message = await publishLiveWidget(this.projectId)
+        let message = await publishLiveWidget(project)
+        if (this.disposed || project !== this.projectId || run !== this.runId) { return }
         placed = message === WIDGET_ADDED
         if (!placed) { this.widgetNote = message; this.watchForCard() }
       } else {
@@ -4215,7 +4284,7 @@ host.worldGuide = this.worldGuide
 
   private async send(): Promise<void> {
     let text = this.draft.trim()
-    if (this.disposed || text.length === 0 || this.generating || this.snapshotting) { return }
+    if (this.disposed || text.length === 0 || this.generating || this.snapshotting || this.saving || this.widgetStateLoading) { return }
     this.widgetOffer = false
     this.requestLabel = this.chipLabel
     this.chipLabel = ''
@@ -4270,7 +4339,7 @@ host.worldGuide = this.worldGuide
 
   /** New starts the thread over; with a result that was never saved it asks first. */
   private confirmNew(): void {
-    if (this.generating) { return }
+    if (this.generating || this.saving || this.widgetStateLoading) { return }
     if (!this.hasUnsavedResult()) {
       this.startFresh()
       return
@@ -4284,6 +4353,7 @@ host.worldGuide = this.worldGuide
   }
 
   private startFresh(): void {
+    if (this.saving || this.widgetStateLoading) { return }
     // "New" means a new app: it is no longer a version of the project this page was opened from.
     this.projectId = ''
     // Nor a widget for it.

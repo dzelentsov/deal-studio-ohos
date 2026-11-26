@@ -2,76 +2,135 @@
 const assert = require('node:assert/strict')
 const fs = require('node:fs'), path = require('node:path')
 const ts = require(process.env.VERA_TYPESCRIPT_PATH || 'typescript')
-const { loadVera } = require('./source-loader')
-const disk = new Map(), cache = new Map()
+const { loadVera, sourceRoot } = require('./source-loader')
+let readingForm = false
+const formOperations = []
+function metadataMutation(operation) {
+  if (readingForm) formOperations.push({op: operation})
+  assert(!readingForm, 'Form must not mutate metadata: ' + operation)
+}
+const worker = require('./state-io-check').createWorkerFixture('/fixture/vera', event => {
+  if (readingForm) formOperations.push(event)
+})
+const {disk, memory} = worker, cache = new Map()
 const formProvider = {}
 const filesystem = {
-  OpenMode: { CREATE: 1, WRITE_ONLY: 2, TRUNC: 4 }, mkdirSync() {},
-  openSync(file) { return { fd: file } },
-  writeSync(file, value) { disk.set(file, value) }, closeSync() {},
-  statSync(file) { if (!disk.has(file)) throw Error('absent'); return { size: disk.get(file).length } },
-  readTextSync(file) { if (!disk.has(file)) throw Error('absent'); return disk.get(file) },
-  renameSync(from, to) { assert(disk.has(from)); disk.set(to, disk.get(from)); disk.delete(from) },
-  unlinkSync(file) { disk.delete(file) },
-  listFileSync(dir) { return [...disk.keys()].filter(file => path.dirname(file) === dir).map(file => path.basename(file)) }
+  OpenMode: { CREATE: 1, WRITE_ONLY: 2, TRUNC: 4 },
+  mkdirSync(file) {
+    metadataMutation('mkdir')
+    if (!memory.nodes.has(file)) {
+      this.mkdirSync(path.dirname(file))
+      memory.put(file, '', 'dir')
+    }
+  },
+  openSync(file) { metadataMutation('open-write'); return { fd: file } },
+  writeSync(file, value) { metadataMutation('write'); disk.set(file, value); return Buffer.byteLength(value, 'utf8') }, closeSync() {},
+  statSync: file => memory.statSync(file),
+  readTextSync(file) { if (!disk.has(file)) throw Object.assign(Error('absent'), {code: 13900002}); return disk.get(file) },
+  renameSync(from, to) { metadataMutation('rename'); assert(disk.has(from)); disk.set(to, disk.get(from)); disk.delete(from) },
+  unlinkSync(file) { metadataMutation('unlink'); disk.delete(file) },
+  listFileSync: dir => memory.listFileSync(dir)
 }
-const base = path.join(__dirname, '../../entry/src/main/ets/vera')
+const committedFilesystem = {OpenMode: worker.filesystem.OpenMode}
+for (const method of ['openSync', 'closeSync', 'statSync', 'lstatSync', 'readSync', 'writeSync', 'fsyncSync', 'renameSync', 'unlinkSync', 'mkdirSync', 'listFileSync']) {
+  committedFilesystem[method] = memory[method].bind(memory)
+}
+const base = path.join(sourceRoot, 'vera')
 function load(name) {
-  if (cache.has(name)) return cache.get(name).exports
-  if (name === 'VeraLiveWidget' || name === 'VeraStateStamp' || name === 'VeraSource') return loadVera(name)
-  const module = { exports: {} }; cache.set(name, module)
-  const source = fs.readFileSync(path.join(base, name + '.ets'), 'utf8')
-  const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020, esModuleInterop: true } }).outputText
-  new Function('require','module','exports', compiled)(dep => {
-    if (dep === '@kit.CoreFileKit') return { fileIo: filesystem }
-    if (dep === '@kit.ArkTS') return {util: {TextEncoder: class {encodeInto(text) {return new TextEncoder().encode(text)}}}}
+  const file = path.resolve(base, name + '.ets')
+  if (cache.has(file)) return cache.get(file).exports
+  if (['VeraLiveWidget', 'VeraStateStamp', 'VeraSource', 'VeraInterpreter'].includes(path.basename(name))) return loadVera(path.basename(name))
+  const module = { exports: {} }; cache.set(file, module)
+  const source = fs.readFileSync(file, 'utf8').replace(/^@Concurrent\s*$/gm, '')
+  const compiled = ts.transpileModule(source, { fileName: file.replace(/\.ets$/, '.ts'),
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }, reportDiagnostics: true })
+  assert.deepEqual((compiled.diagnostics || []).filter(d => d.category === ts.DiagnosticCategory.Error), [])
+  new Function('require','module','exports', compiled.outputText)(dep => {
+    if (dep === '@kit.CoreFileKit') return { fileIo: file === path.join(sourceRoot, 'runtime/StateIo.ets') ? committedFilesystem : filesystem }
+    if (dep === '@kit.ArkTS') return {util: worker.util, taskpool: worker.taskpool}
+    if (dep === '@kit.BasicServicesKit') return {systemDateTime: {TimeType: {STARTUP: 0}, getUptime: () => 10000}}
+    if (dep === '@kit.PerformanceAnalysisKit') return {hilog: {info() {}}}
+    if (dep === '@kit.CryptoArchitectureKit') return {cryptoFramework: worker.cryptoFramework}
+    if (dep === '@ohos.fileio') return {default: worker.legacyFilesystem}
     if (dep === '@kit.FormKit') return { formProvider, formBindingData: { createFormBindingData: value => value } }
-    if (dep.startsWith('./')) return load(dep.slice(2))
+    if (dep.startsWith('.')) return load(path.relative(base, path.resolve(path.dirname(file), dep)))
     throw Error(dep)
   }, module, module.exports)
   return module.exports
+}
+const snapshot = () => [...memory.nodes].sort(([a], [b]) => a.localeCompare(b))
+  .map(([file, node]) => [file, node.kind, node.id, node.mtime, node.data.toString('hex'), node.owner])
+async function readOnly(work) {
+  const before = snapshot(), tasks = worker.taskpool.tasks.length, operations = formOperations.length
+  readingForm = true
+  try { return await work() } finally {
+    readingForm = false
+    for (const event of formOperations.slice(operations)) {
+      assert(['open', 'stat', 'read', 'close', 'list'].includes(event.op), 'Form must not mutate storage: ' + event.op)
+      if (event.op === 'open') assert.equal(event.flags & 3, worker.filesystem.OpenMode.READ_ONLY)
+    }
+    assert.deepEqual(snapshot(), before, 'Form reads/refusals preserve every file and directory')
+    assert.equal(worker.taskpool.tasks.length, tasks, 'Form must not submit background writers')
+    assert.equal(memory.fds.size, 0)
+    assert([...memory.nodes.values()].every(node => node.owner === null))
+  }
+}
+const {assembleStateFile, canonicalPayload} = load('../runtime/StateFileFormat')
+const statePath = (projectId, versionId) => '/fixture/vera/' + projectId + '/' + versionId + '.state.json'
+function appCommit(projectId, version, encoded, revision = 1) {
+  disk.set(statePath(projectId, version.id), assembleStateFile({appId: projectId + '/' + version.id,
+    schemaVersion: 1, vmGeneration: 1, revision, stamp: loadVera('VeraStateStamp').veraStateStamp(version.vbc2)}, canonicalPayload(JSON.parse(encoded))))
 }
 const {store} = load('ProjectStore'), {formBindings} = load('FormBindings')
 store.init('/fixture'); formBindings.init('/fixture')
 const project = store.createProject('Counter','🔢')
 const source = fs.readFileSync(path.join(__dirname,'examples/widget-counter.vera'),'utf8')
-const version = store.createVersion(project.id,source,loadVera('VeraCompiler').compileVeraSource(source).vbc2,'Counter')
+;(async () => {
+const version = await store.createVersion(project.id,source,loadVera('VeraCompiler').compileVeraSource(source).vbc2,'Counter')
 formBindings.bind('form-1',project.id); formBindings.bind('form-2',project.id)
 assert.deepEqual(formBindings.formsFor(project.id), ['form-1','form-2'])
 const {FormBindings} = load('FormBindings'), other = new FormBindings(); other.init('/fixture')
 assert.equal(other.projectFor('form-1'), project.id)
 const service = load('LiveFormService'), {veraStateStamp} = load('VeraStateStamp')
-const initial = service.liveFrame(project.id)
+const absent = await readOnly(() => service.liveFrame(project.id))
+assert(!absent.live); assert.equal(absent.status, 'Open app to initialize state')
+assert.equal(await store.loadState(project.id,version.id,veraStateStamp(version.vbc2)), '')
+const {WidgetSession} = loadVera('VeraLiveWidget')
+appCommit(project.id, version, new WidgetSession(version.vbc2,version.id,'').encodedState())
+const initial = await readOnly(() => service.liveFrame(project.id))
 assert(initial.live)
-assert(store.loadState(project.id,version.id,veraStateStamp(version.vbc2)))
-;(async () => {
-const tap = async (token, value) => service.liveFormTap('form-1', JSON.stringify({action:'message',handler:'change',token,value}))
+const tap = async (token, value) => readOnly(() => service.liveFormTap('form-1', JSON.stringify({action:'message',handler:'change',token,value})))
 const updated = await tap(initial.token,1)
-assert(updated.live); assert.equal(updated.formId,'form-1'); assert.notEqual(updated.token,initial.token)
-const saved = store.loadState(project.id,version.id,veraStateStamp(version.vbc2))
-const stale = await tap(initial.token,1)
-assert.match(stale.status,/changed/)
-assert.equal(store.loadState(project.id,version.id,veraStateStamp(version.vbc2)),saved)
+assert(updated.live); assert.equal(updated.formId,'form-1'); assert.equal(updated.token,initial.token)
+assert.equal(updated.status, 'Open app to interact; widget actions unavailable')
+const saved = await store.loadState(project.id,version.id,veraStateStamp(version.vbc2))
+const stale = await tap('stale-token',1)
+assert.equal(stale.status, updated.status)
+assert.equal(await store.loadState(project.id,version.id,veraStateStamp(version.vbc2)),saved)
 const forged = await tap(updated.token,999)
-assert.match(forged.status,/not available/)
+assert.equal(forged.status, updated.status)
 // A refused tap gives back the seq of the frame the card showed: the card is not drawn again, so a touched Motion does not play.
-const refused = await service.liveFormTap('form-1', JSON.stringify({handler:'change',token:updated.token,seq:updated.seq,value:999}))
-assert.match(refused.status,/not available/); assert.equal(refused.seq, updated.seq); assert.equal(refused.token, updated.token)
-assert.equal(store.loadState(project.id,version.id,veraStateStamp(version.vbc2)),saved)
+const refused = await readOnly(() => service.liveFormTap('form-1', JSON.stringify({handler:'change',token:updated.token,seq:'shown-seq',value:999})))
+assert.equal(refused.status, updated.status); assert.equal(refused.seq, 'shown-seq'); assert.equal(refused.token, updated.token)
+assert.equal(await store.loadState(project.id,version.id,veraStateStamp(version.vbc2)),saved)
 assert.equal(store.listVersions(project.id).length,1)
 assert(![...disk.keys()].some(file=>file.endsWith('.tmp')))
-// A second widget sees the same commit and its previous token becomes stale.
-assert.equal(service.liveBinding(project.id,'form-2').token, updated.token)
-const second = await service.liveFormTap('form-2', JSON.stringify({handler:'change',token:updated.token,value:-1}))
-assert.notEqual(second.token,updated.token)
-assert.match((await tap(updated.token,1)).status,/changed/)
+assert.equal((await readOnly(() => service.liveBinding(project.id,'form-2'))).token, updated.token)
+const second = await readOnly(() => service.liveFormTap('form-2', JSON.stringify({handler:'change',token:updated.token,value:-1})))
+assert.equal(second.token,updated.token)
+assert.equal(second.status, updated.status)
+assert.equal((await tap(updated.token,1)).status, updated.status)
+assert.equal(await store.loadState(project.id,version.id,veraStateStamp(version.vbc2)),saved)
 // Additive refinement publishes saved state before the new version is discoverable.
 const nextSource = source + '\nfunction widgetHelper(): number { return 1; }'
 const nextCode = loadVera('VeraCompiler').compileVeraSource(nextSource).vbc2
-const carried = store.loadState(project.id,version.id,veraStateStamp(version.vbc2))
-const nextVersion = store.createVersion(project.id,nextSource,nextCode,'Make widget','','','','','',null,carried,veraStateStamp(nextCode))
-assert.equal(store.loadState(project.id,nextVersion.id,veraStateStamp(nextCode)),carried)
-assert.equal(store.loadState(project.id,version.id,veraStateStamp(version.vbc2)),carried)
+const carried = await store.loadState(project.id,version.id,veraStateStamp(version.vbc2))
+const publishing = store.createVersion(project.id,nextSource,nextCode,'Make widget','','','','','',null,carried,veraStateStamp(nextCode))
+assert(publishing instanceof Promise)
+assert.equal(store.getLatestVersion(project.id).id, version.id)
+const nextVersion = await publishing
+assert.equal(await store.loadState(project.id,nextVersion.id,veraStateStamp(nextCode)),carried)
+assert.equal(await store.loadState(project.id,version.id,veraStateStamp(version.vbc2)),carried)
 formBindings.bind('form-1','missing-project')
 assert.equal(service.liveFrame(formBindings.projectFor('form-1')).title,'App removed')
 formBindings.bind('form-1',project.id)
@@ -83,74 +142,74 @@ formBindings.setDimension('form-2', 9); assert.equal(formBindings.dimensionFor('
 formBindings.setDimension('form-2', 3)
 other.unbind('form-1'); assert.equal(formBindings.projectFor('form-1'),''); assert.equal(formBindings.projectFor('form-2'),project.id); assert.equal(formBindings.dimensionFor('form-1'), 2, 'a removed card forgets its size')
 assert.equal(service.liveBinding('', 'unbound').formId, 'unbound')
-// The periodic update: widgetRefresh brings yesterday's state up to date once per period, however many cards show it.
 const {refreshLedger} = load('FormBindings'); refreshLedger.init('/fixture')
-const {WidgetSession} = loadVera('VeraLiveWidget')
 const dailySource = fs.readFileSync(path.join(__dirname,'examples/widget-daily.vera'),'utf8')
 const daily = store.createProject('Daily','📅')
-const dailyVersion = store.createVersion(daily.id,dailySource,loadVera('VeraCompiler').compileVeraSource(dailySource).vbc2,'Daily')
+const dailyVersion = await store.createVersion(daily.id,dailySource,loadVera('VeraCompiler').compileVeraSource(dailySource).vbc2,'Daily')
 const dailyStamp = veraStateStamp(dailyVersion.vbc2)
 formBindings.bind('form-d1',daily.id); formBindings.bind('form-d2',daily.id)
 const withFields = (count, day) => { const s = JSON.parse(new WidgetSession(dailyVersion.vbc2,'x','').encodedState())
   for (const [name, value] of s[2]) { if (name === 'count') value[1] = count; if (name === 'day' && day !== null) value[1] = day }
   return JSON.stringify(s) }
-const countOf = () => JSON.parse(store.loadState(daily.id,dailyVersion.id,dailyStamp))[2].find(f => f[0] === 'count')[1][1]
-store.saveState(daily.id,dailyVersion.id,dailyStamp,withFields(5, 1))
-const T = 1_800_000_000_000
-const first = await service.liveFormRefresh('form-d1', T)
-assert(first.ran); assert.equal(countOf(), 0, 'a new day starts the count again'); assert.equal(first.binding.formId, 'form-d1')
-store.saveState(daily.id,dailyVersion.id,dailyStamp,withFields(3, null))
-assert(!(await service.liveFormRefresh('form-d2', T + 60_000) ).ran, 'the second card in the same period does not run it again')
-const later = await service.liveFormRefresh('form-d2', T + service.REFRESH_EVERY_MS)
-assert(later.ran); assert.equal(countOf(), 3, 'the same day keeps its count')
-assert(!(await service.liveFormRefresh('form-2', T) ).ran, 'a program without widgetRefresh is only redrawn')
-// A live source: widgetRefresh asks for Vera.Source.fetch, the card makes the GET and hands the answer to the program's handler
-// before drawing and saving. Any other phone call from widgetRefresh is still refused.
+const countOf = async () => JSON.parse(await store.loadState(daily.id,dailyVersion.id,dailyStamp))[2].find(f => f[0] === 'count')[1][1]
+appCommit(daily.id,dailyVersion,withFields(5, 1))
+const T = 1_800_000_000_000, period = 15 * 60_000
+const first = await readOnly(() => service.liveFormRefresh('form-d1', T))
+assert.equal(first.ran, false); assert.equal(await countOf(), 5, 'Form cannot reset yesterday\'s state'); assert.equal(first.binding.formId, 'form-d1')
+appCommit(daily.id,dailyVersion,withFields(3, null), 2)
+assert(!(await readOnly(() => service.liveFormRefresh('form-d2', T + 60_000))).ran)
+const later = await readOnly(() => service.liveFormRefresh('form-d2', T + period))
+assert.equal(later.ran, false); assert.equal(await countOf(), 3, 'Form only redraws the app commit')
+assert(!(await readOnly(() => service.liveFormRefresh('form-2', T))).ran)
 const liveSource = fs.readFileSync(path.join(__dirname,'examples/widget-source.vera'),'utf8')
 const live = store.createProject('IMOEX','📈')
-const liveVersion = store.createVersion(live.id,liveSource,loadVera('VeraCompiler').compileVeraSource(liveSource).vbc2,'IMOEX')
+const liveVersion = await store.createVersion(live.id,liveSource,loadVera('VeraCompiler').compileVeraSource(liveSource).vbc2,'IMOEX')
 formBindings.bind('form-s1',live.id)
+const liveSeed = new WidgetSession(liveVersion.vbc2,'x','').encodedState()
+appCommit(live.id,liveVersion,liveSeed)
 const asked = []
-const fetched = await service.liveFormRefresh('form-s1', T, async params => { asked.push(Object.fromEntries(params))
-  return 'ok\n2461.3\n\n\nsource\tiss.moex.com\thttps://iss.moex.com/x\nasof\t14:05:00' })
-assert(fetched.ran); assert.equal(asked.length, 1); assert.equal(asked[0].paths, 'marketdata.data[0][1]')
-assert(JSON.stringify(fetched.binding.nodes).includes('2461.3'), 'the card draws the figure fetched now')
-assert(store.loadState(live.id,liveVersion.id,veraStateStamp(liveVersion.vbc2)).includes('2461.3'), 'and the app sees it')
-const failed = await service.liveFormRefresh('form-s1', T + service.REFRESH_EVERY_MS, async () => 'error: HTTP 503')
-assert(failed.ran); assert(JSON.stringify(failed.binding.nodes).includes('2461.3'), 'a failed fetch keeps the last figure')
-// The card's Refresh button fetches the source too, before the card is drawn and saved. (From a fresh state: the program's own
-// Refresh ignores a second press within ten seconds of the last fetch, and the update above has just fetched.)
-store.saveState(live.id,liveVersion.id,veraStateStamp(liveVersion.vbc2),new WidgetSession(liveVersion.vbc2,'x','').encodedState())
-const shown = service.liveFrame(live.id)
+const fetched = await readOnly(() => service.liveFormRefresh('form-s1', T, async params => { asked.push(Object.fromEntries(params)); assert.fail('Form must not fetch') }))
+assert.equal(fetched.ran, false); assert.equal(asked.length, 0)
+assert(fetched.binding.live)
+assert.equal(await store.loadState(live.id,liveVersion.id,veraStateStamp(liveVersion.vbc2)),liveSeed)
+let failedFetches = 0
+const failed = await readOnly(() => service.liveFormRefresh('form-s1', T + period, async () => { failedFetches++; throw Error('HTTP 503') }))
+assert.equal(failed.ran, false); assert.equal(failedFetches, 0)
+assert.deepEqual(failed.binding.nodes, fetched.binding.nodes)
+appCommit(live.id,liveVersion,liveSeed, 2)
+const shown = await readOnly(() => service.liveBinding(live.id))
 const button = JSON.stringify(shown.nodes).includes('"refresh"')
 assert(button, 'the widget has its Refresh button')
-const tapped = await service.liveFormTap('form-s1', JSON.stringify({handler: 'refresh', token: shown.token, value: 0}),
-  async () => 'ok\n2470.1\n\n\nsource\tiss.moex.com\thttps://iss.moex.com/x\nasof\t15:00:00')
-assert(JSON.stringify(tapped.nodes).includes('2470.1'), 'a tap on Refresh draws the figure fetched')
-assert(tapped.seq.length > 0 && shown.seq === '', 'a tap\'s answer is another frame (seq) even when the state came out the same')
-assert(store.loadState(live.id,liveVersion.id,veraStateStamp(liveVersion.vbc2)).includes('2470.1'))
-// The app saves while the card's fetch is out: the app's state is kept and the answer handed to it, not overwritten by the
-// card's copy loaded before the fetch.
+let tappedFetches = 0
+const tapped = await readOnly(() => service.liveFormTap('form-s1', JSON.stringify({handler: 'refresh', token: shown.token, seq:'refresh-seq', value: 0}),
+  async () => { tappedFetches++; assert.fail('Form tap must not fetch') }))
+assert.equal(tappedFetches, 0); assert.equal(tapped.status, updated.status)
+assert.deepEqual(tapped.nodes, shown.nodes)
+assert.equal(tapped.seq, 'refresh-seq'); assert.equal(shown.seq, '')
+assert.equal(await store.loadState(live.id,liveVersion.id,veraStateStamp(liveVersion.vbc2)),liveSeed)
 {
   const fresh = new WidgetSession(liveVersion.vbc2,'x','').encodedState()
-  store.saveState(live.id,liveVersion.id,veraStateStamp(liveVersion.vbc2),fresh)
-  const shown = service.liveFrame(live.id)
+  appCommit(live.id,liveVersion,fresh, 3)
+  const shown = await readOnly(() => service.liveFrame(live.id))
   const appState = JSON.parse(fresh); for (const f of appState[2]) if (f[0] === 'lastCall') f[1][1] = 42
-  await service.liveFormTap('form-s1', JSON.stringify({handler: 'refresh', token: shown.token, value: 0}), async () => {
-    store.saveState(live.id,liveVersion.id,veraStateStamp(liveVersion.vbc2),JSON.stringify(appState))
-    return 'ok\n2480.5\n\n\nsource\tiss.moex.com\thttps://iss.moex.com/x\nasof\t15:10:00' })
-  const after = JSON.parse(store.loadState(live.id,liveVersion.id,veraStateStamp(liveVersion.vbc2)))[2]
-  assert.equal(after.find(f => f[0] === 'lastCall')[1][1], 42, 'the app\'s save during the fetch is kept')
-  assert.equal(after.find(f => f[0] === 'value')[1][1], '2480.5', 'and the answer is on it')
+  appCommit(live.id,liveVersion,JSON.stringify(appState), 4)
+  let calls = 0
+  const refused = await readOnly(() => service.liveFormTap('form-s1', JSON.stringify({handler: 'refresh', token: shown.token, value: 0}), async () => {
+    calls++; assert.fail('Form must not start a fetch or merge its result') }))
+  const after = JSON.parse(await store.loadState(live.id,liveVersion.id,veraStateStamp(liveVersion.vbc2)))[2]
+  assert.equal(calls, 0); assert.equal(refused.status, updated.status)
+  assert.equal(after.find(f => f[0] === 'lastCall')[1][1], 42, 'the app commit after the shown frame is kept')
+  assert.equal(after.find(f => f[0] === 'value')[1][1], JSON.parse(fresh)[2].find(f => f[0] === 'value')[1][1])
 }
-// Two cards of one project updated together: the period is marked before the fetch, so only one of them fetches.
 {
   formBindings.bind('form-s2', live.id)
   let fetches = 0
-  const slow = async () => { fetches++; await new Promise(r => setTimeout(r, 20)); return 'ok\n2490\n\n\nsource\tiss.moex.com\thttps://iss.moex.com/x\nasof\t15:20:00' }
-  const at = T + 5 * service.REFRESH_EVERY_MS
-  const [a, b] = await Promise.all([service.liveFormRefresh('form-s1', at, slow), service.liveFormRefresh('form-s2', at, slow)])
-  assert.equal(fetches, 1, 'one fetch for the burst'); assert.equal([a.ran, b.ran].filter(Boolean).length, 1)
+  const slow = async () => { fetches++; assert.fail('Concurrent Form refresh must not fetch') }
+  const at = T + 5 * period
+  const [a, b] = await readOnly(() => Promise.all([service.liveFormRefresh('form-s1', at, slow), service.liveFormRefresh('form-s2', at, slow)]))
+  assert.equal(fetches, 0); assert.equal([a.ran, b.ran].filter(Boolean).length, 0)
+  assert.equal(a.binding.token, b.binding.token)
+  assert.deepEqual(a.binding.nodes, b.binding.nodes)
 }
 // Add widget through the system widget manager: the project offered is taken by the next card, once, while fresh.
 formBindings.offer(project.id, T)
@@ -228,5 +287,5 @@ for (const info of [
   assert.equal(formBindings.projectFor('bound-form'), '')
   assert.deepEqual(sdkCalls, ['lookup'])
 }
-console.log('PASS live forms: publish/bind success, SDK synchronous throws and async rejections preserve error identity, unsupported manager, foreign-card rejection, Add widget offer taken once while fresh, periodic widgetRefresh once per period, binding persistence/removal, shared state, first render commit, transport, stale/forged rejection, atomic writes, live source on the card')
+console.log('PASS live forms: publish/bind success, SDK synchronous throws and async rejections preserve error identity, unsupported manager, foreign-card rejection, one-shot fresh offer, binding persistence/removal, committed read-only rendering, initialization refusal, tap/refresh refusal without fetches or writes, app-state preservation, concurrent cards')
 })().catch(e => { console.error(e); process.exit(1) })

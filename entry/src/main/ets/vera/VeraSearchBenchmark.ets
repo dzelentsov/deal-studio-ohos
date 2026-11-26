@@ -979,11 +979,17 @@ async function p2Inventory(runId: string, stopAt: number): Promise<P2Inventory> 
         } else if (selected.length < 4) {
           try {
             let module = deserializeVbc2(version.vbc2)
-            let saved = store.loadState(project.id, version.id, veraStateStamp(version.vbc2), 1100000)
+            let saved = await store.loadState(project.id, version.id, veraStateStamp(version.vbc2), 1100000)
+            p2CheckActive()
             readStates += 1
+            if (p2Now() >= stopAt) { complete = false; break }
             if (saved.length > 1000000) { oversized += 1 }
             else { selected.push(new P2Corpus(listed, module, saved)) }
-          } catch (_e) { rejected += 1 }
+          } catch (_e) {
+            p2CheckActive()
+            if (p2Now() >= stopAt) { complete = false; break }
+            rejected += 1
+          }
         }
       }
       if (listed % 8 === 0) { await p2Yield() }

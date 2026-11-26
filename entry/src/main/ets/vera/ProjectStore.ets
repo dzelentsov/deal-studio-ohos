@@ -1,8 +1,29 @@
 import { fileIo as fs } from '@kit.CoreFileKit'
-import { BusinessError } from '@kit.BasicServicesKit'
 import { util } from '@kit.ArkTS'
+import { systemDateTime, BusinessError } from '@kit.BasicServicesKit'
 import { requestHeadline } from './ProjectText'
-import { ProjectMigrationMetadata, ProjectVersionInput } from './ProjectStateMigration'
+import { ProjectStateMigration, ProjectStateLifecycles } from './ProjectStateMigration'
+import type {
+  ProjectMigrationMetadata, ProjectVersionInput, ProjectStateLifecyclePort, ProjectStateTaskPoolPort,
+  ProjectInitialStatePort, ProjectStateTaskPoolCleanupPort, ProjectStateScope
+} from './ProjectStateMigration'
+import { StateIoTaskPool } from '../runtime/StateIoTaskPool'
+import { StateCleanupTaskPool } from '../runtime/StateCleanupTaskPool'
+import { StateManager } from '../runtime/StateManager'
+import type { StateManagerOptions } from '../runtime/StateManager'
+import type { StateStoragePort, StateStorageFactory } from '../runtime/shared/StatePort'
+import { StateIoError } from '../runtime/StateIo'
+import type { LoadResult, StateHeader, CommitResult, StateCleanupScope } from '../runtime/StateIo'
+import { canonicalPayload, validateEncodedState, statePayloadBytes } from '../runtime/StateFileFormat'
+import { BytecodeModule, VirtualMachine, EmptyHostEnvironment, NULL_VALUE, decodeRuntimeValue } from './VeraInterpreter'
+import type { RuntimeValue } from './VeraInterpreter'
+
+export const STATE_MAX_BYTES: number = 1048576
+
+export interface ProjectRuntimeFlags {
+  vmJournal: boolean
+  journalMode: 'JOURNAL'
+}
 
 
 export class Project {
@@ -99,7 +120,9 @@ function writeJson(path: string, content: string): void {
   let failed = false
   try {
     file = fs.openSync(path, fs.OpenMode.CREATE | fs.OpenMode.WRITE_ONLY | fs.OpenMode.TRUNC)
-    fs.writeSync(file.fd, content)
+    let expectedBytes = new util.TextEncoder().encodeInto(content).byteLength
+    let writtenBytes = fs.writeSync(file.fd, content)
+    if (writtenBytes !== expectedBytes) { throw new Error('PROJECT_METADATA_WRITE_INCOMPLETE') }
   } catch (e) {
     failed = true
     throw e as Error
@@ -114,33 +137,164 @@ function writeJson(path: string, content: string): void {
   }
 }
 
-/** State has readers in both processes: replace atomically, never expose a truncated file. */
-function writeStateJson(path: string, content: string): void {
-  let temp = path + '.' + Date.now().toString() + '.' + Math.random().toString().substring(2) + '.tmp'
-  try {
-    writeJson(temp, content)
-    fs.renameSync(temp, path)
-  } catch (e) {
-    throw e as Error
-  } finally {
-    try { fs.unlinkSync(temp) } catch (_e) {}
+class ProjectStateTasks implements ProjectStateTaskPoolPort {
+  private store: ProjectStore
+
+  constructor(store: ProjectStore) { this.store = store }
+
+  async load(appId: string, stamp: string): Promise<LoadResult> {
+    let storage = this.store.createStateStorage()
+    try { return await storage.load(appId, stamp) } finally { await storage.close() }
+  }
+
+  async readHeader(appId: string): Promise<StateHeader | null> {
+    let storage = this.store.createStateStorage()
+    try { return await storage.readHeader(appId) } finally { await storage.close() }
   }
 }
 
-function removeRecursive(path: string): void {
-  try {
-    fs.rmdirSync(path)
-  } catch (e) {
-    if ((e as BusinessError)?.code !== 13900002) { throw e as Error }
+class ProjectInitialState implements ProjectInitialStatePort {
+  private accept: (appId: string, stamp: string, encoded: string) => Promise<CommitResult>
+
+  constructor(accept: (appId: string, stamp: string, encoded: string) => Promise<CommitResult>) {
+    this.accept = accept
   }
+
+  acceptInitialState(appId: string, stamp: string, encoded: string): Promise<CommitResult> {
+    return this.accept(appId, stamp, encoded)
+  }
+}
+
+class ProjectStateCleanup implements ProjectStateTaskPoolCleanupPort {
+  private root: string
+  private uncertain: Map<string, StateIoError> = new Map<string, StateIoError>()
+
+  constructor(root: string) { this.root = root }
+
+  async removeStateFilesKeepingStableLocks(scope: ProjectStateScope): Promise<void> {
+    let prior = this.uncertain.get(scope.projectId)
+    if (prior !== undefined) { throw prior as Error }
+    let cleanup = new StateCleanupTaskPool(this.root, { directoryFsync: 'REQUIRED' })
+    let cleanupScope: StateCleanupScope = { projectId: scope.projectId, versionId: scope.versionId }
+    try { await cleanup.removeStateFilesKeepingStableLocks(cleanupScope) }
+    catch (error) {
+      if (error instanceof StateIoError && error.code === 'STATE_COMMIT_UNCERTAIN') {
+        this.uncertain.set(scope.projectId, error)
+      }
+      throw error as Error
+    }
+  }
+}
+
+class ProjectInitialStateOptions implements StateManagerOptions {
+  appId: string
+  stamp: string
+  mode: 'LIVE_PERSISTENT' = 'LIVE_PERSISTENT'
+  stateMaxBytes: number = STATE_MAX_BYTES
+  initialState: RuntimeValue = NULL_VALUE
+  storageFactory: StateStorageFactory
+  rollbackGuard?: VirtualMachine
+  vmJournal: boolean
+  journalMode: 'JOURNAL'
+
+  constructor(appId: string, stamp: string, factory: StateStorageFactory,
+      guard: VirtualMachine | undefined, flags: ProjectRuntimeFlags) {
+    this.appId = appId
+    this.stamp = stamp
+    this.storageFactory = factory
+    this.rollbackGuard = guard
+    this.vmJournal = flags.vmJournal
+    this.journalMode = flags.journalMode
+  }
+}
+
+class ProjectStateStorageFactory implements StateStorageFactory {
+  private store: ProjectStore
+
+  constructor(store: ProjectStore) { this.store = store }
+
+  create(): StateStoragePort { return this.store.createStateStorage() }
 }
 
 export class ProjectStore {
   private root: string = ''
+  private migration: ProjectStateMigration | null = null
+  private lifecycles: ProjectStateLifecycles = new ProjectStateLifecycles()
 
   init(filesDir: string): void {
-    this.root = filesDir + '/vera'
+    let root = filesDir + '/vera'
+    if (this.root.length > 0 && this.root !== root) { throw new Error('Project state root already initialized') }
+    this.root = root
     ensureDir(this.root)
+  }
+
+  stateRoot(): string {
+    if (this.root.length === 0) { throw new Error('Project state root not initialized') }
+    return this.root
+  }
+
+  runtimeFlags(): ProjectRuntimeFlags {
+    let safe: ProjectRuntimeFlags = { vmJournal: true, journalMode: 'JOURNAL' }
+    try {
+      let raw = JSON.parse(readJson(this.stateRoot() + '/runtime-flags.json', 4096)) as Record<string, Object>
+      if (raw === null || typeof raw !== 'object' || Array.isArray(raw) ||
+          Object.keys(raw).length !== 2 || (raw['vmJournal'] !== 'on' && raw['vmJournal'] !== 'off') ||
+          raw['journalMode'] !== 'JOURNAL') { return safe }
+      return { vmJournal: raw['vmJournal'] === 'on', journalMode: 'JOURNAL' }
+    } catch (_error) { return safe }
+  }
+
+  createStateStorage(): StateStoragePort {
+    return new StateIoTaskPool(this.stateRoot(), { directoryFsync: 'REQUIRED' }, STATE_MAX_BYTES)
+  }
+
+  registerStateLifecycle(port: ProjectStateLifecyclePort): () => void {
+    return this.lifecycles.register(port)
+  }
+
+  assertStateAdmission(appId: string): void {
+    this.stateMigration().assertStateAdmission(appId)
+  }
+
+  trackStateOperation<T>(appId: string, operation: () => Promise<T>): Promise<T> {
+    return this.stateMigration().trackStateOperation(appId, operation)
+  }
+
+  private stateMigration(): ProjectStateMigration {
+    if (this.migration === null) {
+      let cleanupPort = new ProjectStateCleanup(this.stateRoot())
+      let tasks = new ProjectStateTasks(this)
+      let initialState = new ProjectInitialState((appId: string, stamp: string, encoded: string): Promise<CommitResult> =>
+        this.acceptInitialState(appId, stamp, encoded))
+      this.migration = new ProjectStateMigration(this.migrationMetadata(), tasks, initialState, this.lifecycles, cleanupPort)
+    }
+    return this.migration
+  }
+
+  private async acceptInitialState(appId: string, stamp: string, encoded: string): Promise<CommitResult> {
+    let payload = canonicalPayload(validateEncodedState(encoded))
+    if (statePayloadBytes(payload).byteLength > STATE_MAX_BYTES) { throw new Error('PROJECT_READ_LIMIT') }
+    let seed = decodeRuntimeValue(JSON.parse(payload) as Object)
+    let flags = this.runtimeFlags()
+    let guard = flags.vmJournal ? new VirtualMachine(new BytecodeModule([], []), new EmptyHostEnvironment(), 0,
+      { now: (): number => systemDateTime.getUptime(systemDateTime.TimeType.STARTUP), deadlineMs: 1000 },
+      { journalMode: flags.journalMode }) : undefined
+    let storageFactory = new ProjectStateStorageFactory(this)
+    let options = new ProjectInitialStateOptions(appId, stamp, storageFactory, guard, flags)
+    let manager = new StateManager(options)
+    try {
+      let loaded = await manager.load()
+      if (loaded.kind !== 'ABSENT') { throw new Error('Initial state target is not absent') }
+      let published = await manager.publishGeneration()
+      if (published.status !== 'UNCHANGED' || published.reason !== 'ABSENT') {
+        throw new Error('Initial state generation not accepted: ' + published.status)
+      }
+      let tx = manager.beginTurn('IMMEDIATE', 'CARRY')
+      manager.setWorkingState(tx, seed)
+      let result = await manager.commitTurn(tx)
+      if (result.status !== 'COMMITTED') { throw new Error('Initial state not accepted: ' + result.status) }
+      return result
+    } finally { await manager.close() }
   }
 
   private indexPath(): string { return this.root + '/index.json' }
@@ -149,44 +303,12 @@ export class ProjectStore {
     return this.projectDir(projectId) + '/' + versionId + '.json'
   }
 
-  /**
-   * Saved program state lives beside its version rather than inside it, so
-   * rewriting a version's bytecode cannot clobber the record, and deleting a
-   * version takes its state with it.
-   */
-  private statePath(projectId: string, versionId: string): string {
-    return this.projectDir(projectId) + '/' + versionId + '.state.json'
+  loadState(projectId: string, versionId: string, stamp: string, maxBytes: number = 0): Promise<string> {
+    return this.stateMigration().loadState(projectId, versionId, stamp, maxBytes)
   }
 
-  /**
-   * The stamp ties saved state to the exact program that produced it. Refining a
-   * program changes its bytecode, and the old state may no longer fit the new
-   * AppState shape, so a mismatched stamp means start clean rather than restore
-   * something that will trap on the first field access.
-   */
-  saveState(projectId: string, versionId: string, stamp: string, encoded: string): void {
-    ensureDir(this.projectDir(projectId))
-    let payload: Record<string, Object> = {}
-    payload['stamp'] = stamp
-    payload['value'] = JSON.parse(encoded) as Object
-    writeStateJson(this.statePath(projectId, versionId), JSON.stringify(payload))
-  }
-
-  /** Returns the encoded value, or '' when there is nothing usable to restore. */
-  loadState(projectId: string, versionId: string, stamp: string, maxBytes: number = 0): string {
-    let text = readJson(this.statePath(projectId, versionId), maxBytes, maxBytes > 0)
-    if (text.length === 0) { return '' }
-    try {
-      let obj = JSON.parse(text) as Record<string, Object>
-      if ((obj['stamp'] as string) !== stamp) { return '' }
-      return JSON.stringify(obj['value'])
-    } catch (_e) {
-      return ''
-    }
-  }
-
-  clearState(projectId: string, versionId: string): void {
-    try { fs.unlinkSync(this.statePath(projectId, versionId)) } catch (_e) {}
+  clearState(projectId: string, versionId: string): Promise<void> {
+    return this.stateMigration().clearState(projectId, versionId)
   }
 
   private readIndex(maxBytes: number = 0): Project[] {
@@ -218,7 +340,16 @@ export class ProjectStore {
       obj['createdAt'] = p.createdAt
       arr.push(obj)
     }
-    writeJson(this.indexPath(), JSON.stringify(arr))
+    let path = this.indexPath()
+    let temp = path + '.' + Date.now().toString() + '.' + Math.random().toString().substring(2) + '.tmp'
+    try {
+      writeJson(temp, JSON.stringify(arr))
+      fs.renameSync(temp, path)
+    } catch (error) {
+      throw error as Error
+    } finally {
+      try { fs.unlinkSync(temp) } catch (_error) {}
+    }
   }
 
   listProjects(maxBytes: number = 0): Project[] {
@@ -276,16 +407,9 @@ export class ProjectStore {
     this.writeIndex(projects)
   }
 
-  deleteProject(id: string): void {
-    let projects = this.readIndex()
-    if (!projects.some((p: Project) => p.id === id)) { return }
-    let filtered: Project[] = []
-    for (let p of projects) {
-      if (p.id !== id) { filtered.push(p) }
-    }
-    this.summaries.delete(id)
-    removeRecursive(this.projectDir(id))
-    this.writeIndex(filtered)
+  deleteProject(id: string): Promise<void> {
+    if (this.getProject(id) === null && !this.canRetryProjectRemoval(id)) { return Promise.resolve() }
+    return this.stateMigration().deleteProject(id)
   }
 
   listVersions(projectId: string, maxBytes: number = 0, canRead: (() => boolean) | null = null): Version[] {
@@ -335,14 +459,10 @@ export class ProjectStore {
   createVersion(projectId: string, source: string, vbc2: string, note: string,
       prompt: string = '', origin: string = '', composition: string = '',
       lastPrompt: string = '', parentVersionId: string = '', metrics: VersionMetrics | null = null,
-      initialState: string = '', initialStamp: string = ''): Version {
-    ensureDir(this.projectDir(projectId))
-    let v = this.prepareVersion({ projectId: projectId, source: source, vbc2: vbc2, note: note,
+      initialState: string = '', initialStamp: string = ''): Promise<Version> {
+    return this.stateMigration().createVersion({ projectId: projectId, source: source, vbc2: vbc2, note: note,
       prompt: prompt, origin: origin, composition: composition, lastPrompt: lastPrompt,
-      parentVersionId: parentVersionId, metrics: metrics })
-    if (initialState.length > 0) { this.saveState(projectId, v.id, initialStamp, initialState) }
-    this.publishVersion(v)
-    return v
+      parentVersionId: parentVersionId, metrics: metrics, initialState: initialState, initialStamp: initialStamp })
   }
 
   private prepareVersion(input: ProjectVersionInput): Version {
@@ -363,6 +483,7 @@ export class ProjectStore {
   }
 
   private publishVersion(v: Version): void {
+    ensureDir(this.projectDir(v.projectId))
     let obj: Record<string, Object> = {}
     obj['id'] = v.id
     obj['projectId'] = v.projectId
@@ -387,7 +508,11 @@ export class ProjectStore {
       listVersions: (projectId: string): Version[] => this.listVersions(projectId),
       removeVersionMetadata: (projectId: string, versionId: string): void => {
         this.summaries.delete(projectId)
-        fs.unlinkSync(this.versionPath(projectId, versionId))
+        try { fs.unlinkSync(this.versionPath(projectId, versionId)) } catch (error) {
+          if (error === null || error === undefined || (error as BusinessError).code !== 13900002) {
+            throw error as Error
+          }
+        }
       },
       removeProjectMetadata: (projectId: string): void => {
         this.summaries.delete(projectId)
@@ -421,26 +546,16 @@ export class ProjectStore {
     writeJson(this.versionPath(projectId, versionId), JSON.stringify(obj))
   }
 
-  deleteVersion(projectId: string, versionId: string): boolean {
-    let versions = this.listVersions(projectId)
-    let found = false
-    for (let v of versions) {
-      if (v.id === versionId) { found = true; break }
-    }
-    if (!found) { return false }
-    if (versions.length === 1) {
-      this.deleteProject(projectId)
-      return true
-    }
-    try {
-      fs.unlinkSync(this.versionPath(projectId, versionId))
-    } catch (e) {
-      console.error('Delete version file failed: ' + (e as Error).message)
-      throw e as Error
-    }
-    this.clearState(projectId, versionId)
-    this.summaries.delete(projectId)
-    return false
+  canRetryProjectRemoval(projectId: string): boolean {
+    return this.stateMigration().canRetryProjectRemoval(projectId)
+  }
+
+  canRetryVersionRemoval(projectId: string, versionId: string): boolean {
+    return this.stateMigration().canRetryVersionRemoval(projectId, versionId)
+  }
+
+  deleteVersion(projectId: string, versionId: string): Promise<boolean> {
+    return this.stateMigration().deleteVersion(projectId, versionId)
   }
 
   private metricNumber(obj: Record<string, Object>, key: string): number {

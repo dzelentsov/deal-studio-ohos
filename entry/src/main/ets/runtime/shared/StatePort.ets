@@ -113,13 +113,33 @@ export interface StateManagerStatus {
   readonly pendingOperations: number
 }
 
-export interface StateDiagnostic {
+export interface StateDiagnostic extends StateDiagnosticMetrics {
   readonly code: string
   readonly appId: string
   readonly vmGeneration: number
   readonly baseRevision: number
   readonly stage: string
   readonly dirtyAgeMs: number
+}
+
+export interface StateDiagnosticMetrics {
+  readonly vmGeneration?: number
+  readonly baseRevision?: number
+  readonly revision?: number
+  readonly durationMs?: number
+  readonly commitClass?: string
+  readonly turnSource?: string
+  readonly format?: string
+  readonly loadSource?: string
+  readonly outcome?: string
+  readonly dirty?: boolean
+  readonly transientFailures?: number
+  readonly reloadAttempts?: number
+  readonly payloadBytes?: number
+  readonly commitsPerSecond?: number
+  readonly p95DurationMs?: number
+  readonly sampleCount?: number
+  readonly windowMs?: number
 }
 
 export interface StatePort {

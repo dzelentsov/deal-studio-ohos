@@ -100,6 +100,18 @@ export interface VmSafetyOptions {
   journalMaxEntries?: number
 }
 
+export interface VmDiagnostic {
+  entryCategory?: string
+  operation?: string
+  outcome?: string
+  durationMs?: number
+  steps?: number
+  records?: number
+  reservations?: number
+  rollbacks?: number
+  safety?: boolean
+}
+
 export interface VmSafetyDiagnostics {
   readonly journalReservations: number
   readonly journalUndoRecords: number
@@ -161,6 +173,7 @@ class VmUndoRecord {
 
 export abstract class HostEnvironment {
   abstract invoke(module: string, name: string, args: RuntimeValue[], awaited: boolean): RuntimeValue
+  observeDiagnostics(observer: () => void): void { observer() }
   beginSafetyTurn(_reserve: () => void): VmHostSafetyScope {
     throw new RuntimeTrap('R-JOURNAL', 'host does not support safety turns')
   }
@@ -280,6 +293,12 @@ export class VirtualMachine {
   private safetyFailure: RuntimeTrap | null = null
   private turnToken: VmTurnToken | null = null
   private usedTransactions: WeakSet<Object> = new WeakSet<Object>()
+  private diagnostic: ((event: string, attributes: VmDiagnostic) => void) | null = null
+  private diagnosticEntry: string = 'HANDLER'
+  private diagnosticCall: number = 0
+  private diagnosticEmitting: boolean = false
+  private diagnosticEnabled: (() => boolean) | null = null
+  private diagnosticDurationMs: number = 0
 
   constructor(module: BytecodeModule, host: HostEnvironment = new EmptyHostEnvironment(), maxSteps: number = 5000000,
       budget: VmExecutionBudget | null = null, safety: VmSafetyOptions | null = null) {
@@ -316,6 +335,76 @@ export class VirtualMachine {
     }
   }
 
+  setDiagnostic(sink: (event: string, attributes: VmDiagnostic) => void, enabled?: () => boolean): void {
+    this.assertOutsideDiagnostic()
+    this.diagnostic = sink
+    this.diagnosticEnabled = enabled === undefined ? null : enabled
+    this.emitDiagnostic('VM_SAFETY_SWITCH', { safety: this.safetyEnabled })
+  }
+
+  observeDiagnostics(observer: () => void): void {
+    let previous = this.diagnosticEmitting
+    this.diagnosticEmitting = true
+    try { this.host.observeDiagnostics(observer) } catch (_error) {}
+    finally { this.diagnosticEmitting = previous }
+  }
+
+  private assertOutsideDiagnostic(): void {
+    if (this.diagnosticEmitting) { throw new RuntimeTrap('R-JOURNAL', 'VM operation during diagnostics') }
+  }
+
+  private diagnosticsActive(): boolean {
+    if (this.diagnostic === null || this.diagnosticEmitting) { return false }
+    if (this.diagnosticEnabled === null) { return true }
+    let enabled = false
+    this.observeDiagnostics((): void => { enabled = this.diagnosticEnabled!() === true })
+    return enabled
+  }
+
+  private emitDiagnostic(event: string, attributes: VmDiagnostic): void {
+    if (!this.diagnosticsActive()) { return }
+    this.observeDiagnostics((): void => { this.diagnostic?.(event, attributes) })
+  }
+
+  private entryCategory(entry: string): string {
+    if (entry === 'init') { return 'INIT' }
+    if (entry === 'view') { return 'VIEW' }
+    if (entry === 'widget') { return 'WIDGET' }
+    if (entry === 'draw') { return 'DRAW' }
+    if (entry === 'buildScene') { return 'BUILD_SCENE' }
+    return 'HANDLER'
+  }
+
+  private observedExecute(entry: string, args: RuntimeValue[], pure: boolean): RuntimeValue {
+    this.assertOutsideDiagnostic()
+    if (!this.diagnosticsActive()) {
+      return pure ? this.executeSafety(entry, args, true) : this.executeUnobserved(entry, args)
+    }
+    let started = this.budgetNow === null ? Date.now() : 0
+    let outcome = 'OK'
+    let previous = this.diagnosticEntry
+    let call = this.diagnosticCall
+    this.diagnosticEntry = this.entryCategory(entry)
+    try { return pure ? this.executeSafety(entry, args, true) : this.executeUnobserved(entry, args) }
+    catch (error) {
+      outcome = error instanceof RuntimeTrap ? error.trapCode === 'R-PURE' ? 'PURE' :
+        error.trapCode === 'R-JOURNAL' ? 'JOURNAL' :
+        error.trapCode === 'R-BUDGET' || error.trapCode === 'R0017' ? 'BUDGET' : 'TRAP' : 'TRAP'
+      throw error as Error
+    } finally {
+      this.emitDiagnostic('VM_EXECUTE', { entryCategory: this.diagnosticEntry,
+        steps: call === this.diagnosticCall ? 0 : this.steps,
+        durationMs: this.budgetNow === null ? Math.max(0, Date.now() - started) :
+          call === this.diagnosticCall ? 0 : this.diagnosticDurationMs, outcome: outcome })
+      this.diagnosticEntry = previous
+    }
+  }
+
+  private pureViolation(operation: string): void {
+    this.emitDiagnostic('VM_PURE_VIOLATION', { entryCategory: this.diagnosticEntry, operation: operation,
+      outcome: 'PURE' })
+  }
+
   private failSafety(code: string, message: string): RuntimeTrap {
     this.safetyViolations += 1
     this.safetyFailed = true
@@ -329,6 +418,7 @@ export class VirtualMachine {
   }
 
   beginTurn(tx: Object, _root: RuntimeValue): VmSafetyTurnScope {
+    this.assertOutsideDiagnostic()
     if (!this.safetyEnabled) { throw new RuntimeTrap('R-JOURNAL', 'VM safety is disabled') }
     if (this.safetyExecuting || this.safetySettling) {
       throw this.failSafety('R-JOURNAL', 'reentrant turn begin')
@@ -361,6 +451,7 @@ export class VirtualMachine {
       this.safetySettling = false
     }
     let settle = (receiver: VmSafetyTurnScope, action: string): void => {
+      this.assertOutsideDiagnostic()
       if (receiver !== scope) { throw this.failSafety('R-JOURNAL', 'foreign safety scope receiver') }
       this.settleTurn(token, hostScope, action)
     }
@@ -369,6 +460,7 @@ export class VirtualMachine {
   }
 
   private settleTurn(token: VmTurnToken, hostScope: VmHostSafetyScope, action: string): void {
+    this.assertOutsideDiagnostic()
     if (this.safetyInvalid || this.safetyExecuting || this.safetySettling || this.turnToken !== token) {
       throw this.failSafety('R-JOURNAL', 'invalid or reentrant turn settlement')
     }
@@ -377,6 +469,7 @@ export class VirtualMachine {
     }
     this.safetySettling = true
     let violations = this.safetyViolations
+    let settled = false
     try {
       if (action === 'rollback') {
         for (let i = this.journal.length - 1; i >= 0; i--) { this.journal[i].undo() }
@@ -384,10 +477,15 @@ export class VirtualMachine {
       } else if (action === 'accept') { hostScope.accept() }
       else { this.safetyInvalid = true; hostScope.discard() }
       if (this.safetyViolations !== violations) { throw this.failSafety('R-JOURNAL', 'reentrant safety settlement') }
+      settled = true
     } catch (e) {
       this.safetyInvalid = true
       throw this.failSafety('R-JOURNAL', 'host safety settlement failed')
     } finally {
+      this.emitDiagnostic('VM_JOURNAL', { records: this.journal.length, reservations: this.journalCount,
+        rollbacks: action === 'rollback' && settled ? 1 : 0,
+        outcome: !settled ? 'FAILED' :
+          action === 'rollback' ? 'ROLLBACK' : action === 'accept' ? 'ACCEPT' : 'DISCARD' })
       this.turnToken = null
       this.turnBoundary = -1
       this.journal = []
@@ -398,24 +496,33 @@ export class VirtualMachine {
   }
 
   private reserveHost(token: VmTurnToken): void {
+    this.assertOutsideDiagnostic()
     if (this.turnToken !== token || !this.safetyExecuting || this.safetySettling) {
       throw this.failSafety('R-JOURNAL', 'host reservation outside execution')
     }
     this.checkSafety()
-    if (this.pureBoundary >= 0) { throw this.failSafety('R-PURE', 'host mutation in pure call') }
+    if (this.pureBoundary >= 0) {
+      this.pureViolation('HOST')
+      throw this.failSafety('R-PURE', 'host mutation in pure call')
+    }
     this.reserveJournal()
   }
 
   private reserveJournal(): void {
     this.checkSafety()
-    if (this.journalCount >= this.journalLimit) { throw this.failSafety('R-JOURNAL', 'journal capacity exceeded') }
+    if (this.journalCount >= this.journalLimit) {
+      this.emitDiagnostic('VM_JOURNAL', { outcome: 'OVERFLOW', records: this.journal.length,
+        reservations: this.journalCount })
+      throw this.failSafety('R-JOURNAL', 'journal capacity exceeded')
+    }
     this.journalCount += 1
   }
 
-  private reserveWrite(born: number): boolean {
+  private reserveWrite(born: number, operation: string): boolean {
     if (!this.safetyEnabled) { return false }
     this.checkSafety()
     if (this.pureBoundary >= 0 && born <= this.pureBoundary) {
+      this.pureViolation(operation)
       throw this.failSafety('R-PURE', 'write to pre-existing storage in pure call')
     }
     if (born > this.turnBoundary) { return false }
@@ -424,7 +531,7 @@ export class VirtualMachine {
   }
 
   private storeCell(cell: Cell, value: RuntimeValue): void {
-    if (this.reserveWrite(cellBirths.get(cell) || 0)) {
+    if (this.reserveWrite(cellBirths.get(cell) || 0, 'CELL')) {
       let record = new VmUndoRecord('cell')
       record.cell = cell
       record.value = cell.value
@@ -435,7 +542,7 @@ export class VirtualMachine {
 
   executePure(entry: string, args: RuntimeValue[] = []): RuntimeValue {
     if (!this.safetyEnabled) { return this.execute(entry, args) }
-    return this.executeSafety(entry, args, true)
+    return this.observedExecute(entry, args, true)
   }
 
   private executeSafety(entry: string, args: RuntimeValue[], pure: boolean): RuntimeValue {
@@ -462,6 +569,7 @@ export class VirtualMachine {
         if (pure) { this.host.setSafetyPure(false); this.checkSafety() }
       } catch (e) {
         this.safetyFailed = true
+        if (this.safetyFailure === null) { this.pureViolation('CLEANUP') }
         throw this.failSafety('R-PURE', 'pure host cleanup failed')
       } finally {
         this.pureBoundary = -1
@@ -494,6 +602,10 @@ export class VirtualMachine {
   }
 
   execute(entry: string, args: RuntimeValue[] = []): RuntimeValue {
+    return this.observedExecute(entry, args, false)
+  }
+
+  private executeUnobserved(entry: string, args: RuntimeValue[]): RuntimeValue {
     if (this.safetyEnabled) { return this.executeSafety(entry, args, false) }
     if (this.budgetNow !== null) { return this.executeBudgeted(entry, args) }
     let fn = this.functions.get(entry)
@@ -501,6 +613,7 @@ export class VirtualMachine {
       throw new RuntimeTrap('R0001', `entry function not found: ${entry}`)
     }
     this.steps = 0
+    this.diagnosticCall++
     return this.run(new Frame(fn, [], args))
   }
 
@@ -509,7 +622,9 @@ export class VirtualMachine {
     this.budgetActive = true
     this.budgetFailure = null
     this.budgetStartedAt = -1
+    this.diagnosticDurationMs = 0
     this.steps = 0
+    this.diagnosticCall++
     let fn = this.functions.get(entry)
     try {
       this.checkBudget()
@@ -523,6 +638,8 @@ export class VirtualMachine {
       if (error instanceof RuntimeTrap && error.line === 0 && fn !== undefined) { locateTrap(error, fn, 0) }
       throw error
     } finally {
+      this.diagnosticDurationMs = this.budgetStartedAt < 0 ? 0 :
+        Math.max(0, this.budgetLastNow - this.budgetStartedAt)
       this.budgetFrame = null
       this.budgetStartedAt = -1
       this.budgetFailure = null
@@ -677,7 +794,7 @@ export class VirtualMachine {
           if (arr.elements.length >= 4096) {
             throw new RuntimeTrap('R0022', 'array length limit reached (4096)')
           }
-          if (this.reserveWrite(arrayBirths.get(arr.elements) || 0)) {
+          if (this.reserveWrite(arrayBirths.get(arr.elements) || 0, 'ARRAY')) {
             let record = new VmUndoRecord('push')
             record.array = arr.elements
             record.length = arr.elements.length
@@ -692,7 +809,7 @@ export class VirtualMachine {
           if (arr.elements.length === 0) {
             throw new RuntimeTrap('R0023', 'pop from an empty array')
           }
-          if (this.reserveWrite(arrayBirths.get(arr.elements) || 0)) {
+          if (this.reserveWrite(arrayBirths.get(arr.elements) || 0, 'ARRAY')) {
             let record = new VmUndoRecord('pop')
             record.array = arr.elements
             record.index = arr.elements.length - 1
@@ -738,7 +855,7 @@ export class VirtualMachine {
           let idx = this.index(this.pop(frame))
           let arr = this.asArray(this.pop(frame))
           this.indexValue(arr, idx)
-          if (this.reserveWrite(arrayBirths.get(arr.elements) || 0)) {
+          if (this.reserveWrite(arrayBirths.get(arr.elements) || 0, 'ARRAY')) {
             let record = new VmUndoRecord('index')
             record.array = arr.elements
             record.index = idx
@@ -768,7 +885,7 @@ export class VirtualMachine {
           let v = this.pop(frame)
           let obj = this.asObject(this.pop(frame))
           if (!obj.fields.has(inst.name)) { throw new RuntimeTrap('R0010', `missing field ${inst.name}`) }
-          if (this.reserveWrite(objectBirths.get(obj.fields) || 0)) {
+          if (this.reserveWrite(objectBirths.get(obj.fields) || 0, 'OBJECT')) {
             let record = new VmUndoRecord('field')
             record.fields = obj.fields
             record.key = inst.name
@@ -811,6 +928,9 @@ export class VirtualMachine {
           this.checkBudget()
           frame.stack.push(result)
         } catch (e) {
+          if (e instanceof RuntimeTrap && e.trapCode === 'R-PURE' && this.safetyFailure === null) {
+            this.pureViolation('HOST')
+          }
           throw this.checkBudgetOnError(e as Error)
         }
       }

@@ -8,6 +8,8 @@ const {loadSource, loadVera, sourceRoot} = require('./source-loader')
 const ts = require(process.env.VERA_TYPESCRIPT_PATH || 'typescript')
 const {createPreview, effectRequest, seedEffects} = require('./preview-fixture')
 const fixtures = new Set()
+let fixtureId = 0
+const worker = require('./state-io-check').createWorkerFixture('/trace-fixture/vera')
 const traceFile = path.join(sourceRoot, 'runtime/trace/StageTrace.ets')
 if (!fs.existsSync(traceFile)) {
   console.error('stage-trace-check: BLOCKED: runtime/trace/StageTrace.ets is not present')
@@ -122,7 +124,27 @@ function probe(askBeforeCalls = false) {
   global.Trace = () => {}
   const V = loadVera('VeraInterpreter'), U = loadVera('VeraUi')
   let now = 10000, handle = 0, paints = 0, p, frameEffects = []
-  const calls = [], snapshots = [], saves = [], replies = [], loads = [], timers = new Map(), disk = new Map()
+  const stateRoot = '/trace-fixture-' + (++fixtureId) + '/vera'
+  const calls = [], snapshots = [], saves = [], replies = [], loads = [], timers = new Map()
+  const disk = {
+    get(key) {
+      const text = worker.disk.get(stateRoot + '/' + key + '.state.json')
+      if (!text) return undefined
+      const value = JSON.parse(text)
+      return JSON.stringify(value.value)
+    },
+    set(key, encoded) {
+      const file = stateRoot + '/' + key + '.state.json', prior = worker.disk.get(file)
+      try {
+        let header = null
+        try { header = prior ? JSON.parse(prior) : null } catch (_error) {}
+        worker.disk.set(file, format.assembleStateFile({appId: key, schemaVersion: 1,
+          vmGeneration: header?.vmGeneration || 1, revision: (header?.revision || 0) + 1,
+          stamp: 'fixture-stamp'}, encoded))
+      } catch (_error) { worker.disk.set(file, encoded) }
+      return this
+    }
+  }
   const faults = {save: false, view: false, draw: false, media: false}
   const media = {matches: false, on(event, callback) { this.callback = callback }, off() {}}
   const surface = Object.assign(new U.VeraUiNode(), {kind: 'surface', action: 'step', label: 'draw', minimum: 100, maximum: 100, style: 'default'})
@@ -143,47 +165,114 @@ function probe(askBeforeCalls = false) {
       if (action === 'tick') return args[0]
       return args[1] || args[0]
     }
+    executePure(action, args) { return this.execute(action, args) }
+    beginTurn() {
+      const effects = this.host.pendingEffects.slice(), allowed = this.host.effectsAllowed
+      return {accept() {}, discard() {}, rollback: () => {
+        this.host.pendingEffects = effects
+        this.host.effectsAllowed = allowed
+      }}
+    }
     stepsExecuted() { return 1 }
   }
+  Machine.prototype.coverage = 'GRAPH_SLOTS_DEFERRED_INTENTS'
   const platform = (...args) => new Promise((resolve, reject) => replies.push({args, resolve, reject}))
   const mocks = {StageTrace, consent: {has: () => false, remember() {}},
     paintGfx() { paints++ }, runRawIntent: platform, runSdkAdapter: platform,
-    scheduleCardRefresh() {}, Date: {now: () => now}, console: {info() {}, warn() {}, error() {}},
+    scheduleCardRefresh() {}, Date: class extends Date { static now() { return now } }, console: {info() {}, warn() {}, error() {}},
     setInterval(callback, interval) { timers.set(++handle, {callback, interval}); return handle },
-    clearInterval(id) { timers.delete(id) },
-    store: {loadState(project, version) { loads.push([project, version]); return disk.get(project + '/' + version) || '' },
-      saveState(project, version, stamp, encoded) {
-        if (faults.save) throw Error('fixture save')
-        disk.set(project + '/' + version, encoded); saves.push(encoded)
-      }}}
+    clearInterval(id) { timers.delete(id) }}
+  const forbidden = name => new Proxy({}, {get(_target, key) {
+    throw Error('Forbidden platform access: ' + name + '.' + String(key))
+  }})
   const dependencies = {
+    '@kit.BasicServicesKit': {systemDateTime: {TimeType: {STARTUP: 0}, getUptime: () => now}},
+    '@kit.ArkTS': {util: {
+      TextEncoder: class { encodeInto(text) { return new TextEncoder().encode(text) } },
+      TextDecoder: {create(encoding, options) {
+        const decoder = new TextDecoder(encoding, options)
+        return {decodeToString: (value, decodeOptions) => decoder.decode(value, decodeOptions)}
+      }},
+      generateRandomUUID: () => require('node:crypto').randomUUID()
+    }, taskpool: worker.taskpool},
+    '@kit.CoreFileKit': {fileIo: new Proxy(worker.filesystem, {get(target, key) {
+      if (key === 'readTextSync') return file => {
+        assert(!worker.workerActive(), 'worker must use bounded byte reads')
+        if (!worker.disk.has(file)) throw Object.assign(Error('absent'), {code: 13900002})
+        return worker.disk.get(file)
+      }
+      if (key === 'mkdirSync') return file => {
+        if (worker.workerActive()) return target.mkdirSync(file)
+        const parent = dir => {
+          if (worker.memory.nodes.has(dir)) return
+          if (dir !== '/') parent(path.dirname(dir))
+          worker.memory.put(dir, '', 'dir')
+        }
+        parent(file)
+      }
+      if (key === 'statSync') return file => worker.workerActive() ? target.statSync(file) : worker.memory.statSync(file)
+      return target[key]
+    }})},
+    '@ohos.fileio': {default: worker.legacyFilesystem},
+    '@kit.CryptoArchitectureKit': {cryptoFramework: {createMd(algorithm) {
+      assert.equal(algorithm, 'SHA256')
+      const hash = require('node:crypto').createHash('sha256')
+      return {updateSync({data}) { hash.update(data) }, digestSync() { return {data: hash.digest()} }}
+    }}},
     '../vera/VeraInterpreter': {...V, VirtualMachine: Machine,
       deserializeVbc2: value => { if (value === 'broken') throw Error('fixture bytecode'); return {functions: []} }},
     '../vera/VeraUi': {UiHostEnvironment: Host, decodeVeraUi: value => value},
     '../vera/VeraGfx': {...loadVera('VeraGfx'), decodeGfx: value => value},
-    '../vera/VeraStateCarry': loadVera('VeraStateCarry'), '../vera/ProjectStore': {store: mocks.store},
-    './trace/StageTrace': {StageTrace}, '../vera/VeraConsentStore': {consent: mocks.consent},
+    '../vera/VeraStateCarry': loadVera('VeraStateCarry'),
+    './trace/StageTrace': {StageTrace, StateLifecycleDiag: loadSource(traceFile).StateLifecycleDiag}, '../vera/VeraConsentStore': {consent: mocks.consent},
     '../vera/VeraIntents': {runRawIntent: platform}, '../vera/VeraSdkBackend': {runSdkAdapter: platform}
   }
   const cache = new Map()
   function load(file) {
     file = path.resolve(file)
     if (cache.has(file)) return cache.get(file).exports
-    const compiled = ts.transpileModule(fs.readFileSync(file, 'utf8'), {fileName: file.replace(/\.ets$/, '.ts'),
+    const compiled = ts.transpileModule(fs.readFileSync(file, 'utf8').replace(/^@Concurrent\s*$/gm, ''), {fileName: file.replace(/\.ets$/, '.ts'),
       compilerOptions: {target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.CommonJS}, reportDiagnostics: true})
     assert.deepEqual((compiled.diagnostics || []).filter(d => d.category === ts.DiagnosticCategory.Error), [], file)
     const mod = {exports: {}}
     cache.set(file, mod)
     new Function('require', 'module', 'exports', 'Date', 'console', compiled.outputText)(id => {
       if (Object.hasOwn(dependencies, id)) return dependencies[id]
+      if (id.startsWith('@kit.') || id === 'libllama.so') return forbidden(id)
       assert(id.startsWith('.'), 'unexpected runtime dependency ' + id)
       return load(path.resolve(path.dirname(file), id + '.ets'))
     }, mod, mod.exports, mocks.Date, mocks.console)
     return mod.exports
   }
+  const format = load(path.join(sourceRoot, 'runtime/StateFileFormat.ets'))
+  const {store} = load(path.join(sourceRoot, 'vera/ProjectStore.ets'))
+  store.init(stateRoot.slice(0, -5))
+  mocks.store = store
+  const createStorage = store.createStateStorage.bind(store)
+  store.createStateStorage = () => {
+    const storage = createStorage(), read = storage.load.bind(storage), header = storage.readHeader.bind(storage), commit = storage.commit.bind(storage)
+    storage.load = (appId, stamp) => { loads.push({kind: 'load', appId}); return read(appId, stamp) }
+    storage.readHeader = appId => { loads.push({kind: 'header', appId}); return header(appId) }
+    storage.commit = request => {
+      if (faults.save) worker.memory.fail('open', event => event.path.startsWith(stateRoot + '/') && event.path.endsWith('.tmp'))
+      const encoded = Buffer.from(request.payload).toString('utf8')
+      return commit(request).then(result => {
+        if (result.result.status === 'COMMITTED') {
+          const stored = format.validateStateFile(worker.disk.get(stateRoot + '/' + request.pre.appId + '.state.json'), request.pre.appId, 1)
+          assert.equal(stored.revision, request.pre.baseRevision + 1)
+          assert.equal(stored.vmGeneration, request.pre.vmGeneration)
+          saves.push(encoded)
+        }
+        return result
+      })
+    }
+    return storage
+  }
   const {InProcessHost, HostOperationFailure} = load(path.join(sourceRoot, 'runtime/InProcessHost.ets'))
   const {HostEffectsBridge} = load(path.join(sourceRoot, 'runtime/HostEffectsBridge.ets'))
   const runtime = new InProcessHost(() => now)
+  const deliverEffects = runtime.deliverEffects.bind(runtime)
+  runtime.deliverEffects = (record, effects, version = runtime.hostVersion(record)) => deliverEffects(record, effects, version)
   const made = createPreview({runtime, HostOperationFailure, HostEffectsBridge, mocks, askBeforeCalls})
   p = made.probe
   const createActor = runtime.createActor
@@ -435,14 +524,15 @@ async function main() {
   await test('real renderer load/action order, reveal and payload privacy', async () => {
     const records = capture(), f = probe(), {p, V} = f
     await loaded(p)
-    assert.equal(p.error, '')
+    assert.equal(p.error, '', JSON.stringify(records))
     sequence(records, ['EXECUTE', 'SNAPSHOT', 'FRAME'])
     assert.equal(f.snapshots.length, 1)
-    records.length = 0
+    assert.equal(f.saves.length, 1, 'initial state is durable before publication')
+    records.length = 0; f.saves.length = 0
     p.dispatch('tap', payload(secret))
     await settled(p)
     assert.equal(p.error, '')
-    sequence(records, ['EXECUTE', 'INPUT_APPLIED', 'SNAPSHOT', 'FRAME', 'SAVE'])
+    sequence(records, ['EXECUTE', 'STATE_COMMIT_BEGIN', 'STATE_COMMIT_OK', 'SNAPSHOT', 'FRAME', 'INPUT_APPLIED'])
     assert.equal(f.saves.length, 1)
     assert.equal(f.calls.find(call => call.action === 'tap').allowed, true)
     assert(f.calls.filter(call => call.action === 'view').every(call => !call.allowed))
@@ -469,6 +559,7 @@ async function main() {
     StageTrace.digest = () => { hashes++; throw Error('disabled renderer digest called') }
     try {
       await loaded(first.p)
+      first.saves.length = 0
       first.p.dispatch('tap', payload(secret))
       await settled(first.p)
       assert.equal(first.p.error, '')
@@ -479,11 +570,11 @@ async function main() {
   })
   await test('real renderer traps clear effects, stop timers and never commit input', async () => {
     const records = capture(), f = probe(), {p, V, replies, saves} = f
-    await loaded(p); records.length = 0
+    await loaded(p); records.length = 0; saves.length = 0
     const state = await snapshot(p)
     p.dispatch('trap', payload(secret))
     await settled(p)
-    assert.match(p.error, /Action error: fixture trap/)
+    assert.equal(p.error, 'fixture trap')
     assert.equal(await snapshot(p), state)
     assert.equal(f.host().effectsAllowed, false)
     assert.deepEqual(f.host().pendingEffects, [])
@@ -492,8 +583,8 @@ async function main() {
     sequence(records, ['EXECUTE', 'ERROR', 'TIMERS_STOPPED'])
     for (const event of ['INPUT_APPLIED', 'SNAPSHOT', 'FRAME', 'SAVE', 'EFFECT_REQUEST']) assert(!events(records).includes(event), event)
     p.vbc2 = 'broken'; records.length = 0; await loaded(p)
-    assert.equal(p.error, 'ACTOR_NOT_READY')
-    assert(records.some(record => record.event === 'ERROR' && record.attributes.kind === 'INIT'))
+    assert.equal(p.error, 'fixture bytecode')
+    assert(records.some(record => record.event === 'ERROR' && record.attributes.kind === 'init'))
     privateRecords(records)
   })
   await test('real field-action queue blocks composition, applies in order and drops stale actions', async () => {
@@ -562,7 +653,7 @@ async function main() {
     await settled(p)
     sequence(records, ['EXECUTE', 'DRAW', 'SURFACE_FRAME'])
     assert.deepEqual(records.find(record => record.event === 'SURFACE_FRAME').attributes,
-      {actions: ['step'], draws: ['draw'], save: 'DONE'})
+      {actions: ['step'], draws: ['draw'], save: 'NOT_DUE'})
     assert.equal(p.error, '')
     assert.equal(calls.find(call => call.action === 'step').allowed, true)
     assert.equal(calls.find(call => call.action === 'draw').allowed, false)
@@ -581,7 +672,7 @@ async function main() {
     assert.equal(replies.length, 1)
     assert(events(records).includes('EFFECT_REQUEST'))
     replies[0].resolve(secret); await settled(p)
-    sequence(records, ['EFFECT_REQUEST', 'EFFECT_RESULT', 'EXECUTE', 'INPUT_APPLIED', 'SNAPSHOT', 'FRAME', 'SAVE'])
+    sequence(records, ['EFFECT_REQUEST', 'EFFECT_RESULT', 'EXECUTE', 'STATE_COMMIT_BEGIN', 'STATE_COMMIT_OK', 'SNAPSHOT', 'FRAME', 'INPUT_APPLIED'])
     assert(calls.find(call => call.action === 'answer').args[1] instanceof V.VeraStringValue)
     assert.equal(new Set(records.map(record => record.session)).size, 1)
     privateRecords(records)
@@ -613,30 +704,34 @@ async function main() {
     }
   })
   await test('resume reports both reload decisions without extra store loads', async () => {
-    const records = capture(), {p, V, disk, loads} = probe()
+    const records = capture(), {p, V, disk, loads} = probe(), decisions = []
     await loaded(p)
     p.dispatch('tap', payload(secret)); await settled(p)
     records.length = 0; loads.length = 0
     p.onResume(); await settled(p)
-    assert.equal(records.find(record => record.event === 'RESUME_STATE_RELOAD').attributes.changed, false)
-    assert.equal(loads.length, 1)
+    decisions.push(records.find(record => record.event === 'RESUME_STATE_RELOAD')?.attributes.changed)
+    assert.deepEqual(loads, [{kind: 'header', appId: 'fixture/version'}])
+    assert.equal(p.error, '')
     records.length = 0; loads.length = 0
     disk.set('fixture/version', JSON.stringify(V.encodeRuntimeValue(new V.VeraStringValue(secret + '!'))))
     p.onResume(); await settled(p)
-    sequence(records, ['RESUME_STATE_RELOAD', 'FRAME'])
-    assert.equal(records.find(record => record.event === 'RESUME_STATE_RELOAD').attributes.changed, true)
-    assert.equal(loads.length, 2)
+    decisions.push(records.find(record => record.event === 'RESUME_STATE_RELOAD')?.attributes.changed)
+    const changedRecords = records.slice()
+    assert.deepEqual(loads, [{kind: 'header', appId: 'fixture/version'}, {kind: 'load', appId: 'fixture/version'}])
+    assert.equal(p.error, '')
     assert.equal(V.decodeRuntimeValue(JSON.parse(await snapshot(p))).value, secret + '!')
     p.persistKey = ''; p.onPreviewOnlyChanged(); await settled(p)
     records.length = 0; loads.length = 0; p.onResume(); await settled(p)
-    assert.equal(records.find(record => record.event === 'RESUME_STATE_RELOAD').attributes.changed, false)
+    decisions.push(records.find(record => record.event === 'RESUME_STATE_RELOAD')?.attributes.changed)
     assert.equal(loads.length, 0)
     privateRecords(records)
+    assert.deepEqual(decisions, [false, true, false], 'resume must trace unchanged, external reload, and ephemeral decisions')
+    sequence(changedRecords, ['RESUME_STATE_RELOAD', 'FRAME'])
   })
   await test('surface summaries follow actual save gates and executed draws after effects and view', async () => {
     for (const pendingBefore of [false, true]) {
       const records = capture(), f = probe(), {p, surface, saves, calls} = f
-      await loaded(p); p.liveSurfaces = [surface]
+      await loaded(p); saves.length = 0; p.liveSurfaces = [surface]
       p.surfaces.set(surface, {ready: true, visible: true, width: 100, height: 100, ctx: {}})
       p.startSurfaceLoop()
       const loopStartedAt = p.surfaceLoopStartedAt
@@ -657,9 +752,10 @@ async function main() {
       assert.equal(p.surfaceLoopStartedAt, undefined)
       assert.equal(p.error, '')
       assert.deepEqual(records.find(record => record.event === 'SURFACE_FRAME').attributes,
-        {actions: ['step'], draws: ['draw'], save: pendingBefore ? 'DONE' : 'DEFERRED'})
-      assert.equal(saves.length, pendingBefore ? 1 : 0)
-      assert.equal(f.actor().lastSurfaceSave, loopStartedAt + (pendingBefore ? 5000 : 0))
+        {actions: ['step'], draws: ['draw'], save: pendingBefore ? 'NOT_DUE' : 'DEFERRED'})
+      assert.equal(saves.length, 1, 'effects require a durable commit regardless of the later edit gate')
+      sequence(records, ['STATE_COMMIT_BEGIN', 'STATE_COMMIT_OK', 'EFFECT_REQUEST'])
+      assert.equal(f.actor().lastSurfaceSave, loopStartedAt)
       assert(calls.some(call => call.action === 'draw'))
       sequence(records, ['EFFECT_REQUEST', 'DRAW', 'EXECUTE', 'FRAME', 'SURFACE_FRAME'])
       assert.equal(records.at(-1).event, 'SURFACE_FRAME')
@@ -670,7 +766,7 @@ async function main() {
       if (!pendingBefore) {
         p.surfaceFrame(); await settled(p)
         assert.deepEqual(records.find(record => record.event === 'SURFACE_FRAME').attributes,
-          {actions: ['step'], draws: [], save: 'DONE'})
+          {actions: ['step'], draws: [], save: 'NOT_DUE'})
         records.length = 0
       }
       f.elapse(16); p.surfaceFrame(); await settled(p)
@@ -678,10 +774,11 @@ async function main() {
         {actions: ['step'], draws: [], save: 'NOT_DUE'})
       assert.equal(saves.length, 1)
     }
-    const records = capture(), {p, surface} = probe()
+    const records = capture(), {p, surface, calls} = probe()
     await loaded(p); p.liveSurfaces = [surface]; surface.action = 'trap'; records.length = 0; p.surfaceFrame(); await settled(p)
     assert(!events(records).includes('SURFACE_FRAME'))
-    sequence(records, ['EXECUTE', 'ERROR', 'TIMERS_STOPPED'])
+    assert(calls.some(call => call.action === 'trap'))
+    sequence(records, ['ERROR', 'TIMERS_STOPPED'])
   })
   await test('effect requests forward raw mode and generation through consent and direct calls', async () => {
     const request = StageTrace.request, forwarded = []
@@ -769,6 +866,8 @@ async function main() {
     assert(!calls.some(call => call.action === 'ignored'))
     p.previewOnly = false; p.onPreviewOnlyChanged(); await settled(p)
     assert.equal(snapshots.length, 1)
+    assert.equal(saves.length, 1, 'live promotion commits initial state')
+    saves.length = 0
     p.watchDarkMode(); const frames = records.filter(record => record.event === 'FRAME').length
     media.callback({matches: true}); await settled(p)
     assert.equal(p.dark, true)
@@ -782,8 +881,12 @@ async function main() {
     p.previewOnly = true; p.onPreviewOnlyChanged(); await settled(p)
     assert.equal(snapshots.length, 1)
     p.previewOnly = false; p.onPreviewOnlyChanged(); await settled(p)
+    assert.equal(saves.length, 0, 'unchanged reactivation needs only generation publication')
     p.dispatch('ephemeral', payload(secret), false); await settled(p)
+    assert.equal(saves.length, 0, 'volatile input does not commit immediately')
     p.persistKey = ''; p.onPreviewOnlyChanged(); await settled(p)
+    assert.equal(saves.length, 1, 'retiring the persistent actor saves its dirty volatile turn')
+    saves.length = 0
     p.dispatch('unkeyed', payload(secret)); await settled(p)
     assert(calls.some(call => call.action === 'ephemeral'))
     assert(calls.some(call => call.action === 'unkeyed'))
@@ -816,14 +919,22 @@ async function main() {
   await test('MOCKED failure policies preserve observed restore/save/view/draw behavior', async () => {
     const records = capture(), f = probe(), {p, V, disk, faults, saves, surface} = f
     disk.set('fixture/version', 'not-json'); await loaded(p)
-    assert.equal(p.error, '')
-    assert(records.some(record => record.event === 'ERROR' && record.attributes.kind === 'RESTORE'))
-    faults.save = true
-    p.dispatch('tap', payload(secret + '!')); await settled(p)
-    assert.equal(V.decodeRuntimeValue(JSON.parse(await snapshot(p))).value, secret + '!'); assert.equal(p.error, '')
+    assert.equal(p.error, 'ACTOR_NOT_READY')
+    assert(records.some(record => record.event === 'STATE_LOST'))
     assert.equal(saves.length, 0)
-    assert.equal(records.filter(record => record.event === 'SAVE').at(-1).attributes.result, 'ERROR')
-    faults.save = false; faults.view = true
+    disk.set('fixture/version', JSON.stringify(V.encodeRuntimeValue(new V.VeraStringValue(secret))))
+    await loaded(p)
+    assert.equal(p.error, '')
+    const before = await snapshot(p), durable = disk.get('fixture/version')
+    saves.length = 0; records.length = 0; faults.save = true
+    p.dispatch('tap', payload(secret + '!')); await settled(p)
+    assert.equal(await snapshot(p), before)
+    assert.equal(disk.get('fixture/version'), durable)
+    assert.equal(p.error, 'STATE_WRITE_FAILED')
+    assert.equal(saves.length, 0)
+    sequence(records, ['STATE_COMMIT_BEGIN', 'STATE_WRITE_FAILED'])
+    for (const event of ['INPUT_APPLIED', 'SNAPSHOT', 'FRAME', 'EFFECT_REQUEST']) assert(!events(records).includes(event), event)
+    faults.save = false; p.error = ''; faults.view = true
     p.dispatch('tap', payload(secret)); await settled(p)
     assert.equal(p.error, 'fixture view')
     assert(records.some(record => record.event === 'ERROR' && record.attributes.kind === 'VIEW'))
@@ -848,7 +959,7 @@ async function main() {
   await test('throwing trace sink leaves renderer dispatch functional', async () => {
     const {p, V, saves} = probe()
     StageTrace.configure(true, () => { throw Error('fixture sink') })
-    await loaded(p); p.dispatch('tap', payload(secret)); await settled(p)
+    await loaded(p); saves.length = 0; p.dispatch('tap', payload(secret)); await settled(p)
     assert.equal(p.error, '')
     assert.equal(V.decodeRuntimeValue(JSON.parse(await snapshot(p))).value, secret)
     assert.equal(saves.length, 1)

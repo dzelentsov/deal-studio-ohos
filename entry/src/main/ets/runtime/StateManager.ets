@@ -4,7 +4,7 @@ import type { RuntimeMode } from './shared/Messages'
 import { CommitPolicy } from './CommitPolicy'
 import type { CommitClass, StateTurnSource, StateSaveReason } from './CommitPolicy'
 import type {
-  LoadResult, CommitResult, CommittedResult, FailedCommitResult, CommitTaskRequest,
+  LoadResult, CommitResult, CommittedResult, CommitTaskRequest,
   CommitTaskResult, PublishGenerationRequest, StateHeader, StateErrorCode
 } from './StateIo'
 import {
@@ -15,7 +15,7 @@ import type {
   StatePort, StateSnapshot, StateTransaction, StateRollbackGuard, StateRollbackScope,
   StateStoragePort, StateStorageFactory, StateLostRecoveryAuthority, StateAcceptanceResult, StateLoadResult,
   StateReloadReason, StateCheckpointReason, StateManagerPhase, StateManagerStatus,
-  StateDiagnostic, ReloadResult, StateRecreateReason, StateRecreateRequiredResult, UnchangedStateResult
+  StateDiagnostic, StateDiagnosticMetrics, ReloadResult, StateRecreateReason, StateRecreateRequiredResult, UnchangedStateResult
 } from './shared/StatePort'
 
 export interface StateManagerOptions {
@@ -35,6 +35,8 @@ export interface StateManagerOptions {
   now?: () => number
   sleep?: (ms: number) => Promise<void>
   diagnostic?: (event: StateDiagnostic) => void
+  diagnosticEnabled?: () => boolean
+  durable?: () => void
 }
 
 export class StateManagerError extends Error {
@@ -73,20 +75,29 @@ interface StateSaveCapture {
   seq: number
 }
 
+interface EffectCommitSample {
+  at: number
+  duration: number
+}
+
 function validCounter(value: number): boolean {
   return Number.isSafeInteger(value) && value >= 0 && value < Number.MAX_SAFE_INTEGER
 }
 
-function failed(code: StateErrorCode, stage: string): FailedCommitResult {
+function failed(code: StateErrorCode, stage: string): CommitResult {
   return { status: 'FAILED', code: code, stage: stage }
 }
 
 function snapshotDigest(encoded: string): string {
-  let digest = cryptoFramework.createMd('SHA256')
-  digest.updateSync({ data: statePayloadBytes(encoded) })
-  let hex = ''
-  for (let byte of digest.digestSync().data) { hex += byte.toString(16).padStart(2, '0') }
-  return 'sha256:' + hex
+  try {
+    let digest = cryptoFramework.createMd('SHA256')
+    digest.updateSync({ data: statePayloadBytes(encoded) })
+    let hex = ''
+    for (let byte of digest.digestSync().data) { hex += byte.toString(16).padStart(2, '0') }
+    return 'sha256:' + hex
+  } catch (error) {
+    throw error as Error
+  }
 }
 
 export class StateManager implements StatePort {
@@ -103,6 +114,9 @@ export class StateManager implements StatePort {
   private readonly clock: () => number
   private readonly sleeper: (ms: number) => Promise<void>
   private readonly diagnostic: ((event: StateDiagnostic) => void) | undefined
+  private readonly diagnosticEnabled: (() => boolean) | undefined
+  private diagnosticEmitting: boolean = false
+  private readonly durable: (() => void) | undefined
   private storage: StateStoragePort | null
   private working: RuntimeValue
   private snapshot: StateSnapshot | null = null
@@ -116,6 +130,10 @@ export class StateManager implements StatePort {
   private dirty: boolean = false
   private dirtySeq: number = 0
   private dirtySince: number = 0
+  private memoryAccepted: boolean = false
+  private memoryAcceptedSince: number = 0
+  private effectWindows: Map<StateTurnSource, EffectCommitSample[]> =
+    new Map<StateTurnSource, EffectCommitSample[]>()
   private lastCommit: number = 0
   private lastProbe: number = 0
   private lastBackupAt: number = 0
@@ -137,9 +155,10 @@ export class StateManager implements StatePort {
   private captureInFlight: boolean = false
 
   constructor(options: StateManagerOptions) {
-    if (typeof options.appId !== 'string' || options.appId.split('/').length !== 2 ||
-        options.appId.split('/').some((part: string) => part.length === 0 || part === '.' ||
-          part === '..' || /[\u0000-\u001f\\]/.test(part)) ||
+    if (typeof options.appId !== 'string' || options.appId.length === 0 ||
+        /[\u0000-\u001f\\]/.test(options.appId) ||
+        (options.mode === 'LIVE_PERSISTENT' && (options.appId.split('/').length !== 2 ||
+          options.appId.split('/').some((part: string) => part.length === 0 || part === '.' || part === '..'))) ||
         typeof options.stamp !== 'string' || options.stamp.indexOf('\u0000') >= 0 ||
         !Number.isSafeInteger(options.stateMaxBytes) || options.stateMaxBytes <= 0 ||
         options.stateMaxBytes >= 16 * 1024 * 1024 ||
@@ -178,6 +197,18 @@ export class StateManager implements StatePort {
     this.sleeper = options.sleep === undefined ? (ms: number): Promise<void> =>
       new Promise<void>((resolve: () => void) => { setTimeout(resolve, ms) }) : options.sleep
     this.diagnostic = options.diagnostic
+    this.diagnosticEnabled = options.diagnosticEnabled
+    this.durable = options.durable
+  }
+
+  private resetStorageHealth(stage: string): void {
+    let degraded = this.phase === 'DEGRADED' || this.transientFailures >= this.policy.degradedAfter
+    this.transientFailures = 0
+    if (degraded) { this.emit('STATE_DEGRADED', stage, { outcome: 'EXIT' }) }
+  }
+
+  private markDurable(): void {
+    try { this.durable?.() } catch (_error) { this.emit('STATE_DURABLE_CALLBACK_FAILED', 'publication') }
   }
 
   status(): StateManagerStatus {
@@ -190,16 +221,44 @@ export class StateManager implements StatePort {
     }
   }
 
-  private emit(code: string, stage: string): void {
-    if (!this.diagnostic) { return }
+  private diagnosticsActive(): boolean {
+    if (!this.diagnostic || this.diagnosticEmitting) { return false }
+    this.diagnosticEmitting = true
+    try { return this.diagnosticEnabled === undefined || this.diagnosticEnabled() === true }
+    catch (_error) { return false }
+    finally { this.diagnosticEmitting = false }
+  }
+
+  private emit(code: string, stage: string, metrics: StateDiagnosticMetrics = {}): void {
+    if (!this.diagnosticsActive()) { return }
+    this.diagnosticEmitting = true
     try {
       let event: StateDiagnostic = {
-        code: code, appId: this.appId, vmGeneration: this.generation,
-        baseRevision: this.revision, stage: stage,
-        dirtyAgeMs: this.dirty ? Math.max(0, this.clock() - this.dirtySince) : 0
+        code: code, appId: this.appId,
+        vmGeneration: metrics.vmGeneration === undefined ? this.generation : metrics.vmGeneration,
+        baseRevision: metrics.baseRevision === undefined ? this.revision : metrics.baseRevision, stage: stage,
+        dirtyAgeMs: this.dirty ? Math.max(0, this.clock() - this.dirtySince) :
+          this.memoryAccepted ? Math.max(0, this.clock() - this.memoryAcceptedSince) : 0,
+        revision: metrics.revision, durationMs: metrics.durationMs,
+        commitClass: metrics.commitClass, turnSource: metrics.turnSource,
+        format: metrics.format, loadSource: metrics.loadSource, outcome: metrics.outcome,
+        dirty: this.dirty, transientFailures: this.transientFailures, reloadAttempts: this.reloadAttempts,
+        payloadBytes: metrics.payloadBytes, commitsPerSecond: metrics.commitsPerSecond,
+        p95DurationMs: metrics.p95DurationMs, sampleCount: metrics.sampleCount, windowMs: metrics.windowMs
       }
-      this.diagnostic(event)
+      this.diagnostic?.(event)
     } catch (_error) {}
+    finally { this.diagnosticEmitting = false }
+  }
+
+  private emitLockWait(stage: string, durationMs: number | undefined, outcome: string): void {
+    if (durationMs !== undefined && Number.isFinite(durationMs) && durationMs >= 0) {
+      this.emit('STATE_LOCK_WAIT', stage, { durationMs: durationMs, outcome: outcome })
+    }
+  }
+
+  private assertOutsideDiagnostic(): void {
+    if (this.diagnosticEmitting) { throw new StateManagerError('STATE_TURN_PENDING', 'diagnostic') }
   }
 
   private isFaulted(): boolean { return this.invalidated }
@@ -207,6 +266,7 @@ export class StateManager implements StatePort {
   private isTerminal(): boolean { return this.isFaulted() || this.phase === 'CLOSED' }
 
   private assertLive(): void {
+    this.assertOutsideDiagnostic()
     if (this.isFaulted() || this.phase === 'CLOSED') {
       throw new StateManagerError('STATE_UNAVAILABLE', this.phase)
     }
@@ -232,6 +292,7 @@ export class StateManager implements StatePort {
   }
 
   private enqueue<T>(kind: string, work: () => Promise<T>): Promise<T> {
+    this.assertOutsideDiagnostic()
     if (this.closing && kind !== 'CLOSE') { throw new StateManagerError('STATE_UNAVAILABLE', 'closing') }
     this.pending++
     if (kind !== 'CHECKPOINT' && kind !== 'FINAL') { this.exclusive++ }
@@ -347,6 +408,7 @@ export class StateManager implements StatePort {
     return this.enqueue<StateLoadResult>('LOAD', async (): Promise<StateLoadResult> => {
       if (this.mode !== 'LIVE_PERSISTENT') {
         this.phase = 'READY'
+        this.emit('STATE_LOAD', 'load', { outcome: 'IN_MEMORY' })
         return { kind: 'IN_MEMORY' }
       }
       return this.loadDisk(preserveWorkingState, !preserveWorkingState)
@@ -355,12 +417,18 @@ export class StateManager implements StatePort {
 
   private async loadDisk(preserve: boolean, initial: boolean = false): Promise<LoadResult> {
     let result: LoadResult
+    let started = this.clock()
     try {
       await this.reopen()
       result = await this.io().load(this.appId, this.stamp)
     } catch (_error) {
       result = { kind: 'UNAVAILABLE', code: 'STATE_READ_FAILED', stage: 'load' }
     }
+    this.emitLockWait('load', result.lockWaitMs, result.kind)
+    this.emit('STATE_LOAD', 'load', { outcome: result.kind, format: result.format,
+      vmGeneration: result.header?.vmGeneration, loadSource: result.source,
+      baseRevision: result.header?.revision, revision: result.header?.revision,
+      durationMs: Math.max(0, this.clock() - started) })
     if (this.isTerminal()) {
       return { kind: 'UNAVAILABLE', code: 'STATE_UNAVAILABLE', stage: 'load-invalidated' }
     }
@@ -415,10 +483,13 @@ export class StateManager implements StatePort {
       this.working = root
       this.needsReload = false
       this.reloadAttempts = 0
-      this.transientFailures = 0
+      this.resetStorageHealth('load')
       this.published = false
       this.phase = 'STARTING'
-      this.emit(result.source === 'BAK' ? 'STATE_RECOVERY' : 'STATE_LOAD', 'load')
+      if (result.source === 'BAK' || result.recovered) {
+        this.emit('STATE_RECOVERY', 'load', { outcome: result.kind, format: result.format,
+          loadSource: result.source, revision: revision })
+      }
       return this.copyLoad(result)
     } catch (_error) {
       this.fault('STATE_CORRUPTED', 'load-decode')
@@ -448,6 +519,7 @@ export class StateManager implements StatePort {
               throw new StateManagerError('STATE_RECOVERY_FAILED', 'lost-capability')
             }
             let recovered = await storage.recoverLost(this.appId, this.stamp)
+            this.emitLockWait('recoverLost', recovered.lockWaitMs, recovered.kind)
             if (!active || this.isFaulted()) {
               throw new StateManagerError('STATE_COMMIT_UNCERTAIN', 'lost-authority-incomplete')
             }
@@ -501,7 +573,7 @@ export class StateManager implements StatePort {
     let copy: LoadResult = {
       kind: result.kind, format: result.format, source: result.source, stamp: result.stamp,
       encodedState: result.encodedState, matchingStamp: result.matchingStamp,
-      code: result.code, stage: result.stage, recovered: result.recovered
+      code: result.code, stage: result.stage, recovered: result.recovered, lockWaitMs: result.lockWaitMs
     }
     if (header !== undefined) {
       copy.header = {
@@ -558,6 +630,8 @@ export class StateManager implements StatePort {
         expectedRevision: this.revision, expectedStamp: this.loaded.stamp as string
       }
       let result = await this.submitPublication(request)
+      this.emitLockWait('publication', result.lockWaitMs, result.status)
+      if (result.status === 'COMMITTED' || result.status === 'COMMIT_UNCERTAIN') { this.markDurable() }
       if (this.isTerminal()) { return failed('STATE_UNAVAILABLE', 'publication-invalidated') }
       if (result.status === 'COMMITTED') {
         this.generation = generation
@@ -632,6 +706,7 @@ export class StateManager implements StatePort {
   }
 
   private transaction(tx: StateTransaction): ManagedStateTransaction {
+    this.assertOutsideDiagnostic()
     if (this.active === null || this.active !== tx || this.active.settling) {
       throw new StateManagerError('STATE_TRANSACTION_INVALID', 'turn')
     }
@@ -710,6 +785,7 @@ export class StateManager implements StatePort {
     if (!this.dirty) { this.dirtySince = this.clock() }
     this.dirty = true
     this.dirtySeq++
+    this.emit('STATE_DIRTY', 'commit')
   }
 
   async commitTurn(tx: StateTransaction): Promise<StateAcceptanceResult> {
@@ -732,6 +808,10 @@ export class StateManager implements StatePort {
     turn.settling = true
     if (this.mode !== 'LIVE_PERSISTENT') {
       this.finishTurn(turn)
+      if (this.mode === 'LIVE_EPHEMERAL' && turn.possibleMutation) {
+        if (!this.memoryAccepted) { this.memoryAcceptedSince = this.clock() }
+        this.memoryAccepted = true
+      }
       return { status: 'IN_MEMORY', vmGeneration: this.generation, revision: 0 }
     }
     if (effective !== 'IMMEDIATE') {
@@ -791,6 +871,21 @@ export class StateManager implements StatePort {
   }
 
   private async save(reason: StateSaveReason, turn: ManagedStateTransaction | null): Promise<CommitResult | null> {
+    if (turn !== null || reason === 'THROTTLED') { return this.saveMeasured(reason, turn) }
+    let started = this.clock()
+    this.emit('STATE_CHECKPOINT', reason, { outcome: 'ENTER' })
+    try {
+      let result = await this.saveMeasured(reason, turn)
+      this.emit('STATE_CHECKPOINT', reason, { outcome: result === null ? this.dirty ? 'SKIPPED' : 'CLEAN' : result.status,
+        durationMs: Math.max(0, this.clock() - started) })
+      return result
+    } catch (error) {
+      this.emit('STATE_CHECKPOINT', reason, { outcome: 'FAILED', durationMs: Math.max(0, this.clock() - started) })
+      throw error as Error
+    }
+  }
+
+  private async saveMeasured(reason: StateSaveReason, turn: ManagedStateTransaction | null): Promise<CommitResult | null> {
     if (turn === null && this.active !== null) {
       throw new StateManagerError('STATE_TURN_PENDING', 'save-capture')
     }
@@ -798,6 +893,11 @@ export class StateManager implements StatePort {
       return failed('STATE_UNAVAILABLE', 'save-blocked')
     }
     if (turn === null && (!this.dirty || this.blockedPayloadSeq === this.dirtySeq)) { return null }
+    let started = this.clock()
+    let baseRevision = this.revision
+    let commitClass: CommitClass = reason === 'THROTTLED' ? 'THROTTLED' : 'IMMEDIATE'
+    this.emit('STATE_COMMIT_BEGIN', reason, { revision: this.revision + 1,
+      commitClass: commitClass, turnSource: turn?.source })
     if (!validCounter(this.revision + 1)) {
       this.fault('STATE_CORRUPTED', 'revision-capacity')
       if (turn !== null) { this.abandonTurn(turn) }
@@ -811,13 +911,13 @@ export class StateManager implements StatePort {
       if (bytes.byteLength > this.stateMaxBytes) {
         if (turn === null) { this.blockedPayloadSeq = this.dirtySeq }
         let result = failed('STATE_VALIDATION_FAILED', 'payload-size')
-        await this.handleRefusal(result, turn, reason)
+        await this.handleRefusal(result, turn, reason, started)
         return result
       }
     } catch (_error) {
       if (turn === null) { this.blockedPayloadSeq = this.dirtySeq }
       let result = failed('STATE_SERIALIZATION_FAILED', 'serialize')
-      await this.handleRefusal(result, turn, reason)
+      await this.handleRefusal(result, turn, reason, started)
       return result
     }
     let request: CommitTaskRequest
@@ -834,9 +934,16 @@ export class StateManager implements StatePort {
     }
     let result: CommitResult
     this.captureInFlight = turn === null
-    this.emit('STATE_COMMIT_BEGIN', reason)
     try { result = this.correlate(await this.io().commit(request), request.operationId, this.revision + 1) }
     catch (_error) { result = { status: 'COMMIT_UNCERTAIN', code: 'STATE_COMMIT_UNCERTAIN', stage: 'commit-result' } }
+    this.emitLockWait('commit', result.lockWaitMs, result.status)
+    if (result.status === 'COMMITTED') {
+      let durationMs = result.backupDurationMs
+      this.emit('STATE_BACKUP', result.backup, { outcome: result.backup,
+        durationMs: result.backup !== 'SKIPPED' && durationMs !== undefined &&
+          Number.isFinite(durationMs) && durationMs >= 0 ? durationMs : undefined })
+    }
+    if (result.status === 'COMMITTED' || result.status === 'COMMIT_UNCERTAIN') { this.markDurable() }
     if (this.isTerminal()) {
       if (turn !== null) { this.abandonTurn(turn) }
       if (result.status === 'COMMITTED') {
@@ -845,7 +952,7 @@ export class StateManager implements StatePort {
       return failed('STATE_UNAVAILABLE', 'commit-invalidated')
     }
     if (result.status !== 'COMMITTED') {
-      await this.handleRefusal(result, turn, reason)
+      await this.handleRefusal(result, turn, reason, started)
       return result
     }
     try { await this.confirmCommit(result, capture) }
@@ -855,6 +962,11 @@ export class StateManager implements StatePort {
       else { this.finishTurn(turn) }
     }
     if (this.isFaulted()) { throw new StateManagerError('STATE_COMMIT_UNCERTAIN', 'snapshot-confirmation') }
+    let duration = Math.max(0, this.clock() - started)
+    this.emit('STATE_COMMIT_OK', reason, { baseRevision: baseRevision, revision: result.revision,
+      durationMs: duration, commitClass: commitClass, turnSource: turn?.source,
+      payloadBytes: bytes.byteLength, outcome: 'COMMITTED' })
+    if (turn !== null && turn.hasEffects) { this.recordEffectCommit(turn.source, duration) }
     return result
   }
 
@@ -877,6 +989,7 @@ export class StateManager implements StatePort {
       try {
         this.assertLive()
         let loaded = await this.io().load(this.appId, this.stamp)
+        this.emitLockWait('snapshot-reread', loaded.lockWaitMs, loaded.kind)
         this.assertLive()
         if (loaded.kind !== 'READY' || loaded.stamp !== this.stamp || !loaded.header ||
             loaded.header.vmGeneration !== this.generation || loaded.header.revision !== result.revision ||
@@ -894,17 +1007,35 @@ export class StateManager implements StatePort {
     this.loadedGeneration = this.generation
     this.loaded = committed
     this.lastCommit = this.clock()
-    this.transientFailures = 0
+    this.resetStorageHealth('commit')
     if (!this.isFaulted()) { this.phase = 'READY' }
-    if (capture.seq === this.dirtySeq) { this.dirty = false; this.dirtySince = 0 }
+    if (capture.seq === this.dirtySeq) {
+      this.dirty = false
+      this.dirtySince = 0
+      this.memoryAccepted = false
+      this.memoryAcceptedSince = 0
+    }
     if (result.backup === 'WRITTEN') {
       this.commitsSinceBackup = 0
       this.lastBackupAt = this.lastCommit
     } else {
       this.commitsSinceBackup++
-      if (result.backup === 'FAILED') { this.emit('STATE_BACKUP', 'FAILED') }
     }
-    this.emit('STATE_COMMIT_OK', 'commit')
+  }
+
+  private recordEffectCommit(source: StateTurnSource, durationMs: number): void {
+    if (!this.diagnosticsActive()) { this.effectWindows.clear(); return }
+    let now = this.clock()
+    let samples: EffectCommitSample[] = this.effectWindows.get(source) || []
+    let window = samples.filter((sample: EffectCommitSample): boolean =>
+      sample.at <= now && now - sample.at < 1000)
+    let sample: EffectCommitSample = { at: now, duration: durationMs }
+    window.push(sample)
+    this.effectWindows.set(source, window)
+    let durations = window.map((sample): number => sample.duration).sort((a: number, b: number): number => a - b)
+    this.emit('STATE_EFFECT_COMMIT_RATE', 'commit', { turnSource: source,
+      commitsPerSecond: window.length, windowMs: 1000,
+      p95DurationMs: durations[Math.ceil(durations.length * 0.95) - 1], sampleCount: durations.length })
   }
 
   private fault(code: string, stage: string): void {
@@ -919,8 +1050,10 @@ export class StateManager implements StatePort {
   }
 
   private discardDirty(stage: string): boolean {
-    let discarded = this.dirty
+    let discarded = this.dirty || this.memoryAccepted
     if (discarded) { this.emit('STATE_DIRTY_DISCARDED', stage) }
+    this.memoryAccepted = false
+    this.memoryAcceptedSince = 0
     this.dirty = false
     this.dirtySince = 0
     this.blockedPayloadSeq = -1
@@ -928,8 +1061,13 @@ export class StateManager implements StatePort {
   }
 
   private async handleRefusal(result: CommitResult, turn: ManagedStateTransaction | null,
-      reason: StateSaveReason): Promise<void> {
+      reason: StateSaveReason, started: number): Promise<void> {
     if (result.status === 'COMMITTED') { return }
+    this.emit('STATE_COMMIT_FAIL', result.status === 'FAILED' || result.status === 'COMMIT_UNCERTAIN' ?
+      result.stage : reason, { outcome: result.status, revision: this.revision + 1,
+      durationMs: Math.max(0, this.clock() - started),
+      commitClass: reason === 'THROTTLED' ? 'THROTTLED' : 'IMMEDIATE',
+      turnSource: turn?.source })
     if (this.isTerminal()) {
       if (turn !== null) { this.abandonTurn(turn) }
       return
@@ -961,9 +1099,9 @@ export class StateManager implements StatePort {
     }
     if (this.policy.transient(result)) {
       this.transientFailures++
-      if (this.transientFailures >= this.policy.degradedAfter && !this.isFaulted()) {
+      if (this.transientFailures >= this.policy.degradedAfter && !this.isFaulted() && this.phase !== 'DEGRADED') {
         this.phase = 'DEGRADED'
-        this.emit('STATE_DEGRADED', reason)
+        this.emit('STATE_DEGRADED', reason, { outcome: 'ENTER' })
       }
     }
   }
@@ -1042,7 +1180,7 @@ export class StateManager implements StatePort {
         if (preserving) { this.markDirty(); this.promotionPending = false }
         this.needsReload = false
         this.reloadAttempts = 0
-        this.transientFailures = 0
+        this.resetStorageHealth(reason)
         return { status: 'RELOADED', load: loaded, discardedDirty: discarded }
       }
     }
@@ -1082,7 +1220,7 @@ export class StateManager implements StatePort {
         header.appId === this.appId && header.vmGeneration === this.generation && header.revision === this.revision &&
         (this.loaded === null || this.loaded.header === undefined || header.payloadHash === this.loaded.header.payloadHash)
       if (!unchanged) { return this.reload('APP_RESUME') }
-      this.transientFailures = 0
+      this.resetStorageHealth('APP_RESUME')
       this.phase = 'READY'
       return { status: 'UNCHANGED', load: null, discardedDirty: false }
     } catch (_error) {
@@ -1121,6 +1259,7 @@ export class StateManager implements StatePort {
   }
 
   close(): Promise<void> {
+    this.assertOutsideDiagnostic()
     if (this.closePromise !== null) { return this.closePromise }
     if (this.active !== null) { throw new StateManagerError('STATE_TURN_PENDING', 'close') }
     this.closing = true

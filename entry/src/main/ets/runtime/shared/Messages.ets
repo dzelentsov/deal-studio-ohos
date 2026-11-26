@@ -124,11 +124,12 @@ export interface StateSnapshotEnvelope extends HostStateVersion {
 }
 
 export interface AppSubscriber {
-  onViewFrame(frame: FrameEnvelope): void
+  onViewFrame(frame: RevisionedFrameEnvelope): void
   onError(kind: string, message: string, inputSeq?: number): void
-  onStateSnapshot(encoded: string): void
+  onStateSnapshot(encoded: string, snapshot?: StateSnapshotEnvelope): void
   onStateSaved(projectId: string): void
-  onEffectRequest(effect: EffectRequest): void
+  onEffectRequest(effect: RevisionedEffectRequest): void
+  onActorHandle?(handle: ActorHandle): void
   flushPendingInputFor(appId: string): void | Promise<void>
   onMailboxWritable(): void
 }

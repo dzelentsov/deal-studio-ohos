@@ -92,7 +92,7 @@ export struct RunnerPage {
       }.width('100%').height('100%')
     }
     .title(this.title)
-    .hideTitleBar(this.shortcutMode)
+    .hideTitleBar(false)
     .hideBackButton(this.shortcutMode)
     .onBackPressed((): boolean => this.handleBack())
     .onShown(() => { this.destinationHidden = false })

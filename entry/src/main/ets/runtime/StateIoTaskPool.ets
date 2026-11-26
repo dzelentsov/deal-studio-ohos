@@ -48,33 +48,42 @@ function validHeader(header: StateHeader, identity: string): boolean {
     typeof header.payloadHash === 'string' && /^sha256:[0-9a-f]{64}$/.test(header.payloadHash)
 }
 
+function optionalDuration(value: number | undefined): boolean {
+  return value === undefined || (typeof value === 'number' && Number.isFinite(value) && value >= 0)
+}
+
 function validCommit(result: CommitResult): boolean {
-  if (!record(result, ['status', 'revision', 'backup', 'code', 'stage'])) { return false }
+  if (!record(result, ['status', 'revision', 'backup', 'code', 'stage', 'lockWaitMs', 'backupDurationMs']) ||
+      !optionalDuration(result.lockWaitMs)) { return false }
   if (result.status === 'COMMITTED') {
-    return record(result, ['status', 'revision', 'backup']) && counter(result.revision) &&
-      ['WRITTEN', 'SKIPPED', 'FAILED'].indexOf(result.backup) >= 0
+    return record(result, result.backup === 'SKIPPED' ? ['status', 'revision', 'backup', 'lockWaitMs'] :
+      ['status', 'revision', 'backup', 'lockWaitMs', 'backupDurationMs']) && counter(result.revision) &&
+      ['WRITTEN', 'SKIPPED', 'FAILED'].indexOf(result.backup) >= 0 && optionalDuration(result.backupDurationMs)
   }
   if (result.status === 'FAILED' || result.status === 'COMMIT_UNCERTAIN') {
-    return record(result, ['status', 'code', 'stage']) && validCode(result.code) &&
+    return record(result, ['status', 'code', 'stage', 'lockWaitMs']) && validCode(result.code) &&
       typeof result.stage === 'string' && result.stage.length > 0 &&
       (result.status === 'COMMIT_UNCERTAIN' ? result.code === 'STATE_COMMIT_UNCERTAIN' : result.code !== 'STATE_COMMIT_UNCERTAIN')
   }
-  return record(result, ['status']) && ['FENCED_COMMIT', 'STALE_REVISION', 'STALE'].indexOf(result.status) >= 0
+  return record(result, ['status', 'lockWaitMs']) && ['FENCED_COMMIT', 'STALE_REVISION', 'STALE'].indexOf(result.status) >= 0
 }
 
 function validLoad(value: LoadResult, identity: string, expectedStamp: string): boolean {
-  if (!record(value, ['kind', 'format', 'source', 'header', 'stamp', 'encodedState', 'matchingStamp', 'code', 'stage', 'recovered'])) {
+  if (!record(value, ['kind', 'format', 'source', 'header', 'stamp', 'encodedState', 'matchingStamp', 'code', 'stage', 'recovered', 'lockWaitMs']) ||
+      !optionalDuration(value.lockWaitMs)) {
     return false
   }
   if (value.kind === 'READY') {
-    return (value.format === 'FORMAT2' ? validHeader(value.header as StateHeader, identity) :
+    return record(value, ['kind', 'format', 'source', 'header', 'stamp', 'encodedState', 'matchingStamp', 'recovered', 'lockWaitMs']) &&
+      (value.format === 'FORMAT2' ? validHeader(value.header as StateHeader, identity) :
       value.format === 'LEGACY' && value.header === undefined && value.source === 'MAIN') &&
       ['MAIN', 'BAK'].indexOf(value.source as string) >= 0 && stamp(value.stamp as string) &&
       value.matchingStamp === (value.stamp === expectedStamp) &&
       (value.matchingStamp ? typeof value.encodedState === 'string' : value.encodedState === undefined) &&
       value.recovered === (value.source === 'BAK') && value.code === undefined && value.stage === undefined
   }
-  return ['ABSENT', 'LOST', 'UNAVAILABLE'].indexOf(value.kind) >= 0 &&
+  return record(value, value.kind === 'ABSENT' ? ['kind', 'lockWaitMs'] : ['kind', 'code', 'stage', 'lockWaitMs']) &&
+    ['ABSENT', 'LOST', 'UNAVAILABLE'].indexOf(value.kind) >= 0 &&
     value.format === undefined && value.source === undefined && value.header === undefined &&
     value.stamp === undefined && value.encodedState === undefined && value.matchingStamp === undefined &&
     value.recovered === undefined && (value.kind === 'ABSENT' ? value.code === undefined && value.stage === undefined :

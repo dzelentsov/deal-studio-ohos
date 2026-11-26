@@ -1,6 +1,7 @@
 import { fileIo as fs } from '@kit.CoreFileKit'
 import fileIo from '@ohos.fileio'
 import { util } from '@kit.ArkTS'
+import { systemDateTime } from '@kit.BasicServicesKit'
 import {
   StateHeader, DecodedStateData, StateFormatError, STATE_HEADER_WINDOW_BYTES,
   assembleStateFile, canonicalPayload, validateEncodedState, validateStateFile,
@@ -23,7 +24,11 @@ export interface StateIoOptions {
 
 export type LoadKind = 'READY' | 'ABSENT' | 'LOST' | 'UNAVAILABLE'
 
-export interface LoadResult {
+interface StateLockMetrics {
+  lockWaitMs?: number
+}
+
+export interface LoadResult extends StateLockMetrics {
   kind: LoadKind
   format?: 'FORMAT2' | 'LEGACY'
   source?: 'MAIN' | 'BAK'
@@ -60,21 +65,22 @@ export interface PublishGenerationRequest {
   expectedStamp: string
 }
 
-export interface CommittedResult {
+export interface CommittedResult extends StateLockMetrics {
   status: 'COMMITTED'
   revision: number
   backup: 'WRITTEN' | 'SKIPPED' | 'FAILED'
+  backupDurationMs?: number
 }
 
-export interface FencedCommitResult {
+export interface FencedCommitResult extends StateLockMetrics {
   status: 'FENCED_COMMIT'
 }
 
-export interface StaleRevisionResult {
+export interface StaleRevisionResult extends StateLockMetrics {
   status: 'STALE_REVISION'
 }
 
-export interface StaleCommitResult {
+export interface StaleCommitResult extends StateLockMetrics {
   status: 'STALE'
 }
 
@@ -90,8 +96,12 @@ export interface UncertainCommitResult {
   stage: string
 }
 
+interface MeasuredFailedCommitResult extends FailedCommitResult, StateLockMetrics {}
+
+interface MeasuredUncertainCommitResult extends UncertainCommitResult, StateLockMetrics {}
+
 export type CommitResult = CommittedResult | FencedCommitResult | StaleRevisionResult |
-  StaleCommitResult | FailedCommitResult | UncertainCommitResult
+  StaleCommitResult | MeasuredFailedCommitResult | MeasuredUncertainCommitResult
 
 export interface CommitTaskResult {
   operationId: string
@@ -336,13 +346,16 @@ export class StateIo {
   private directoryFsync: 'REQUIRED' | 'UNSUPPORTED'
   private lockTimeoutMs: number
   private tmpOrphanAgeMs: number
+  private readonly telemetryClock: () => number
 
-  constructor(root: string, options: StateIoOptions) {
+  constructor(root: string, options: StateIoOptions,
+      telemetryClock: () => number = (): number => systemDateTime.getUptime(systemDateTime.TimeType.STARTUP)) {
     if (typeof root !== 'string' || !root.startsWith('/') || root.indexOf('\u0000') >= 0 ||
         root.split('/').some((part: string) => part === '.' || part === '..') ||
         !options || (options.directoryFsync !== 'REQUIRED' && options.directoryFsync !== 'UNSUPPORTED')) {
       throw new StateIoError('STATE_VALIDATION_FAILED', 'options')
     }
+    this.telemetryClock = telemetryClock
     this.root = root.replace(/\/+$/, '') || '/'
     this.directoryFsync = options.directoryFsync
     this.lockTimeoutMs = options.lockTimeoutMs === undefined ? 100 : options.lockTimeoutMs
@@ -350,6 +363,31 @@ export class StateIo {
     if (!Number.isSafeInteger(this.lockTimeoutMs) || this.lockTimeoutMs < 0 ||
         !Number.isSafeInteger(this.tmpOrphanAgeMs) || this.tmpOrphanAgeMs < 0) {
       throw new StateIoError('STATE_VALIDATION_FAILED', 'options')
+    }
+  }
+
+  private telemetryNow(): number | undefined {
+    try {
+      let now = this.telemetryClock()
+      if (Number.isFinite(now) && now >= 0) { return now }
+    } catch (_error) {}
+    return undefined
+  }
+
+  private telemetryDuration(start: number | undefined): number | undefined {
+    if (start === undefined) { return undefined }
+    let end = this.telemetryNow()
+    if (end === undefined || end < start) { return undefined }
+    let duration = end - start
+    return Number.isFinite(duration) ? duration : undefined
+  }
+
+  private acquire(paths: StatePaths, metrics: StateLockMetrics, timeout: number = this.lockTimeoutMs): fs.File | null {
+    let start = this.telemetryNow()
+    try { return this.lock(paths, timeout) }
+    finally {
+      let duration = this.telemetryDuration(start)
+      if (duration !== undefined) { metrics.lockWaitMs = duration }
     }
   }
 
@@ -603,16 +641,23 @@ export class StateIo {
     if (issue !== null) { throw issue as Error }
   }
 
-  private cleanupValidMain(paths: StatePaths, appId: string): void {
+  private cleanupValidMain(paths: StatePaths, appId: string, metrics: StateLockMetrics): void {
     let lock: fs.File | null = null
     try {
-      lock = this.lock(paths, 0)
+      lock = this.acquire(paths, metrics, 0)
       if (lock !== null && this.readFile(paths.main, appId, 'cleanup-main').kind === 'VALID') { this.cleanup(paths) }
     } catch (_error) {}
     finally { releaseLock(lock) }
   }
 
   load(appId: string, expectedStamp: string): LoadResult {
+    let metrics: StateLockMetrics = {}
+    let result = this.loadMeasured(appId, expectedStamp, metrics)
+    if (metrics.lockWaitMs !== undefined) { result.lockWaitMs = metrics.lockWaitMs }
+    return result
+  }
+
+  private loadMeasured(appId: string, expectedStamp: string, metrics: StateLockMetrics): LoadResult {
     let lock: fs.File | null = null
     try {
       let paths = this.paths(appId)
@@ -620,13 +665,13 @@ export class StateIo {
       if (!this.directoryExists(paths)) { return { kind: 'ABSENT' } }
       let main = this.readFile(paths.main, appId, 'load-main')
       if (main.kind === 'VALID') {
-        this.cleanupValidMain(paths, appId)
+        this.cleanupValidMain(paths, appId, metrics)
         return ready(main, 'MAIN', expectedStamp)
       }
       if (main.kind === 'IO') {
         return unavailable(main.error as StateIoError)
       }
-      lock = this.lock(paths)
+      lock = this.acquire(paths, metrics)
       if (lock === null) { return unavailable(new StateIoError('STATE_LOCK_UNAVAILABLE', 'recovery-lock')) }
       this.checkRoot()
       main = this.readFile(paths.main, appId, 'recovery-main')
@@ -653,6 +698,13 @@ export class StateIo {
   }
 
   recoverLost(appId: string, expectedStamp: string): LoadResult {
+    let metrics: StateLockMetrics = {}
+    let result = this.recoverLostMeasured(appId, expectedStamp, metrics)
+    if (metrics.lockWaitMs !== undefined) { result.lockWaitMs = metrics.lockWaitMs }
+    return result
+  }
+
+  private recoverLostMeasured(appId: string, expectedStamp: string, metrics: StateLockMetrics): LoadResult {
     let lock: fs.File | null = null
     let result: LoadResult
     try {
@@ -663,7 +715,7 @@ export class StateIo {
       if (this.directoryFsync !== 'REQUIRED') { throw new StateIoError('STATE_SYNC_FAILED', 'lost-fsync-required') }
       this.checkRoot()
       if (!this.directoryExists(paths)) { throw new StateIoError('STATE_UNAVAILABLE', 'lost-project-absent') }
-      lock = this.lock(paths)
+      lock = this.acquire(paths, metrics)
       if (lock === null) { throw new StateIoError('STATE_LOCK_UNAVAILABLE', 'lost-lock') }
       if (!fs.statSync(lock.fd).isFile()) { throw new StateIoError('STATE_LOCK_UNAVAILABLE', 'lost-lock-stat') }
       result = this.recoverLostLocked(paths, appId, expectedStamp)
@@ -790,6 +842,13 @@ export class StateIo {
   }
 
   commit(request: CommitTaskRequest): CommitResult {
+    let metrics: StateLockMetrics = {}
+    let result = this.commitMeasured(request, metrics)
+    if (metrics.lockWaitMs !== undefined) { result.lockWaitMs = metrics.lockWaitMs }
+    return result
+  }
+
+  private commitMeasured(request: CommitTaskRequest, metrics: StateLockMetrics): CommitResult {
     let lock: fs.File | null = null
     try {
       if (!request || !request.pre || typeof request.operationId !== 'string' || request.operationId.length === 0 ||
@@ -813,7 +872,7 @@ export class StateIo {
         throw failure(error, 'payload-validation', 'STATE_VALIDATION_FAILED')
       }
       this.ensureDirectory(paths)
-      lock = this.lock(paths)
+      lock = this.acquire(paths, metrics)
       if (lock === null) { return { status: 'STALE' } }
       this.checkRoot()
       let main = this.readFile(paths.main, request.pre.appId, 'commit-current')
@@ -838,16 +897,28 @@ export class StateIo {
       } catch (error) { throw failure(error, 'commit-assemble', 'STATE_SERIALIZATION_FAILED') }
       this.safeWrite(paths.main, paths.directory, text, 'commit-main')
       let backup: 'WRITTEN' | 'SKIPPED' | 'FAILED' = 'SKIPPED'
+      let backupDurationMs: number | undefined
       if (request.backupDue) {
+        let start = this.telemetryNow()
         try { this.safeWrite(paths.backup, paths.directory, text, 'commit-backup'); backup = 'WRITTEN' }
         catch (_error) { backup = 'FAILED' }
+        finally { backupDurationMs = this.telemetryDuration(start) }
       }
-      return { status: 'COMMITTED', revision: revision, backup: backup }
+      let result: CommittedResult = { status: 'COMMITTED', revision: revision, backup: backup }
+      if (backupDurationMs !== undefined) { result.backupDurationMs = backupDurationMs }
+      return result
     } catch (error) { return refused(error, 'commit') }
     finally { releaseLock(lock) }
   }
 
   publishGeneration(request: PublishGenerationRequest): CommitResult {
+    let metrics: StateLockMetrics = {}
+    let result = this.publishGenerationMeasured(request, metrics)
+    if (metrics.lockWaitMs !== undefined) { result.lockWaitMs = metrics.lockWaitMs }
+    return result
+  }
+
+  private publishGenerationMeasured(request: PublishGenerationRequest, metrics: StateLockMetrics): CommitResult {
     let lock: fs.File | null = null
     try {
       if (!request || typeof request.operationId !== 'string' || request.operationId.length === 0 ||
@@ -858,7 +929,7 @@ export class StateIo {
       }
       let paths = this.paths(request.appId)
       this.ensureDirectory(paths)
-      lock = this.lock(paths)
+      lock = this.acquire(paths, metrics)
       if (lock === null) { return { status: 'STALE' } }
       this.checkRoot()
       let main = this.readFile(paths.main, request.appId, 'publication-main')
