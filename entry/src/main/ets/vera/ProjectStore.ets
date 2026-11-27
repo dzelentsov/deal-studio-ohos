@@ -5,7 +5,8 @@ import { requestHeadline } from './ProjectText'
 import { ProjectStateMigration, ProjectStateLifecycles } from './ProjectStateMigration'
 import type {
   ProjectMigrationMetadata, ProjectVersionInput, ProjectStateLifecyclePort, ProjectStateTaskPoolPort,
-  ProjectInitialStatePort, ProjectStateTaskPoolCleanupPort, ProjectStateScope
+  ProjectInitialStatePort, ProjectStateTaskPoolCleanupPort, ProjectStateScope,
+  ProjectStateRecoveryOwner, ProjectStateRecoveryScope
 } from './ProjectStateMigration'
 import { StateIoTaskPool } from '../runtime/StateIoTaskPool'
 import { StateCleanupTaskPool } from '../runtime/StateCleanupTaskPool'
@@ -258,6 +259,15 @@ export class ProjectStore {
 
   trackStateOperation<T>(appId: string, operation: () => Promise<T>): Promise<T> {
     return this.stateMigration().trackStateOperation(appId, operation)
+  }
+
+  trackStateActivation<T>(appId: string, operation: (owner: ProjectStateRecoveryOwner) => Promise<T>): Promise<T> {
+    return this.stateMigration().trackStateActivation(appId, operation)
+  }
+
+  withExclusiveStateRecovery<T>(appId: string, owner: ProjectStateRecoveryOwner,
+      operation: (scope: ProjectStateRecoveryScope) => Promise<T>): Promise<T> {
+    return this.stateMigration().withExclusiveStateRecovery(appId, owner, operation)
   }
 
   private stateMigration(): ProjectStateMigration {

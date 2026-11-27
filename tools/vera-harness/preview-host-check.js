@@ -266,7 +266,7 @@ function fixture(program = programs.basic, config = {}) {
   const createSubscriber = p.createSubscriber
   p.createSubscriber = function(...args) {
     const subscriber = createSubscriber.apply(this, args)
-    for (const name of ['onViewFrame', 'onError', 'onStateSnapshot', 'onStateSaved', 'onEffectRequest', 'onMailboxWritable']) {
+    for (const name of ['onViewFrame', 'onError', 'onStateSnapshot', 'onStateSaved', 'onEffectRequest', 'onMailboxWritable', 'onActorHandle']) {
       const callback = subscriber[name]
       subscriber[name] = (...values) => {
         events.push({ type: name, handle: p.handle, transitioning: p.transitioning, values })
@@ -1105,6 +1105,468 @@ test('snapshot flush waits asynchronously through actual mailbox backpressure', 
   assert.equal(state.order.at(-1), 'field')
   assert.equal(field(f.p).value, 'snapshot draft')
   assert.equal(f.p.inFlight, null)
+})
+
+for (const retained of [false, true]) test('committed state recovery before acquire settlement preserves timers, effects and capture' + (retained ? ' with retained lineage' : ''), async () => {
+  const persistKey = 'recovered-preview/version'
+  const file = '/preview-host-fixture/vera/' + persistKey + '.state.json'
+  disk.set(file, '{broken-main')
+  disk.set(file + '.bak', '{broken-backup')
+  const program = compile({ initial: 42, ticker: 1000, surface: true, animated: true, effect: true })
+  const f = fixture(program, { persistKey })
+  f.p.aboutToAppear()
+  if (retained) {
+    f.p.publicationVersion = { appId: persistKey, runtimeMode: 'LIVE_PERSISTENT', vmGeneration: 9, stateRevision: 90 }
+    f.p.publicationAppId = persistKey
+    f.p.frameAppId = persistKey
+    f.p.frameVmGeneration = 9
+    f.p.lastFrameSeq = 90
+  }
+  await finish(f.p.operations)
+  await pump()
+  const recovery = f.events.filter(event => event.type === 'onError' && event.values[0] === 'state' && event.values[1] === 'STATE_RECOVERY')
+  assert.equal(recovery.length, 1)
+  assert.deepEqual(recovery[0].values.slice(0, 2), ['state', 'STATE_RECOVERY'])
+  assert.equal(recovery[0].values[2], undefined)
+  assert.equal(recovery[0].handle, null)
+  assert.equal(recovery[0].transitioning, true)
+  const recoveryIndex = f.events.indexOf(recovery[0])
+  assert(f.events.slice(0, recoveryIndex).some(event => event.type === 'onStateSnapshot'))
+  assert(f.events.slice(0, recoveryIndex).some(event => event.type === 'onViewFrame'))
+  assert.equal(f.p.handle.vmGeneration, 1)
+  assert(f.snapshots.length > 0)
+  assert.equal(decode(f.snapshots[0]).n, 42)
+  assert.equal(f.p.publicationVersion.vmGeneration, 1)
+  assert.equal(f.p.frameVmGeneration, 1)
+  assert.equal(f.p.error, '')
+  assert.equal(f.p.viewError, '')
+  assert.equal(f.p.flushFailure, null)
+  assert.equal(text(f.p), '42')
+  assert.equal(adapterCalls.length, 1)
+  assert.deepEqual((await f.state()).order, ['answer'])
+  const ticker = f.p.timers.get('clock')
+  const surface = f.p.surfaceTimer
+  assert(timers.has(ticker))
+  assert(timers.has(surface))
+  draft(f.p, 'after recovery')
+  f.p.handleAction('add', 1)
+  await pump()
+  const captured = await finish(f.p.controller.flushAndSnapshot())
+  await finish(f.p.operations)
+  assert.deepEqual(decode(captured), { n: 43, text: 'after recovery', order: ['answer', 'field', 'add'], seen: ['after recovery'] })
+  assert.equal(await finish(store.loadState('recovered-preview', 'version', program.stamp)), captured)
+  now += 1000
+  timers.get(ticker).callback()
+  await pump()
+  assert.equal((await f.state()).n, 44)
+  assert.equal(f.p.timers.get('clock'), ticker)
+  assert.equal(f.p.surfaceTimer, surface)
+  assert(timers.has(ticker))
+  assert(timers.has(surface))
+  assert.equal(f.p.error, '')
+  assert.equal(f.p.flushFailure, null)
+})
+
+test('same-key replacement recovery rebinds lower versions and fences old incarnation deliveries', async () => {
+  const persistKey = 'replacement-recovery/version'
+  const f = fixture(programs.effect, { persistKey })
+  await f.mount()
+  await pump()
+  const record = f.h.registry.get(persistKey)
+  const subscriber = f.p.subscriber
+  const firstOwner = f.h.deliveryOwner(record)
+  const firstFrame = f.frames.at(-1)
+  const firstSnapshot = f.events.filter(event => event.type === 'onStateSnapshot').at(-1).values
+  const firstEffect = f.events.filter(event => event.type === 'onEffectRequest').at(-1).values[0]
+  record.deliveries = []
+  for (const callback of [
+    () => subscriber.onViewFrame({ ...firstFrame, frameSeq: 9998, appliedSeq: 9998 }),
+    () => subscriber.onStateSnapshot(...firstSnapshot),
+    () => subscriber.onEffectRequest({ ...firstEffect, effectId: 9998 }),
+    () => subscriber.onError('handler', 'first incarnation trap', 9998)
+  ]) f.h.deliver(record, callback, firstOwner)
+  const firstDeliveries = record.deliveries
+  record.deliveries = null
+  const previous = compile({ initial: 10, effect: true })
+  f.p.vbc2 = previous.vbc2
+  f.p.onProgramChanged()
+  await finish(f.p.operations)
+  await pump()
+  f.p.handleAction('add', 7)
+  await pump()
+  const oldHandle = f.p.handle
+  const oldVersion = { ...f.p.publicationVersion }
+  const oldFrame = f.frames.at(-1)
+  const oldSnapshot = f.events.filter(event => event.type === 'onStateSnapshot').at(-1).values
+  const oldEffect = f.events.filter(event => event.type === 'onEffectRequest').at(-1).values[0]
+  const oldActor = record.actor
+  assert(oldVersion.vmGeneration > 1)
+  assert(oldVersion.stateRevision > 1)
+  record.deliveries = []
+  const staleCallbacks = [
+    () => subscriber.onViewFrame({ ...oldFrame, frameSeq: 9999, appliedSeq: 9999 }),
+    () => subscriber.onStateSnapshot(...oldSnapshot),
+    () => subscriber.onEffectRequest({ ...oldEffect, effectId: 9999 }),
+    () => subscriber.onError('handler', 'old incarnation trap', 9999),
+    () => subscriber.onError('state', 'STATE_RECOVERY')
+  ]
+  for (const callback of staleCallbacks) f.h.deliver(record, callback)
+  const staleDeliveries = record.deliveries
+  record.deliveries = null
+  const file = '/preview-host-fixture/vera/' + persistKey + '.state.json'
+  disk.set(file, '{broken-main')
+  disk.set(file + '.bak', '{broken-backup')
+  const program = compile({ initial: 42, ticker: 1000, surface: true, animated: true, effect: true })
+  const events = f.events.length
+  const snapshots = f.snapshots.length
+  const adapters = adapterCalls.length
+  f.p.vbc2 = program.vbc2
+  f.p.onProgramChanged()
+  await finish(f.p.operations)
+  await pump()
+  assert.notEqual(record.actor, oldActor)
+  assert.notEqual(f.p.handle, oldHandle)
+  assert.equal(f.p.handle.leaseId, oldHandle.leaseId)
+  assert.equal(f.p.handle.appId, oldHandle.appId)
+  assert.equal(f.p.handle.vmGeneration, 1)
+  assert.equal(f.p.frameVmGeneration, 1)
+  assert.equal(f.p.publicationVersion.vmGeneration, 1)
+  assert(f.p.publicationVersion.stateRevision < oldVersion.stateRevision)
+  assert.equal(f.p.activeProgram, program.vbc2)
+  assert.equal(f.p.subscriber, subscriber)
+  const deliveries = f.events.slice(events)
+  const recovery = deliveries.findIndex(event => event.type === 'onError' && event.values[0] === 'state' && event.values[1] === 'STATE_RECOVERY')
+  assert(recovery >= 0)
+  assert.equal(deliveries[recovery].values[2], undefined)
+  assert.equal(deliveries[recovery].handle, oldHandle)
+  assert.equal(deliveries[recovery].transitioning, true)
+  for (const type of ['onStateSnapshot', 'onViewFrame', 'onEffectRequest']) {
+    assert(deliveries.findIndex(event => event.type === type) > recovery, type + ' must follow recovery notification')
+  }
+  assert.equal(decode(f.snapshots[snapshots]).n, 42)
+  assert.equal(text(f.p), '42')
+  assert.deepEqual((await f.state()).order, ['answer'])
+  assert.equal(adapterCalls.length, adapters + 1)
+  assert.equal(f.p.error, '')
+  assert.equal(f.p.flushFailure, null)
+  const before = { events: f.events.length, snapshots: f.snapshots.length, revision: f.p.revision,
+    publication: f.p.publicationVersion, binding: f.p.effectsBinding }
+  assert.equal(firstOwner.fence.vmGeneration, f.p.handle.vmGeneration)
+  assert.notEqual(firstOwner.fence.incarnation, record.actor)
+  for (const delivery of [...firstDeliveries, ...staleDeliveries]) delivery()
+  assert.deepEqual({ events: f.events.length, snapshots: f.snapshots.length, revision: f.p.revision,
+    publication: f.p.publicationVersion, binding: f.p.effectsBinding }, before)
+  assert.equal(f.p.error, '')
+  subscriber.onViewFrame({ ...oldFrame, frameSeq: 9999 })
+  subscriber.onStateSnapshot(...oldSnapshot)
+  subscriber.onEffectRequest({ ...oldEffect, effectId: 9999 })
+  assert.equal(f.p.revision, before.revision)
+  assert.equal(f.snapshots.length, before.snapshots)
+  assert.equal(f.p.publicationVersion, before.publication)
+  await assert.rejects(f.h.requestSnapshot(oldHandle), /INVALID_HANDLE/)
+  draft(f.p, 'recovered replacement')
+  f.p.handleAction('add', 1)
+  await pump()
+  const captured = await finish(f.p.controller.flushAndSnapshot())
+  await finish(f.p.operations)
+  assert.deepEqual(decode(captured), { n: 43, text: 'recovered replacement', order: ['answer', 'field', 'add'], seen: ['recovered replacement'] })
+  assert.equal(await finish(store.loadState('replacement-recovery', 'version', program.stamp)), captured)
+  assert.equal(text(f.p), '43')
+  assert.equal(f.p.inFlight, null)
+  assert.equal(f.p.fieldActions.length, 0)
+  const ticker = f.p.timers.get('clock')
+  const surface = f.p.surfaceTimer
+  assert(timers.has(ticker))
+  assert(timers.has(surface))
+  now += 1000
+  timers.get(ticker).callback()
+  await pump()
+  assert.equal(text(f.p), '44')
+  assert.equal(f.p.inFlight, null)
+  assert.equal(f.p.timers.get('clock'), ticker)
+  assert.equal(f.p.surfaceTimer, surface)
+  assert.equal(adapterCalls.length, adapters + 1)
+})
+
+for (const reuse of [false, true]) test('paused old VIEW cannot seed replacement recovery lineage; counter reuse=' + reuse, async () => {
+  const persistKey = 'paused-recovery/version'
+  const f = fixture(programs.basic, { persistKey })
+  await f.mount()
+  if (!reuse) {
+    f.p.vbc2 = programs.newer.vbc2
+    f.p.onProgramChanged()
+    await finish(f.p.operations)
+    f.p.handleAction('add', 7)
+    await pump()
+  }
+  const oldHandle = f.p.handle
+  const oldVersion = f.p.publicationVersion
+  const record = f.h.registry.get(persistKey)
+  const oldActor = record.actor
+  const owner = f.h.deliveryOwner(record)
+  const subscriber = f.p.subscriber
+  const staleFrame = { ...f.frames.at(-1), frameSeq: 9999, appliedSeq: 9999 }
+  record.deliveries = []
+  f.h.deliver(record, () => subscriber.onViewFrame(staleFrame), owner)
+  const late = record.deliveries
+  record.deliveries = null
+  const program = compile({ initial: 42, ticker: 1000, surface: true, animated: true, effect: true })
+  const file = '/preview-host-fixture/vera/' + persistKey + '.state.json'
+  disk.set(file, '{broken-main')
+  disk.set(file + '.bak', '{broken-backup')
+  const resume = pause(f.h)
+  let oldSnapshot
+  let boundaries = 0
+  const snapshotCount = f.snapshots.length
+  const revision = f.p.revision
+  const adapters = adapterCalls.length
+  const onHandle = subscriber.onActorHandle
+  subscriber.onActorHandle = (handle, reason) => {
+    assert.equal(reason, 'REPLACE')
+    assert.notEqual(handle, oldHandle)
+    assert.equal(record.leases.get(handle.leaseId).handle, handle)
+    assert.equal(f.p.publicationVersion, oldVersion)
+    assert.equal(f.p.revision, revision, 'preceding VIEW must not render under the candidate program')
+    assert.equal(f.snapshots.length, snapshotCount)
+    assert.equal(f.p.awaitingReplacement, true)
+    onHandle(handle, reason)
+    assert.equal(f.p.publicationVersion, null)
+    assert.equal(f.p.frameAppId, '')
+    assert.equal(f.p.lastFrameSeq, 0)
+    boundaries++
+  }
+  try {
+    assert.equal(f.h.requestView(oldHandle).status, 'ACCEPTED')
+    oldSnapshot = f.h.requestSnapshot(oldHandle)
+    f.p.vbc2 = program.vbc2
+    f.p.onProgramChanged()
+    await microtasks()
+    assert.equal(f.p.transitioning, true)
+    assert.equal(f.p.awaitingReplacement, true)
+    assert.equal(record.current, null)
+    assert.deepEqual(record.mailbox.map(entry => entry.kind), ['VIEW', 'SNAPSHOT', 'REPLACE'])
+    assert.equal(f.p.publicationVersion, oldVersion)
+  } finally { resume() }
+  assert.equal(decode(await finish(oldSnapshot)).n, reuse ? 0 : 17)
+  await finish(f.p.operations)
+  await pump()
+  assert.equal(boundaries, 1)
+  assert.notEqual(record.actor, oldActor)
+  assert.equal(f.p.handle.vmGeneration, 1)
+  const deliveries = f.events.filter(event => event.type === 'onViewFrame' && event.transitioning)
+  assert(deliveries.some(event => event.values[0].vmGeneration === oldHandle.vmGeneration &&
+    event.values[0].stateRevision === oldVersion.stateRevision && event.values[0].frameSeq > 1))
+  const boundary = f.events.findLastIndex(event => event.type === 'onActorHandle')
+  const candidate = f.events.slice(boundary + 1).find(event => event.type === 'onStateSnapshot').values[1]
+  assert.equal(candidate.vmGeneration, 1)
+  assert.equal(candidate.stateRevision, 1)
+  if (reuse) {
+    assert.equal(oldVersion.vmGeneration, candidate.vmGeneration)
+    assert.equal(oldVersion.stateRevision, candidate.stateRevision)
+  } else {
+    assert(oldVersion.vmGeneration > candidate.vmGeneration)
+    assert(oldVersion.stateRevision > candidate.stateRevision)
+  }
+  assert.equal(decode(f.snapshots[snapshotCount]).n, 42)
+  assert.equal(text(f.p), '42')
+  assert.equal(adapterCalls.length, adapters + 1)
+  const current = { publication: f.p.publicationVersion, revision: f.p.revision, snapshots: f.snapshots.length }
+  for (const delivery of late) delivery()
+  assert.deepEqual({ publication: f.p.publicationVersion, revision: f.p.revision, snapshots: f.snapshots.length }, current)
+  await assert.rejects(f.h.requestSnapshot(oldHandle), /INVALID_HANDLE/)
+  assert.equal(f.h.requestView(oldHandle).status, 'REJECTED')
+  draft(f.p, 'after paused recovery')
+  f.p.handleAction('add', 1)
+  await pump()
+  const captured = await finish(f.p.controller.flushAndSnapshot())
+  await finish(f.p.operations)
+  assert.deepEqual(decode(captured), { n: 43, text: 'after paused recovery', order: ['answer', 'field', 'add'], seen: ['after paused recovery'] })
+  assert.equal(await finish(store.loadState('paused-recovery', 'version', program.stamp)), captured)
+  assert.equal(f.p.inFlight, null)
+  assert.equal(f.p.fieldActions.length, 0)
+  assert.equal(f.p.error, '')
+  assert.equal(f.p.flushFailure, null)
+  assert(timers.has(f.p.timers.get('clock')))
+  assert(timers.has(f.p.surfaceTimer))
+})
+
+test('paused old VIEW does not cross a failed replacement and rollback restores lineage', async () => {
+  const f = fixture()
+  await f.mount()
+  const original = f.p.handle
+  const version = f.p.publicationVersion
+  const frame = f.p.lastFrameSeq
+  const applied = f.p.lastAppliedSeq
+  const resume = pause(f.h)
+  const events = f.events.length
+  const requestView = f.h.requestView
+  let restored = false
+  try {
+    assert.equal(f.h.requestView(original).status, 'ACCEPTED')
+    f.h.requestView = function(handle) {
+      assert.equal(f.p.handle, original)
+      assert.equal(f.p.publicationVersion, version)
+      assert.equal(f.p.lastFrameSeq, frame)
+      assert.equal(f.p.lastAppliedSeq, applied)
+      assert.equal(f.p.awaitingReplacement, false)
+      restored = true
+      return requestView.call(this, handle)
+    }
+    f.p.vbc2 = programs.bad.vbc2
+    f.p.onProgramChanged()
+    await microtasks()
+    assert.equal(f.p.awaitingReplacement, true)
+    assert.equal(f.p.publicationVersion, version)
+  } finally { resume() }
+  await finish(f.p.operations)
+  f.h.requestView = requestView
+  assert.equal(restored, true)
+  assert.equal(f.p.handle, original)
+  assert.deepEqual(f.p.publicationVersion, version)
+  assert.equal(f.p.frameAppId, original.appId)
+  assert.equal(f.p.frameVmGeneration, original.vmGeneration)
+  assert(f.p.lastFrameSeq >= frame)
+  assert.equal(f.p.lastAppliedSeq, applied)
+  assert.equal(f.p.awaitingReplacement, false)
+  assert.equal(f.events.slice(events).some(event => event.type === 'onActorHandle'), false)
+  f.p.handleAction('add', 1)
+  await pump()
+  assert.equal(text(f.p), '1')
+  assert.equal(f.p.flushFailure, null)
+})
+
+test('publication lineage stays monotonic through promotion and restores after reversible replacement failure', async () => {
+  const f = fixture()
+  await f.mount()
+  const original = f.p.handle
+  const version = { ...f.p.publicationVersion, vmGeneration: original.vmGeneration + 10 }
+  f.p.publicationVersion = version
+  f.p.vbc2 = programs.bad.vbc2
+  f.p.onProgramChanged()
+  await finish(f.p.operations)
+  assert.equal(f.p.handle, original)
+  assert.equal(f.p.publicationVersion, version)
+  assert.equal(f.p.frameAppId, original.appId)
+  assert.equal(f.p.frameVmGeneration, original.vmGeneration)
+  f.p.vbc2 = programs.basic.vbc2
+  f.p.load()
+  await finish(f.p.operations)
+  assert.equal(f.p.publicationVersion, version)
+  const snapshots = f.snapshots.length
+  const frame = f.frames.at(-1)
+  f.p.transitioning = true
+  try {
+    const snapshot = { ...version, vmGeneration: version.vmGeneration - 1, encoded: f.snapshots.at(-1) }
+    f.p.subscriber.onStateSnapshot(snapshot.encoded, snapshot)
+    f.p.subscriber.onViewFrame({ ...frame, ...snapshot, frameSeq: 9999 })
+    assert.equal(f.p.publicationVersion, version)
+    assert.equal(f.snapshots.length, snapshots)
+  } finally {
+    f.p.transitioning = false
+  }
+  const promote = f.h.promote
+  let promotions = 0
+  f.h.promote = function(...args) {
+    promotions++
+    assert.equal(f.p.publicationVersion, version)
+    assert.equal(f.p.frameAppId, original.appId)
+    assert.equal(f.p.frameVmGeneration, original.vmGeneration)
+    return promote.apply(this, args)
+  }
+  f.p.persistKey = 'lineage-promotion/version'
+  f.p.load()
+  await finish(f.p.operations)
+  assert.equal(promotions, 1)
+  assert.equal(f.p.handle.appId, f.p.persistKey)
+  f.p.handleAction('add', 1)
+  await pump()
+  assert.equal(text(f.p), '1')
+  const current = f.p.publicationVersion
+  assert(current.stateRevision > 0)
+  const snapshot = { ...current, stateRevision: current.stateRevision - 1, encoded: f.snapshots.at(-1) }
+  const revision = f.p.revision
+  const count = f.snapshots.length
+  const binding = f.p.effectsBinding
+  let effects = 0
+  const request = binding.onEffectRequest
+  binding.onEffectRequest = function(...args) { effects++; return request.apply(this, args) }
+  for (const transitioning of [false, true]) {
+    f.p.transitioning = transitioning
+    try {
+      f.p.subscriber.onStateSnapshot(snapshot.encoded, snapshot)
+      f.p.subscriber.onViewFrame({ ...f.frames.at(-1), ...snapshot, frameSeq: 9999 })
+      f.p.subscriber.onEffectRequest({ ...snapshot, effectId: 9999, kind: 'SDK', rawTarget: 'Fixture.device.read',
+        params: [], resultHandler: 'answered', mode: 'background' })
+      f.p.subscriber.onError('state', 'STATE_RECOVERY')
+      assert.equal(f.p.publicationVersion, current)
+      assert.equal(f.snapshots.length, count)
+      assert.equal(f.p.revision, revision)
+      assert.equal(effects, 0)
+    } finally {
+      f.p.transitioning = false
+    }
+  }
+})
+
+test('only the recovery success pair bypasses error bookkeeping and leaves admitted input alone', async () => {
+  const program = compile({ ticker: 1000, surface: true, animated: true })
+  const f = fixture(program)
+  await f.mount()
+  const ticker = f.p.timers.get('clock')
+  const surface = f.p.surfaceTimer
+  const resume = pause(f.h)
+  try {
+    f.p.handleAction('add', 1)
+    const input = f.p.inFlight
+    assert(input)
+    assert(input.inputSeq > 0)
+    const observed = [...f.p.observedErrors]
+    for (const kind of ['state', 'STATE']) {
+      f.p.subscriber.onError(kind, 'STATE_RECOVERY', input.inputSeq)
+      assert.equal(f.p.error, '')
+      assert.equal(f.p.flushFailure, null)
+      assert.deepEqual([...f.p.observedErrors], observed)
+      assert.equal(f.p.inFlight, input)
+      assert.equal(f.p.timers.get('clock'), ticker)
+      assert.equal(f.p.surfaceTimer, surface)
+      assert(timers.has(ticker))
+      assert(timers.has(surface))
+    }
+    const failure = new Error('existing failure')
+    f.p.error = failure.message
+    f.p.flushFailure = failure
+    f.p.viewError = 'existing view failure'
+    f.p.worldTransitionError = 'existing transition failure'
+    f.p.subscriber.onError('state', 'STATE_RECOVERY')
+    assert.equal(f.p.error, failure.message)
+    assert.equal(f.p.flushFailure, failure)
+    assert.equal(f.p.viewError, 'existing view failure')
+    assert.equal(f.p.worldTransitionError, 'existing transition failure')
+    f.p.error = ''
+    f.p.flushFailure = null
+    f.p.viewError = ''
+    f.p.worldTransitionError = ''
+  } finally {
+    resume()
+  }
+  await pump()
+  assert.equal(f.p.inFlight, null)
+  assert.equal((await f.state()).n, 1)
+  for (const [kind, message] of [['state', 'STATE_RECOVERY_FAILED'], ['recovery', 'STATE_RECOVERY'],
+    ['handler', 'fixture trap'], ['state', 'STATE_RECOVERY extra'], ['state ', 'STATE_RECOVERY']]) {
+    const g = fixture(program)
+    await g.mount()
+    const ticker = g.p.timers.get('clock')
+    const surface = g.p.surfaceTimer
+    g.p.subscriber.onError(kind, message, 123)
+    assert.equal(g.p.error, message)
+    assert.equal(g.p.flushFailure.message, message)
+    assert(g.p.observedErrors.has(123))
+    assert.equal(g.p.timers.size, 0)
+    assert.equal(g.p.surfaceTimer, -1)
+    assert(!timers.has(ticker))
+    assert(!timers.has(surface))
+  }
 })
 
 test('view trap preserves active UI timers, saved state and field-action completion', async () => {

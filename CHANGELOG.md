@@ -8,6 +8,16 @@
 
 ## Worker Thread backend: Stage 1B — AppState Persistence & VM Safety
 
+### Production LOST recovery follow-up
+
+- Replaced placeholder-seed recovery with actor-orchestrated initial `LOST` recovery: an activation-bound, single-use owner reserves the AppState key, fences competing admissions and drains other tracked operations/actors before the storage final recheck and quarantine/reset. The actor then runs normal INIT/CARRY and confirms the real commit before publishing snapshots, effects and frames; a valid final recheck adopts committed state instead. Resume and promotion do not perform destructive recovery; Form remains read-only.
+- Successful recovery emits nonfatal `onError('state', 'STATE_RECOVERY')` without `inputSeq`, matching §7.2 and AC-15, while the exclusive fence is still held. Cancellation, disposal, initialization failure and commit refusal cannot report recovery success or release the failure fence. Real-VM regressions with `vmJournal: false` verify once-only initialization/commit and fail-closed behavior without pretend rollback or retry.
+- Fixed recovered replacement publication lineage: the host reports the committed replacement handle after old-actor cleanup and before candidate deliveries; preview resets its counters at that boundary, rejecting queued old publications while allowing recovered counters to restart. Promotion retains its lineage, failed replacement restores the original lineage, and disposal suppresses candidate deliveries.
+- Focused local checks passed: manager (341), state I/O (327), actor (82), host (200), project lifecycle (134), preview (53), effects (242), callers (58), traces (32), live Form and state-carry ownership guards (81 sole-writer and 31 protected-owner rejection probes). JavaScript syntax and staged/unstaged whitespace checks passed. A clean unsigned ArkTS/HAP build passed with existing SDK/deprecation warnings and missing-model/physics stubs.
+- Verification is local and in-process, not proof of independent-process exclusion or device/crash/BFU/EL2 behavior; Windows execution remains unverified. No device operations, deployment or commits were performed. Existing Stage 1B administrative acceptance and deferred Stage 1C scope are unchanged.
+
+### Stage 1B integration
+
 - Activated Format 2 persistence through Main's sole `StateManager` writer and Task Pool I/O, with commit-gated snapshots/effects, asynchronous seed/delete migration, lifecycle barriers and fenced recovery. Execution remains in-process on the UI thread; Form can only read committed AppState.
 - Integrated VM undo journaling, pure rendering, deadlines and the default-on `vmJournal` safety switch. Retained permanent regression checks and sole-writer CI; removed temporary device-probe launch routes/workers.
 - Focused host checks and an unsigned ArkTS build passed; exception-handling warnings were resolved. Existing deprecation and model/physics-stub warnings remain. The latest background-checkpoint fix is built, not deployed; its manual device trial remains user-owned and unverified.

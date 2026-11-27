@@ -41,10 +41,6 @@ export interface StateRollbackGuard {
   beginTurn(tx: StateTransaction, root: RuntimeValue): StateRollbackScope
 }
 
-export interface StateLostRecoveryAuthority {
-  withExclusiveDrained(appId: string, operation: () => Promise<void>): Promise<void>
-}
-
 export interface StateStoragePort {
   load(appId: string, expectedStamp: string): Promise<LoadResult>
   recoverLost?(appId: string, expectedStamp: string): Promise<LoadResult>
@@ -144,6 +140,7 @@ export interface StateDiagnosticMetrics {
 
 export interface StatePort {
   load(preserveWorkingState?: boolean): Promise<StateLoadResult>
+  recoverLost(): Promise<LoadResult>
   beginTurn(commitClass: CommitClass, source?: StateTurnSource): StateTransaction
   getWorkingState(): RuntimeValue
   setWorkingState(tx: StateTransaction, value: RuntimeValue): void

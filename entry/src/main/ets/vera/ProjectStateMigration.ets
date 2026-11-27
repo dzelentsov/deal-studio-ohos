@@ -47,8 +47,59 @@ export interface ProjectStateRemovalBarrier {
   release(outcome: ProjectRemovalOutcome): void
 }
 
+class ProjectStateRecoveryToken {
+  private marker: boolean = true
+}
+
+export type ProjectStateRecoveryOwner = ProjectStateRecoveryToken
+
+export interface ProjectStateRecoveryScope {
+  complete: () => void
+}
+
+export interface ProjectStateRecoveryBarrier {
+  drainOtherActorsAndStorage(): Promise<void>
+  release(): void
+}
+
 export interface ProjectStateLifecyclePort {
   fenceAllAdmissions(scope: ProjectStateScope): ProjectStateRemovalBarrier
+  fenceRecoveryAdmissions?(appId: string, owner: ProjectStateRecoveryOwner): ProjectStateRecoveryBarrier
+}
+
+interface ProjectStateActivation {
+  appId: string
+  pending: Promise<void>
+  recoveryStarted: boolean
+}
+
+class ProjectStateAggregateRecoveryBarrier implements ProjectStateRecoveryBarrier {
+  private barriers: ProjectStateRecoveryBarrier[]
+  private failure: Error
+  private failed: boolean
+  private released: () => void
+
+  constructor(barriers: ProjectStateRecoveryBarrier[], failure: Error, failed: boolean, released: () => void) {
+    this.barriers = barriers
+    this.failure = failure
+    this.failed = failed
+    this.released = released
+  }
+
+  async drainOtherActorsAndStorage(): Promise<void> {
+    let failure = this.failure
+    let failed = this.failed
+    await Promise.all(this.barriers.map(async (barrier: ProjectStateRecoveryBarrier): Promise<void> => {
+      try { await barrier.drainOtherActorsAndStorage() }
+      catch (error) { if (!failed) { failure = error as Error; failed = true } }
+    }))
+    if (failed) { throw failure }
+  }
+
+  release(): void {
+    for (let barrier of this.barriers) { barrier.release() }
+    this.released()
+  }
 }
 
 class ProjectStateAggregateBarrier implements ProjectStateRemovalBarrier {
@@ -92,8 +143,10 @@ class ProjectStateAggregateBarrier implements ProjectStateRemovalBarrier {
 
 export class ProjectStateLifecycles implements ProjectStateLifecyclePort {
   private ports: Set<ProjectStateLifecyclePort> = new Set<ProjectStateLifecyclePort>()
+  private recoveries: Set<string> = new Set<string>()
 
   register(port: ProjectStateLifecyclePort): () => void {
+    if (this.recoveries.size > 0) { throw new Error('Project state lifecycle registration fenced by recovery') }
     if (this.ports.has(port)) { throw new Error('Project state lifecycle already registered') }
     this.ports.add(port)
     return (): void => { this.ports.delete(port) }
@@ -109,6 +162,21 @@ export class ProjectStateLifecycles implements ProjectStateLifecyclePort {
       } catch (error) { if (!failed) { failure = error as Error; failed = true } }
     }
     return new ProjectStateAggregateBarrier(barriers, failure, failed)
+  }
+
+  fenceRecoveryAdmissions(appId: string, owner: ProjectStateRecoveryOwner): ProjectStateRecoveryBarrier {
+    if (this.recoveries.has(appId)) { throw new Error('Project state recovery already fenced: ' + appId) }
+    this.recoveries.add(appId)
+    let barriers: ProjectStateRecoveryBarrier[] = []
+    let failure: Error = new Error('Project state recovery fence failed')
+    let failed = false
+    for (let port of Array.from(this.ports)) {
+      try {
+        if (port.fenceRecoveryAdmissions === undefined) { throw new Error('Project state recovery lifecycle unsupported') }
+        barriers.push(port.fenceRecoveryAdmissions(appId, owner))
+      } catch (error) { if (!failed) { failure = error as Error; failed = true } }
+    }
+    return new ProjectStateAggregateRecoveryBarrier(barriers, failure, failed, (): void => { this.recoveries.delete(appId) })
   }
 }
 
@@ -168,6 +236,9 @@ export class ProjectStateMigration {
   private retryableRemovals: Set<string> = new Set<string>()
   private metadataRemovals: Map<string, ProjectMetadataRemoval> = new Map<string, ProjectMetadataRemoval>()
   private pending: Map<string, Set<Promise<void>>> = new Map<string, Set<Promise<void>>>()
+  private activationOwners: Map<string, ProjectStateRecoveryOwner> = new Map<string, ProjectStateRecoveryOwner>()
+  private activations: Map<ProjectStateRecoveryOwner, ProjectStateActivation> = new Map<ProjectStateRecoveryOwner, ProjectStateActivation>()
+  private recoveringApps: Set<string> = new Set<string>()
 
   constructor(metadata: ProjectMigrationMetadata, tasks: ProjectStateTaskPoolPort,
       initialState: ProjectInitialStatePort, lifecycle: ProjectStateLifecyclePort,
@@ -189,7 +260,7 @@ export class ProjectStateMigration {
     let parts = appId.split('/')
     if (parts.length !== 2) { throw new Error('Invalid project state identity') }
     identity(parts[0], parts[1])
-    if (this.blockedProjects.has(parts[0]) || this.blockedApps.has(appId)) {
+    if (this.blockedProjects.has(parts[0]) || this.blockedApps.has(appId) || this.recoveringApps.has(appId)) {
       throw new Error('Project state admission fenced: ' + appId)
     }
   }
@@ -201,7 +272,66 @@ export class ProjectStateMigration {
     } catch (error) { return Promise.reject(error) }
   }
 
-  private track<T>(appId: string, operation: () => Promise<T>): Promise<T> {
+  trackStateActivation<T>(appId: string, operation: (owner: ProjectStateRecoveryOwner) => Promise<T>): Promise<T> {
+    try {
+      this.assertStateAdmission(appId)
+      if (this.activationOwners.has(appId)) { throw new Error('Project state activation already pending: ' + appId) }
+      let owner = new ProjectStateRecoveryToken()
+      this.activationOwners.set(appId, owner)
+      return this.track(appId, () => operation(owner), owner)
+    } catch (error) { return Promise.reject(error) }
+  }
+
+  withExclusiveStateRecovery<T>(appId: string, owner: ProjectStateRecoveryOwner,
+      operation: (scope: ProjectStateRecoveryScope) => Promise<T>): Promise<T> {
+    try {
+      this.assertStateAdmission(appId)
+      let activation = this.activations.get(owner)
+      if (activation === undefined || activation.appId !== appId || activation.recoveryStarted ||
+          this.activationOwners.get(appId) !== owner || !this.pending.get(appId)?.has(activation.pending)) {
+        throw new Error('Invalid project state recovery owner: ' + appId)
+      }
+      activation.recoveryStarted = true
+      this.recoveringApps.add(appId)
+      if (this.lifecycle.fenceRecoveryAdmissions === undefined) {
+        throw new Error('Project state recovery lifecycle unsupported')
+      }
+      let barrier = this.lifecycle.fenceRecoveryAdmissions(appId, owner)
+      let initiating = activation.pending
+      let accepted = Array.from(this.pending.get(appId)!).filter((pending: Promise<void>): boolean => pending !== initiating)
+      return this.finishRecovery(appId, barrier, accepted, operation)
+    } catch (error) { return Promise.reject(error) }
+  }
+
+  private async finishRecovery<T>(appId: string, barrier: ProjectStateRecoveryBarrier,
+      accepted: Promise<void>[], operation: (scope: ProjectStateRecoveryScope) => Promise<T>): Promise<T> {
+    let failure: Error = new Error('Project state recovery drain failed')
+    let failed = false
+    let settle = async (operation: () => Promise<void>): Promise<void> => {
+      try { await operation() }
+      catch (error) { if (!failed) { failure = error as Error; failed = true } }
+    }
+    let pending = accepted.map((operation: Promise<void>): Promise<void> => settle(() => operation))
+    await settle(() => barrier.drainOtherActorsAndStorage())
+    await Promise.all(pending)
+    if (failed) { throw failure }
+    let completed = false
+    let active = true
+    let scope: ProjectStateRecoveryScope = {
+      complete: (): void => {
+        if (!active) { throw new Error('Project state recovery scope closed') }
+        completed = true
+      }
+    }
+    let result: T
+    try { result = await operation(scope) } finally { active = false }
+    if (!completed) { throw new Error('Project state recovery completion required') }
+    barrier.release()
+    this.recoveringApps.delete(appId)
+    return result
+  }
+
+  private track<T>(appId: string, operation: () => Promise<T>, owner?: ProjectStateRecoveryOwner): Promise<T> {
     let pending = this.pending.get(appId)
     if (pending === undefined) {
       pending = new Set<Promise<void>>()
@@ -217,9 +347,19 @@ export class ProjectStateMigration {
       accepted.delete(tracked)
       if (accepted.size === 0) { this.pending.delete(appId) }
     }
-    tracked.then(settle, settle)
+    if (owner !== undefined) {
+      this.activations.set(owner, { appId: appId, pending: tracked, recoveryStarted: false })
+    }
+    let finish = (): void => {
+      settle()
+      if (owner !== undefined) {
+        this.activations.delete(owner)
+        if (this.activationOwners.get(appId) === owner) { this.activationOwners.delete(appId) }
+      }
+    }
+    tracked.then(finish, finish)
     try { resolve(operation()) } catch (error) { reject(error as Object) }
-    return result
+    return tracked.then((): Promise<T> => result)
   }
 
   loadStateResult(projectId: string, versionId: string, stamp: string): Promise<LoadResult> {
@@ -327,6 +467,10 @@ export class ProjectStateMigration {
       let scope: ProjectStateScope = { projectId: requestedScope.projectId, versionId: requestedScope.versionId }
       let key = this.removalKey(scope, outcome, deletedVersionId)
       let appId = identity(scope.projectId, scope.versionId || deletedVersionId || '@project')
+      if (Array.from(this.recoveringApps).some((recovering: string): boolean =>
+        scope.versionId === undefined ? recovering.startsWith(scope.projectId + '/') : recovering === appId)) {
+        throw new Error('Project state recovery fenced: ' + appId)
+      }
       let metadataRemoval = this.metadataRemovals.get(key)
       if (metadataRemoval !== undefined) { this.metadataRemovals.delete(key) }
       else if (this.retryableRemovals.has(key)) { this.retryableRemovals.delete(key) }

@@ -129,7 +129,7 @@ export interface AppSubscriber {
   onStateSnapshot(encoded: string, snapshot?: StateSnapshotEnvelope): void
   onStateSaved(projectId: string): void
   onEffectRequest(effect: RevisionedEffectRequest): void
-  onActorHandle?(handle: ActorHandle): void
+  onActorHandle?(handle: ActorHandle, reason?: 'REPLACE' | 'PROMOTE'): void
   flushPendingInputFor(appId: string): void | Promise<void>
   onMailboxWritable(): void
 }

@@ -6,6 +6,7 @@ import { decodeGfx, GfxOp } from '../vera/VeraGfx'
 import { decodeScene, WorldSpec as SceneSpec } from '../vera/VeraScene'
 import { carryState } from '../vera/VeraStateCarry'
 import { store, STATE_MAX_BYTES } from '../vera/ProjectStore'
+import type { ProjectStateRecoveryOwner } from '../vera/ProjectStateMigration'
 import { StateManager, StateManagerOptions } from './StateManager'
 import { canonicalPayload, statePayloadBytes, validateEncodedState } from './StateFormat'
 import { ProgramRef, AcquireOptions, RuntimeMode } from './shared/Messages'
@@ -833,6 +834,7 @@ export interface AppActorCallbacks {
   durable?: () => void
   identity?: () => string
   generation?: () => number
+  recoveryOwner?: (owner: ProjectStateRecoveryOwner | null) => void
 }
 
 class AppActorStorageFactory implements StateStorageFactory {
@@ -846,6 +848,7 @@ class AppActorStateOptions implements StateManagerOptions {
   stateMaxBytes: number = STATE_MAX_BYTES
   initialState: RuntimeValue = NULL_VALUE
   storageFactory?: StateStorageFactory
+  allowInitialLostRecovery: boolean = false
   rollbackGuard?: VirtualMachine
   vmJournal: boolean = true
   journalMode: 'JOURNAL' = 'JOURNAL'
@@ -905,6 +908,7 @@ export class AppActor implements HostActor {
   private closureFailure: Error | null = null
   private saveFailure: Error | null = null
   private callbacksActive: number = 0
+  private pendingInitializations: number = 0
 
   constructor(callbacks: AppActorCallbacks, traceOwner: Object) {
     this.callbacks = callbacks
@@ -1009,21 +1013,31 @@ export class AppActor implements HostActor {
     }
   }
 
-  initialize(program: ProgramRef, options: AcquireOptions, refresh: boolean = true): Promise<void> {
+  async initialize(program: ProgramRef, options: AcquireOptions, refresh: boolean = true): Promise<void> {
     let target: AcquireOptions = { mode: options.mode, persistKey: options.persistKey, seedState: options.seedState }
     let source: ProgramRef = { vbc2: program.vbc2, stamp: program.stamp }
-    return this.tracked(target, () => this.enqueue(async (): Promise<void> => {
-      await this.retire()
-      await this.activate(source, target, null)
-      if (refresh) { await this.refreshWidget() }
-    }))
+    let initialize = (owner: ProjectStateRecoveryOwner | null): Promise<void> => this.enqueue(async (): Promise<void> => {
+      this.callback(() => this.callbacks.recoveryOwner?.(owner))
+      try {
+        await this.retire()
+        await this.activate(source, target, null, owner)
+        if (refresh) { await this.refreshWidget() }
+      } finally { this.callback(() => this.callbacks.recoveryOwner?.(null)) }
+    })
+    this.pendingInitializations++
+    try {
+      await (target.mode === 'LIVE_PERSISTENT' ?
+        store.trackStateActivation(target.persistKey, (owner: ProjectStateRecoveryOwner): Promise<void> => initialize(owner)) :
+        initialize(null))
+    } finally { this.pendingInitializations-- }
   }
 
   replaceProgram(program: ProgramRef, options: AcquireOptions): Promise<void> {
     return this.initialize(program, options)
   }
 
-  private async activate(program: ProgramRef, options: AcquireOptions, working: RuntimeValue | null): Promise<void> {
+  private async activate(program: ProgramRef, options: AcquireOptions, working: RuntimeValue | null,
+      recoveryOwner: ProjectStateRecoveryOwner | null = null): Promise<void> {
     this.program = program
     this.mode = options.mode
     this.persistKey = options.persistKey
@@ -1064,6 +1078,7 @@ export class AppActor implements HostActor {
       managerOptions.mode = this.mode
       managerOptions.initialState = working === null ? NULL_VALUE : working
       managerOptions.storageFactory = persistent ? new AppActorStorageFactory() : undefined
+      managerOptions.allowInitialLostRecovery = persistent && working === null && recoveryOwner !== null
       managerOptions.rollbackGuard = this.safety ? this.vm! : undefined
       managerOptions.vmJournal = this.safety
       managerOptions.journalMode = flags.journalMode
@@ -1088,67 +1103,87 @@ export class AppActor implements HostActor {
       }
       this.manager = new StateManager(managerOptions)
       let loaded = await this.manager!.load(working !== null)
-      if (loaded.kind !== 'IN_MEMORY' && loaded.kind !== 'READY' && loaded.kind !== 'ABSENT') {
-        throw new AppActorTurnError(loaded.kind === 'UNAVAILABLE' ? loaded.code || 'STATE_UNAVAILABLE' : 'STATE_LOST', 'state')
-      }
-      let publication = await this.manager!.publishGeneration()
-      if (persistent && (publication.status === 'COMMITTED' || publication.status === 'COMMIT_UNCERTAIN')) {
-        this.markDurable()
-      }
-      this.accepted(publication)
-      this.align()
-      if (this.cancelled || this.disposed) { throw new AppActorTurnError('STATE_UNAVAILABLE', 'state') }
-      this.coordinator = new AppActorTurnCoordinator(this.manager!, this.vm!, this.host!, this.mode, policy, {
-        snapshot: (snapshot): void => this.publishSnapshot(snapshot.encoded, snapshot),
-        effects: (delivery): void => {
-          if (this.cancelled || this.disposed) { return }
-          this.align(delivery)
-          this.callback(() => this.callbacks.effects(delivery.effects, delivery))
-        },
-        render: (version, pure): Promise<void> => this.render(version, pure),
-        durable: (): void => this.markDurable(),
-        saved: (version): void => {
-          if (this.cancelled || this.disposed) { return }
-          this.align(version)
-          this.callback(() => this.callbacks.saved(this.persistKey.split('/')[0]))
-        },
-        resumed: (changed: boolean): void => {
-          if (!this.cancelled && !this.disposed) {
-            StageTrace.emit(this.traceOwner, 'RESUME_STATE_RELOAD', { changed: changed })
+      let finishActivation = async (): Promise<void> => {
+        if (loaded.kind !== 'IN_MEMORY' && loaded.kind !== 'READY' && loaded.kind !== 'ABSENT') {
+          throw new AppActorTurnError(loaded.kind === 'UNAVAILABLE' ? loaded.code || 'STATE_UNAVAILABLE' : 'STATE_LOST', 'state')
+        }
+        let publication = await this.manager!.publishGeneration()
+        if (persistent && (publication.status === 'COMMITTED' || publication.status === 'COMMIT_UNCERTAIN')) {
+          this.markDurable()
+        }
+        this.accepted(publication)
+        this.align()
+        if (this.cancelled || this.disposed) { throw new AppActorTurnError('STATE_UNAVAILABLE', 'state') }
+        this.coordinator = new AppActorTurnCoordinator(this.manager!, this.vm!, this.host!, this.mode, policy, {
+          snapshot: (snapshot): void => this.publishSnapshot(snapshot.encoded, snapshot),
+          effects: (delivery): void => {
+            if (this.cancelled || this.disposed) { return }
+            this.align(delivery)
+            this.callback(() => this.callbacks.effects(delivery.effects, delivery))
+          },
+          render: (version, pure): Promise<void> => this.render(version, pure),
+          durable: (): void => this.markDurable(),
+          saved: (version): void => {
+            if (this.cancelled || this.disposed) { return }
+            this.align(version)
+            this.callback(() => this.callbacks.saved(this.persistKey.split('/')[0]))
+          },
+          resumed: (changed: boolean): void => {
+            if (!this.cancelled && !this.disposed) {
+              StageTrace.emit(this.traceOwner, 'RESUME_STATE_RELOAD', { changed: changed })
+            }
+          },
+          error: (error): void => {
+            reportedFailure = error
+            StageTrace.emit(this.traceOwner, 'ERROR', { kind: error.kind })
+            if (!this.cancelled && !this.disposed) { this.callback(() => this.callbacks.error(error.kind, error.code)) }
           }
-        },
-        error: (error): void => {
-          reportedFailure = error
-          StageTrace.emit(this.traceOwner, 'ERROR', { kind: error.kind })
-          if (!this.cancelled && !this.disposed) { this.callback(() => this.callbacks.error(error.kind, error.code)) }
-        }
-      }, this.safety)
-      this.active = true
-      let restored = working !== null || loaded.kind === 'READY' && loaded.stamp === program.stamp
-      let call: AppActorTurnCall = { entry: 'init', args: [], useState: false }
-      let source: StateTurnSource = working !== null ? 'CARRY' : 'INIT'
-      if (restored) { call = { entry: '', args: [], useState: false, value: this.manager!.getWorkingState() } }
-      else if (options.seedState.length > 0 && this.mode !== 'PREVIEW') {
-        let payload = canonicalPayload(validateEncodedState(options.seedState))
-        if (statePayloadBytes(payload).byteLength > STATE_MAX_BYTES) {
-          throw new AppActorTurnError('STATE_VALIDATION_FAILED', 'carry')
-        }
-        let seed = decodeRuntimeValue(JSON.parse(payload) as Object)
-        source = 'CARRY'
-        call = { entry: 'init', args: [], useState: false,
-          prepare: (fresh: RuntimeValue): RuntimeValue => {
-            let carried = carryState(fresh, seed, this.vm!.classShapes())
-            let allowed = this.host!.effectsAllowed
-            this.host!.effectsAllowed = false
-            try { this.vm!.executePure('view', [carried]) }
-            finally { this.host!.effectsAllowed = allowed }
-            return carried
+        }, this.safety)
+        this.active = true
+        let restored = working !== null || loaded.kind === 'READY' && loaded.stamp === program.stamp
+        let call: AppActorTurnCall = { entry: 'init', args: [], useState: false }
+        let source: StateTurnSource = working !== null ? 'CARRY' : 'INIT'
+        if (restored) { call = { entry: '', args: [], useState: false, value: this.manager!.getWorkingState() } }
+        else if (options.seedState.length > 0 && this.mode !== 'PREVIEW') {
+          let payload = canonicalPayload(validateEncodedState(options.seedState))
+          if (statePayloadBytes(payload).byteLength > STATE_MAX_BYTES) {
+            throw new AppActorTurnError('STATE_VALIDATION_FAILED', 'carry')
+          }
+          let seed = decodeRuntimeValue(JSON.parse(payload) as Object)
+          source = 'CARRY'
+          call = { entry: 'init', args: [], useState: false,
+            prepare: (fresh: RuntimeValue): RuntimeValue => {
+              let carried = carryState(fresh, seed, this.vm!.classShapes())
+              let allowed = this.host!.effectsAllowed
+              this.host!.effectsAllowed = false
+              try { this.vm!.executePure('view', [carried]) }
+              finally { this.host!.effectsAllowed = allowed }
+              return carried
+            }
           }
         }
+        StageTrace.emit(this.traceOwner, 'EXECUTE', { entry: restored ? 'restore' : 'init', kind: source })
+        await this.coordinator!.runTurn(source, true, [call])
+        if (this.mode === 'PREVIEW') { await this.render(this.version()) }
       }
-      StageTrace.emit(this.traceOwner, 'EXECUTE', { entry: restored ? 'restore' : 'init', kind: source })
-      await this.coordinator!.runTurn(source, true, [call])
-      if (this.mode === 'PREVIEW') { await this.render(this.version()) }
+      if (loaded.kind === 'LOST' && recoveryOwner !== null && working === null && persistent) {
+        await store.withExclusiveStateRecovery(appId, recoveryOwner, async (scope): Promise<void> => {
+          if (this.cancelled || this.disposed) { throw new AppActorTurnError('STATE_UNAVAILABLE', 'state') }
+          loaded = await this.manager!.recoverLost()
+          if (this.cancelled || this.disposed) { throw new AppActorTurnError('STATE_UNAVAILABLE', 'state') }
+          await finishActivation()
+          let snapshot = this.manager!.committedSnapshot()
+          if (snapshot === null || !this.ready() || this.cancelled || this.disposed) {
+            throw new AppActorTurnError('STATE_COMMIT_UNCERTAIN', 'state')
+          }
+          StageTrace.emit(this.traceOwner, 'STATE_RECOVERY', { outcome: 'COMMITTED' })
+          this.callback(() => this.callbacks.error('state', 'STATE_RECOVERY'))
+          if (!this.ready() || this.cancelled || this.disposed) {
+            throw new AppActorTurnError('STATE_COMMIT_UNCERTAIN', 'state')
+          }
+          scope.complete()
+        })
+      } else { await finishActivation() }
     } catch (error) {
       this.active = false
       this.clearEffects()
@@ -1219,6 +1254,7 @@ export class AppActor implements HostActor {
   }
 
   promote(options: AcquireOptions): Promise<void> {
+    if (this.pendingInitializations !== 0) { return Promise.reject(new AppActorTurnError('STATE_TURN_PENDING', 'state')) }
     let target: AcquireOptions = { mode: options.mode, persistKey: options.persistKey, seedState: options.seedState }
     return this.tracked(target, () => this.enqueue(async (): Promise<void> => {
       if (!this.ready()) { throw new AppActorTurnError('ACTOR_NOT_READY', 'state') }
