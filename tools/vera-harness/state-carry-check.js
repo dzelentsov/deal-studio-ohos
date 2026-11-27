@@ -102,7 +102,7 @@ function externalGraphChecks() {
         bytes += size
         assert(size <= 1024 * 1024 && bytes <= 16 * 1024 * 1024 && sources.size < 512,
           'external inventory: source size/file bound')
-        sources.set(path.relative(root, file).split(path.sep).join('/'), fs.readFileSync(file, 'utf8'))
+        sources.set(path.relative(root, file).split(path.sep).join('/'), fs.readFileSync(file, 'utf8').replace(/\r\n/g, '\n'))
       }
     }
   }
@@ -125,6 +125,8 @@ function externalGraphChecks() {
         ['VeraScene', 'asNumbers', '(v as VeraArrayValue).elements', 'items'],
         ['VeraScene', 'asParts', '(v as VeraArrayValue).elements', 'items'],
         ['VeraScene', 'decodeScene', '(value as VeraArrayValue).elements', 'iteration'],
+        ['VeraReachability', 'stateKey', 'value.fields', 'read-only deduplication forEach/get', 2],
+        ['VeraReachability', 'stateKey', 'value.elements', 'read-only deduplication map'],
         ['VeraStateCarry', 'carryState', 'fresh.fields', 'forEach'],
         ['VeraStateCarry', 'carryState', 'old.fields', 'get'],
         ['VeraStateCarry', 'carryState', 'old.elements', 'length/every/index', 3],
@@ -304,7 +306,7 @@ function externalGraphChecks() {
           return freshObjectValue(GFX_POINTER, fields)
         }`, 'Fresh map/wrapper/scalars per event'],
         ['VeraScene', 'sceneEventValue', `export function sceneEventValue(kind: string, bodyId: string, other: string,
-            x: number, y: number, z: number, speed: number, bodies: string[], values: number[]): RuntimeValue {
+            x: number, y: number, z: number, speed: number, bodies: string[], values: number[], dir: number[] = [0, 0, 0]): RuntimeValue {
           let fields = new Map<string, RuntimeValue>()
           fields.set('kind', new VeraStringValue(kind))
           fields.set('body', new VeraStringValue(bodyId))
@@ -312,6 +314,9 @@ function externalGraphChecks() {
           fields.set('x', new VeraNumberValue(x))
           fields.set('y', new VeraNumberValue(y))
           fields.set('z', new VeraNumberValue(z))
+          fields.set('dx', new VeraNumberValue(dir.length > 0 ? dir[0] : 0))
+          fields.set('dy', new VeraNumberValue(dir.length > 1 ? dir[1] : 0))
+          fields.set('dz', new VeraNumberValue(dir.length > 2 ? dir[2] : 0))
           fields.set('speed', new VeraNumberValue(speed))
           let ids: RuntimeValue[] = []
           for (let b of bodies) { ids.push(new VeraStringValue(b)) }
@@ -364,6 +369,7 @@ function externalGraphChecks() {
         ['runtime/StateManager.ets', 'ManagedStateTransaction', 'originalRoot', 'beginTurn retains alias until accept/rollback; no deep snapshot implied'],
         ['vera/VeraLiveWidget.ets', 'WidgetSession', 'state', 'saved decode/init -> restore/refresh/tap candidates -> encodedState; session lifetime'],
         ['vera/VeraWorldPlay.ets', 'WorldPlay', 'state', 'playWorld init -> constructor alias -> handle replacement; bounded play lifetime'],
+        ['vera/VeraReachability.ets', 'ReachState', 'state', 'fresh init/handler result -> queue retains branch root; views/actions receive serialized clones; bounded exploration lifetime'],
         ['vera/VeraSurfacePlay.ets', 'playSurface', 'state', 'init -> local handler replacements; bounded play lifetime'],
         ['vera/VeraMovingPart.ets', 'appMovingPart', 'start', 'saved decode/init -> branch-local state aliases; bounded probe lifetime']
       ]},
@@ -498,10 +504,11 @@ function externalGraphChecks() {
   let previousProgram
   const expectedAccesses = ownership.D.accesses.flatMap(([file, owner, expression, use, count = 1]) =>
     Array.from({length: count}, () => [file, owner, tokens(expression)]))
-  assert.equal(expectedAccesses.length, 46)
+  assert.equal(expectedAccesses.length, 49)
   const inventory = (input, inspectStorage, inspectFile) => {
     assert(input.size <= 512, 'external inventory: file bound')
-    const virtual = name => path.join(root, name.replace(/\.ets$/, '.ts'))
+    const slash = value => value.split(path.sep).join('/')
+    const virtual = name => slash(path.join(root, name.replace(/\.ets$/, '.ts')))
     const dependencies = new Map()
     const trees = new Map([...input].map(([name, text]) => {
       assert(text.length <= 1024 * 1024, 'external inventory: source bound')
@@ -523,7 +530,7 @@ function externalGraphChecks() {
     const options = {target: ts.ScriptTarget.ES2020, jsx: ts.JsxEmit.Preserve, strict: true, noEmit: true, types: [], noResolve: true}
     const host = ts.createCompilerHost(options)
     const original = host.getSourceFile.bind(host), readFile = host.readFile.bind(host), exists = host.fileExists.bind(host)
-    const library = name => path.dirname(name) === path.dirname(ts.getDefaultLibFilePath(options)) &&
+    const library = name => slash(path.dirname(name)) === slash(path.dirname(ts.getDefaultLibFilePath(options))) &&
       /^lib\..*\.d\.ts$/.test(path.basename(name))
     host.getSourceFile = (name, ...args) => {
       if (trees.has(name)) return trees.get(name)
@@ -536,8 +543,8 @@ function externalGraphChecks() {
     host.writeFile = () => { throw Error('external inventory: read only') }
     const candidates = (name, containing) => {
       if (!name.startsWith('.')) return []
-      const base = path.resolve(path.dirname(containing), name.replace(/\.ets$/, '.ts'))
-      return /\.(ts|tsx)$/.test(base) ? [base] : [base + '.ts', base + '.tsx', path.join(base, 'index.ts'), path.join(base, 'index.tsx')]
+      const base = slash(path.resolve(path.dirname(containing), name.replace(/\.ets$/, '.ts')))
+      return /\.(ts|tsx)$/.test(base) ? [base] : [base + '.ts', base + '.tsx', base + '/index.ts', base + '/index.tsx']
     }
     host.resolveModuleNames = (names, containing) => names.map(name => {
       const resolvedFileName = candidates(name, containing).find(file => trees.has(file))
@@ -737,7 +744,12 @@ function externalGraphChecks() {
             accesses.push([path.basename(file, '.ets'), owner, tokens(print(node))])
           }
           if (sensitive(type, storageOwners) || sensitive(type, interfaceOwners)) {
-            assert(ts.isPropertyAccessExpression(node) || ts.isStringLiteral(node.argumentExpression),
+            const ownerArraySelection = ts.isElementAccessExpression(node) && checker.isArrayType(type) &&
+              (checker.getTypeAtLocation(node.argumentExpression).flags & ts.TypeFlags.NumberLike) !== 0 &&
+              ts.isVariableDeclaration(node.parent) && node.parent.initializer === node &&
+              ts.isIdentifier(node.parent.name) && !node.parent.type &&
+              (sensitive(checker.getTypeAtLocation(node), storageOwners) || sensitive(checker.getTypeAtLocation(node), interfaceOwners))
+            assert(ts.isPropertyAccessExpression(node) || ts.isStringLiteral(node.argumentExpression) || ownerArraySelection,
               'external inventory: computed protected owner access in ' + file + ':' + owner)
             if (sensitive(type, interfaceOwners) || ownership.B.roots.some(([rootFile, rootOwner, rootName]) =>
                 rootFile === file && (ts.isPropertyAccessExpression(node) ? node.name.text : node.argumentExpression.text) === rootName)) {
@@ -1887,6 +1899,11 @@ function externalGraphChecks() {
     ['runtime/StateManager.ets', "import type { RuntimeValue } from '../vera/VeraInterpreter'"],
     ['vera/ProjectStore.ets', "import { BytecodeModule, VirtualMachine, EmptyHostEnvironment, NULL_VALUE, decodeRuntimeValue } from './VeraInterpreter'"],
     ['vera/ProjectStore.ets', "import type { RuntimeValue } from './VeraInterpreter'"],
+    ['vera/agent/AgentAppContract.ets', "import { BytecodeModule } from '../VeraInterpreter'"],
+    ['vera/agent/AgentCustom.ets', "import { deserializeVbc2 } from '../VeraInterpreter'"],
+    ['vera/agent/AgentRepair.ets', "import { deserializeVbc2 } from '../VeraInterpreter'"],
+    ['vera/VeraAppRefine.ets', "import { deserializeVbc2 } from './VeraInterpreter'"],
+    ['vera/VeraReachability.ets', "import { VirtualMachine, deserializeVbc2, RuntimeValue, VeraNumberValue, VeraStringValue, VeraBooleanValue, VeraArrayValue, VeraObjectValue, encodeRuntimeValue, decodeRuntimeValue } from './VeraInterpreter'"],
     ['vera/VeraBudget.ets', "import { BytecodeModule } from './VeraInterpreter'"],
     ['vera/VeraCompiler.ets', "import { Instruction, BytecodeFunction, BytecodeModule } from './VeraInterpreter'"],
     ['vera/VeraGfx.ets', "import { RuntimeValue, VeraNumberValue, VeraStringValue, VeraBooleanValue, VeraArrayValue, VeraObjectValue, RuntimeTrap, freshObjectValue } from './VeraInterpreter'"],
@@ -1946,10 +1963,11 @@ runtime/AppActor.ets
 @AppActor.render
 ["signature","constructor ( call: AppActorTurnCall ) RuntimeValue"]
 @AppActor.activate
-["signature","private async activate ( program: ProgramRef options: AcquireOptions working: RuntimeValue | null ) Promise<void>"]
+["signature","private async activate ( program: ProgramRef options: AcquireOptions working: RuntimeValue | null recoveryOwner: ProjectStateRecoveryOwner | null = null ) Promise<void>"]
 ["initialKind = working !== null || options.seedState.length > 0 && options.mode !== 'PREVIEW' ? 'carry' : 'init'",[]]
 ["working === null",[["if","working === null","condition"],["try","body"]]]
 ["managerOptions.initialState = working === null ? NULL_VALUE : working",[["try","body"]]]
+["managerOptions.allowInitialLostRecovery = persistent && working === null && recoveryOwner !== null",[["try","body"]]]
 ["loaded = await this.manager!.load(working !== null)",[["try","body"]]]
 ["restored = working !== null || loaded.kind === 'READY' && loaded.stamp === program.stamp",[["try","body"]]]
 ["source: StateTurnSource = working !== null ? 'CARRY' : 'INIT'",[["try","body"]]]
@@ -1957,6 +1975,7 @@ runtime/AppActor.ets
 ["seed = decodeRuntimeValue(JSON.parse(payload) as Object)",[["if","options.seedState.length > 0 && this.mode !== 'PREVIEW'","then"],["if","restored","else"],["try","body"]]]
 ["call = { entry: 'init', args: [], useState: false,\n    prepare: (fresh: RuntimeValue): RuntimeValue => {\n        let carried = carryState(fresh, seed, this.vm!.classShapes());\n        let allowed = this.host!.effectsAllowed;\n        this.host!.effectsAllowed = false;\n        try {\n            this.vm!.executePure('view', [carried]);\n        }\n        finally {\n            this.host!.effectsAllowed = allowed;\n        }\n        return carried;\n    }\n}",[["if","options.seedState.length > 0 && this.mode !== 'PREVIEW'","then"],["if","restored","else"],["try","body"]]]
 ["await this.coordinator!.runTurn(source, true, [call])",[["try","body"]]]
+["loaded.kind === 'LOST' && recoveryOwner !== null && working === null && persistent",[["if","loaded.kind === 'LOST' && recoveryOwner !== null && working === null && persistent","condition"],["try","body"]]]
 @AppActor.promote
 ["working = this.manager!.getWorkingState()",[]]
 ["await this.activate(program, target, working)",[["if","this.mode === 'LIVE_PERSISTENT'","then"]]]
@@ -1992,7 +2011,7 @@ runtime/InProcessHost.ets
 ["new VeraStringValue(payload.str)",[["case","'STRING'"]]]
 ["new VeraBooleanValue(payload.bool)",[["case","'BOOLEAN'"]]]
 ["pointerValue(payload.phase, payload.id, payload.x, payload.y)",[["case","'POINTER'"]]]
-["sceneEventValue(scene.kind, scene.body, scene.other, scene.x, scene.y, scene.z, scene.speed, scene.bodies, scene.values)",[["case","'SCENE'"]]]
+["sceneEventValue(scene.kind, scene.body, scene.other, scene.x, scene.y, scene.z, scene.speed, scene.bodies, scene.values, scene.dir === undefined ? [0, 0, 0] : scene.dir)",[["case","'SCENE'"]]]
 ["new VeraNumberValue(0)",[]]
 @InProcessHost.runTurn
 ["actor.dispatch(entry.input!.action, this.payload(entry.input!.payload), entry.input!.persist, entry.input!.kind, entry.input!.skipIfSame || false)",[["case","'INPUT'"]]]
@@ -2037,7 +2056,7 @@ runtime/StateManager.ets
 ["this.policy = options.policy === undefined ? new CommitPolicy() : options.policy",[]]
 ["this.guard = options.rollbackGuard",[]]
 ["this.factory = options.storageFactory",[]]
-["this.lostRecoveryAuthority = options.lostRecoveryAuthority",[]]
+["this.allowInitialLostRecovery = options.allowInitialLostRecovery === true",[]]
 ["this.storage = options.storage === undefined ? null : options.storage",[]]
 ["clock = options.now",[]]
 ["this.sleeper = options.sleep === undefined ? (ms: number): Promise<void> => new Promise<void>((resolve: () => void) => { setTimeout(resolve, ms); }) : options.sleep",[]]
@@ -2302,6 +2321,64 @@ vera/VeraMovingPart.ets
 ["looks: GfxOp[][] = [decodeGfx(vm.execute(picture.label, [state]))]",[["try","body"],["for","way < 2 + presses.length"],["loop","let picture","pictures"],["try","body"]]]
 ["state = vm.execute(picture.action, [state, new VeraNumberValue(PART_STEP_MS)])",[["for","step <= PART_STEPS"],["try","body"],["for","way < 2 + presses.length"],["loop","let picture","pictures"],["try","body"]]]
 ["looks.push(decodeGfx(vm.execute(picture.label, [state])))",[["if","step % PART_EVERY === 0","then"],["for","step <= PART_STEPS"],["try","body"],["for","way < 2 + presses.length"],["loop","let picture","pictures"],["try","body"]]]
+vera/VeraReachability.ets
+@ReachHost.invoke
+["signature","invoke ( module: string name: string args: RuntimeValue[] awaited: boolean ) RuntimeValue"]
+["new VeraNumberValue(1767268800000)",[["case","'nowMillis'"],["if","module === 'std/time'","then"]]]
+["new VeraNumberValue(1767268800)",[["case","'nowSeconds'"],["if","module === 'std/time'","then"]]]
+["new VeraNumberValue(20454)",[["case","'daysSinceEpoch'"],["if","module === 'std/time'","then"]]]
+["new VeraNumberValue(43200000)",[["case","'millisOfDay'"],["if","module === 'std/time'","then"]]]
+["new VeraNumberValue(12)",[["case","'hourOfDay'"],["if","module === 'std/time'","then"]]]
+["new VeraNumberValue(0)",[["case","'minuteOfHour'"],["if","module === 'std/time'","then"]]]
+["new VeraNumberValue(4)",[["case","'weekday'"],["if","module === 'std/time'","then"]]]
+["new VeraNumberValue(1)",[["case","'dayOfMonth'"],["if","module === 'std/time'","then"]]]
+["new VeraNumberValue(1)",[["case","'monthOfYear'"],["if","module === 'std/time'","then"]]]
+["new VeraNumberValue(2026)",[["case","'year'"],["if","module === 'std/time'","then"]]]
+["super.invoke(module, name, args, awaited)",[]]
+@ReachState
+["root","state: RuntimeValue;"]
+@ReachState.constructor
+["signature","constructor ( state: RuntimeValue path: string[] ) "]
+["this.state = state",[]]
+@clone
+["signature","clone ( value: RuntimeValue ) RuntimeValue"]
+["decodeRuntimeValue(encodeRuntimeValue(value))",[]]
+@stateKey
+["signature","stateKey ( value: RuntimeValue ) string"]
+["value instanceof VeraObjectValue",[["if","value instanceof VeraObjectValue","condition"]]]
+["value.fields.forEach((_v: RuntimeValue, name: string) => { names.push(name); })",[["if","value instanceof VeraObjectValue","then"]]]
+["JSON.stringify([value.classIdentity, names.map((name: string): string => JSON.stringify(name) + ':' + stateKey(value.fields.get(name)!))])",[["if","value instanceof VeraObjectValue","then"]]]
+["value instanceof VeraArrayValue",[["if","value instanceof VeraArrayValue","condition"]]]
+["'[' + value.elements.map((v: RuntimeValue): string => stateKey(v)).join(',') + ']'",[["if","value instanceof VeraArrayValue","then"]]]
+["JSON.stringify(encodeRuntimeValue(value))",[]]
+@inputValue
+["signature","inputValue ( node: VeraUiNode ) RuntimeValue"]
+["new VeraStringValue(text)",[["if","node.kind === 'field'","then"]]]
+["new VeraBooleanValue(!node.checked)",[["if","node.kind === 'toggle' || node.kind === 'checkbox'","then"]]]
+["new VeraNumberValue(0)",[["if","node.kind === 'select'","then"]]]
+["new VeraNumberValue(node.numberValue || 20454)",[["if","node.kind === 'datefield'","then"]]]
+["new VeraNumberValue(node.numberValue || 720)",[["if","node.kind === 'timefield'","then"]]]
+["new VeraNumberValue(Math.max(node.minimum, Math.min(node.maximum, node.kind === 'slider' ? 1 : (node.numberValue || 1))))",[]]
+@checkScreenReachability
+["vm.execute(name, args)",[["try","body"]]]
+["draw = (state: RuntimeValue): VeraUiNode[] => visible(decodeVeraUi(run('view', [clone(state)])))",[]]
+["key = stateKey(state)",[]]
+["queue.push(new ReachState(state, path))",[]]
+["next = run(node.action, [clone(state), value])",[["try","body"]]]
+["next",[["try","body"]]]
+["enqueue(run('init', []), [])",[["try","body"]]]
+["nodes = draw(current.state)",[["try","body"],["for","index < queue.length && result.actions < MAX_ACTIONS && result.steps < MAX_STEPS"],["try","body"]]]
+["filled = clone(current.state)",[["for","index < queue.length && result.actions < MAX_ACTIONS && result.steps < MAX_STEPS"],["try","body"]]]
+["live = draw(filled).find((n: VeraUiNode): boolean => n.kind === input.kind && n.action === input.action && n.enabled)",[["try","body"],["loop","let input","inputs"],["for","index < queue.length && result.actions < MAX_ACTIONS && result.steps < MAX_STEPS"],["try","body"]]]
+["filled = act(filled, live, inputValue(live))",[["try","body"],["loop","let input","inputs"],["for","index < queue.length && result.actions < MAX_ACTIONS && result.steps < MAX_STEPS"],["try","body"]]]
+["enqueue(filled, current.path.concat(['fill(' + filledNames.join(', ') + ')']))",[["if","filledNames.length > 0","then"],["for","index < queue.length && result.actions < MAX_ACTIONS && result.steps < MAX_STEPS"],["try","body"]]]
+["values: RuntimeValue[] = [isInput(node) ? inputValue(node) : new VeraNumberValue(node.eventValue)]",[["loop","let node","choices"],["for","index < queue.length && result.actions < MAX_ACTIONS && result.steps < MAX_STEPS"],["try","body"]]]
+["values = node.options.map((_s: string, i: number): RuntimeValue => new VeraNumberValue(i))",[["if","node.kind === 'tabs' || node.kind === 'select'","then"],["loop","let node","choices"],["for","index < queue.length && result.actions < MAX_ACTIONS && result.steps < MAX_STEPS"],["try","body"]]]
+["values",[["loop","let value","values"],["loop","let node","choices"],["for","index < queue.length && result.actions < MAX_ACTIONS && result.steps < MAX_STEPS"],["try","body"]]]
+["label = node.action + '(' + JSON.stringify(encodeRuntimeValue(value)) + ')'",[["loop","let value","values"],["loop","let node","choices"],["for","index < queue.length && result.actions < MAX_ACTIONS && result.steps < MAX_STEPS"],["try","body"]]]
+["next = act(current.state, node, value)",[["try","body"],["loop","let value","values"],["loop","let node","choices"],["for","index < queue.length && result.actions < MAX_ACTIONS && result.steps < MAX_STEPS"],["try","body"]]]
+["!isInput(node) && stateKey(next) === stateKey(current.state)",[["if","!isInput(node) && stateKey(next) === stateKey(current.state)","condition"],["try","body"],["loop","let value","values"],["loop","let node","choices"],["for","index < queue.length && result.actions < MAX_ACTIONS && result.steps < MAX_STEPS"],["try","body"]]]
+["enqueue(next, current.path.concat([label]))",[["try","body"],["loop","let value","values"],["loop","let node","choices"],["for","index < queue.length && result.actions < MAX_ACTIONS && result.steps < MAX_STEPS"],["try","body"]]]
 vera/VeraScene.ets
 @SceneThingValue.constructor
 ["signature","constructor ( thing: SceneThing ) "]
@@ -2386,6 +2463,13 @@ vera/VeraScene.ets
 "points = asNumbers(args, 4, 'points', 3 * MAX_SHAPE_POINTS)"
 "t.color = asStr(args, 5)"
 "wrap(t)"
+"t.id = asId(args, 0, 'model')"
+"t.model = asStr(args, 1)"
+"t.x = asNum(args, 2, 'x')"
+"t.y = asNum(args, 3, 'y')"
+"t.z = asNum(args, 4, 'z')"
+"shape = modelShape(t.model, positive(asNum(args, 5, 'size'), 'size'))"
+"wrap(t)"
 "t = body('group', args)"
 "t.parts = asParts(args, 4, t.id)"
 "wrap(t)"
@@ -2439,10 +2523,11 @@ vera/VeraScene.ets
 "wrap(t)"
 "t = asBody(args, 'glow')"
 "wrap(t)"
-"t = asBody(args, 'paint')"
+"v = args.length > 0 ? args[0] : null"
+"!(v instanceof SceneThingValue)"
+"t = (v as SceneThingValue).thing"
 "pattern = asStr(args, 1)"
-"t.color2 = asStr(args, 2)"
-"wrap(t)"
+"wrap(paintThing(t, pattern, asStr(args, 2)))"
 "t = asBody(args, 'rings')"
 "inner = positive(asNum(args, 1, 'inner'), 'inner')"
 "outer = asNum(args, 2, 'outer')"
@@ -2469,6 +2554,7 @@ vera/VeraScene.ets
 "t = asBody(args, 'player')"
 "p.speed = positive(asNum(args, 1, 'speed'), 'speed')"
 "p.action = asStr(args, 2)"
+"p.fire = asStr(args, 3)"
 "wrap(t)"
 "t = asBody(args, 'follow')"
 "f.distance = positive(asNum(args, 1, 'distance'), 'distance')"
@@ -2485,8 +2571,41 @@ vera/VeraScene.ets
 "w.periodS = positive(asNum(args, 2, 'periodS'), 'periodS')"
 "w.phaseDeg = asNum(args, 3, 'phaseDeg')"
 "wrap(t)"
+"t = asBody(args, 'from')"
+"parent = asStr(args, 1)"
+"f.burst = asNum(args, 2, 'burst')"
+"wrap(t)"
+"t = asBody(args, 'shoot')"
+"s.speed = positive(asNum(args, 1, 'speed'), 'speed')"
+"s.arc = asBool(args, 2)"
+"wrap(t)"
+"t = asBody(args, 'aim')"
+"t.aim = [asNum(args, 1, 'x'), asNum(args, 2, 'y'), asNum(args, 3, 'z')]"
+"wrap(t)"
+"t = asBody(args, 'target')"
+"wrap(t)"
+"t = asBody(args, 'split')"
+"n = Math.max(2, Math.min(MAX_SPLIT, Math.round(asNum(args, 1, 'n'))))"
+"burst = asNum(args, 2, 'burst')"
+"new VeraArrayValue(splitThing(t, n, burst).map((p: SceneThing): RuntimeValue => wrap(p)))"
+"t.id = asId(args, 0, 'blast')"
+"t.trigger = asNum(args, 1, 'trigger')"
+"t.x = asNum(args, 2, 'x')"
+"t.y = asNum(args, 3, 'y')"
+"t.z = asNum(args, 4, 'z')"
+"t.radius = positive(asNum(args, 5, 'radius'), 'radius')"
+"t.strength = asNum(args, 6, 'strength')"
+"wrap(t)"
+"t.id = asId(args, 0, 'burst')"
+"t.trigger = asNum(args, 1, 'burst trigger')"
+"t.x = asNum(args, 2, 'burst x')"
+"t.y = asNum(args, 3, 'burst y')"
+"t.z = asNum(args, 4, 'burst z')"
+"t.burstKind = asStr(args, 5)"
+"t.color = asStr(args, 6)"
+"wrap(t)"
 @sceneEventValue
-["signature","export sceneEventValue ( kind: string bodyId: string other: string x: number y: number z: number speed: number bodies: string[] values: number[] ) RuntimeValue"]
+["signature","export sceneEventValue ( kind: string bodyId: string other: string x: number y: number z: number speed: number bodies: string[] values: number[] dir: number[] = [0, 0, 0] ) RuntimeValue"]
 "fields = new Map<string, RuntimeValue>()"
 "fields.set('kind', new VeraStringValue(kind))"
 "fields.set('body', new VeraStringValue(bodyId))"
@@ -2494,6 +2613,9 @@ vera/VeraScene.ets
 "fields.set('x', new VeraNumberValue(x))"
 "fields.set('y', new VeraNumberValue(y))"
 "fields.set('z', new VeraNumberValue(z))"
+"fields.set('dx', new VeraNumberValue(dir.length > 0 ? dir[0] : 0))"
+"fields.set('dy', new VeraNumberValue(dir.length > 1 ? dir[1] : 0))"
+"fields.set('dz', new VeraNumberValue(dir.length > 2 ? dir[2] : 0))"
 "fields.set('speed', new VeraNumberValue(speed))"
 "ids.push(new VeraStringValue(b))"
 "nums.push(new VeraNumberValue(v))"
@@ -2504,8 +2626,8 @@ vera/VeraScene.ets
 ["signature","export decodeScene ( value: RuntimeValue ) WorldSpec"]
 "!(value instanceof VeraArrayValue)"
 "(value as VeraArrayValue).elements"
-"!(item instanceof SceneThingValue)"
-"t = (item as SceneThingValue).thing"
+"item instanceof SceneThingValue"
+"things.push((item as SceneThingValue).thing)"
 vera/VeraSmoke.ets
 @plainValue
 ["signature","plainValue ( kind: string ) RuntimeValue"]
@@ -2522,13 +2644,15 @@ vera/VeraSmoke.ets
 @smokeRun
 "state = vm.execute('init')"
 "roots = decodeVeraUi(vm.execute('view', [state]))"
+"drawn = decodeVeraUi(vm.execute(name, [state]))"
+"drawSurfaces(vm, drawn[0], state)"
 "drawSurfaces(vm, root, state)"
 "verdict = vm.execute('expect', [state])"
 "!(verdict instanceof VeraBooleanValue) || !verdict.value"
 "before = state"
 "state = vm.execute(name, [state, plainValue(compiled.handlers.get(name)!)])"
 "state = before"
-"decodeVeraUi(vm.execute('view', [state]))"
+"roots = decodeVeraUi(vm.execute('view', [state]))"
 "drawSurfaces(vm, root, state)"
 vera/VeraSourceFind.ets
 @sourceShownError
@@ -2634,6 +2758,9 @@ vera/VeraUi.ets
 ["signature","invokeStdTime ( name: string args: RuntimeValue[] ) RuntimeValue"]
 "new VeraNumberValue(now.getTime())"
 "new VeraNumberValue(Math.floor(now.getTime() / 1000))"
+"day = asWhole(args[0])"
+"minute = asWhole(args[1])"
+"new VeraNumberValue(at.getTime())"
 "new VeraNumberValue(Math.floor((now.getTime() - now.getTimezoneOffset() * 60000) / 86400000))"
 "new VeraNumberValue(((now.getHours() * 60 + now.getMinutes()) * 60 + now.getSeconds()) * 1000 +\n    now.getMilliseconds())"
 "new VeraNumberValue(now.getHours())"
@@ -2709,6 +2836,7 @@ vera/VeraUi.ets
 "containerNode('column', args)"
 "containerNode('row', args)"
 "containerNode('card', args)"
+"viewNode('screen', [\n    ['screenId', new VeraStringValue(argString(args, 0))],\n    ['children', argArray(args, 1)],\n])"
 "containerNode('scroll', args)"
 "containerNode('canvas', args)"
 "viewNode('transform', [\n    ['style', new VeraStringValue(argString(args, 0))],\n    ['series', argArray(args, 1)],\n    ['numberValue', new VeraNumberValue(argNum(args, 2))],\n    ['minimum', new VeraNumberValue(argNum(args, 3))],\n    ['children', argArray(args, 4)],\n])"
@@ -2718,6 +2846,7 @@ vera/VeraUi.ets
 "viewNode('text', [\n    ['style', new VeraStringValue(argString(args, 0))],\n    ['text', new VeraStringValue(argString(args, 1))],\n])"
 "viewNode('spacer', [\n    ['style', new VeraStringValue(argString(args, 0))],\n])"
 "viewNode('image', [\n    ['style', new VeraStringValue(argString(args, 0))],\n    ['src', new VeraStringValue(argString(args, 1))],\n    ['alt', new VeraStringValue(argString(args, 2))],\n])"
+"viewNode('camera', [\n    ['style', new VeraStringValue(argString(args, 0))],\n    ['action', new VeraStringValue(argString(args, 1))],\n    ['value', new VeraStringValue(argString(args, 2))],\n    ['text', new VeraStringValue(argString(args, 3))],\n])"
 "viewNode('path', [\n    ['style', new VeraStringValue(argString(args, 0))],\n    ['commands', new VeraStringValue(argString(args, 1))],\n    ['spinPeriodMs', new VeraNumberValue(argNum(args, 2))],\n    ['action', new VeraStringValue(argString(args, 3))],\n    ['value', new VeraNumberValue(argNum(args, 4))],\n])"
 "viewNode('field', [\n    ['style', new VeraStringValue(argString(args, 0))],\n    ['label', new VeraStringValue(argString(args, 1))],\n    ['value', new VeraStringValue(argString(args, 2))],\n    ['action', new VeraStringValue(argString(args, 3))],\n    ['keyboardType', new VeraStringValue(argString(args, 4))],\n    ['required', new VeraBooleanValue(argBool(args, 5, false))],\n    ['requiredMessage', new VeraStringValue(argString(args, 6))],\n    ['minLength', new VeraNumberValue(argNum(args, 7, 0))],\n    ['minLengthMessage', new VeraStringValue(argString(args, 8))],\n    ['maxLength', new VeraNumberValue(argNum(args, 9, -1))],\n    ['maxLengthMessage', new VeraStringValue(argString(args, 10))],\n    ['pattern', new VeraStringValue(argString(args, 11))],\n    ['patternMessage', new VeraStringValue(argString(args, 12))],\n    ['email', new VeraBooleanValue(argBool(args, 13, false))],\n    ['emailMessage', new VeraStringValue(argString(args, 14))],\n])"
 "viewNode(name === 'Toggle' ? 'toggle' : 'checkbox', [\n    ['style', new VeraStringValue(argString(args, 0))],\n    ['label', new VeraStringValue(argString(args, 1))],\n    ['checked', new VeraBooleanValue(argBool(args, 2))],\n    ['action', new VeraStringValue(argString(args, 3))],\n])"
@@ -2804,6 +2933,8 @@ vera/VeraUi.ets
 "v: RuntimeValue = entry[1]"
 "v instanceof VeraStringValue"
 "node.kind = (v as VeraStringValue).value"
+"v instanceof VeraStringValue"
+"node.screenId = (v as VeraStringValue).value"
 "v instanceof VeraStringValue"
 "node.style = (v as VeraStringValue).value"
 "v instanceof VeraStringValue"
@@ -3057,6 +3188,8 @@ vera/VeraWorldPlay.ets
 ["before = fingerprint(this.state)",[]]
 ["this.state = this.vm.execute(name, [this.state, value])",[["try","body"]]]
 ["fingerprint(this.state) !== before",[["if","fingerprint(this.state) !== before","condition"]]]
+@WorldPlay.watchTexts
+["decodeVeraUi(this.vm.execute('view', [this.state]))",[["loop","let root","decodeVeraUi(this.vm.execute('view', [this.state]))"],["try","body"]]]
 @WorldPlay.rebuild
 ["value = this.vm.execute(this.build, [this.state])",[["try","body"]]]
 ["next = decodeScene(value)",[["try","body"]]]
@@ -3064,13 +3197,14 @@ vera/VeraWorldPlay.ets
 ["before = fingerprint(this.state)",[["loop","queue.length > 0 && n < EVENTS_PER_FRAME"]]]
 ["steps = this.handle(this.event, sceneEventValue(e.kind, e.body, e.other, e.x, e.y, e.z, e.speed, e.bodies, e.values), 'in ' + this.event + ' (the event \"' + e.kind + '\" at frame ' + frame.toString() + ')')",[["loop","queue.length > 0 && n < EVENTS_PER_FRAME"]]]
 ["isDiceSettle && fingerprint(this.state) !== before",[["if","isDiceSettle && fingerprint(this.state) !== before","condition"],["loop","queue.length > 0 && n < EVENTS_PER_FRAME"]]]
+["fingerprint(this.state) !== before",[["if","fingerprint(this.state) !== before","condition"],["if","e.kind === 'struck'","then"],["loop","queue.length > 0 && n < EVENTS_PER_FRAME"]]]
 @WorldPlay.play
 ["decodeVeraUi(this.vm.execute('view', [this.state]))",[["loop","let root","decodeVeraUi(this.vm.execute('view', [this.state]))"]]]
 ["this.handle(b.action, new VeraNumberValue(b.eventValue), 'in ' + b.action + ' (the button \"' + b.text + '\")')",[["if","input.kind === 'button'","then"],["loop","let input","inputs"],["for","frame <= WORLD_PLAY_FRAMES"]]]
-["this.handle(this.event, sceneEventValue('tap', input.body, '', p[0], p[1], p[2], 0, [], []), 'in ' + this.event + ' (a tap on ' + (input.body.length > 0 ? 'body \"' + input.body + '\"' : 'empty space') +\n    ' at frame ' + frame.toString() + ')')",[["if","input.kind === 'tap'","then"],["loop","let input","inputs"],["for","frame <= WORLD_PLAY_FRAMES"]]]
+["this.handle(this.event, sceneEventValue('tap', input.body, '', p[0], p[1], p[2], 0, [], [], dir), 'in ' + this.event + ' (a tap on ' + (input.body.length > 0 ? 'body \"' + input.body + '\"' : 'empty space') +\n    ' at frame ' + frame.toString() + ')')",[["if","input.kind === 'tap'","then"],["loop","let input","inputs"],["for","frame <= WORLD_PLAY_FRAMES"]]]
 ["this.handle(this.event, sceneEventValue('swipe', input.body, '', d[0], 0, d[2], 3, [], []), 'in ' + this.event + ' (a swipe of body \"' + input.body + '\" at frame ' + frame.toString() + ')')",[["if","input.kind === 'tap'","else"],["loop","let input","inputs"],["for","frame <= WORLD_PLAY_FRAMES"]]]
 @WorldPlay.steerAt
-["this.handle(this.event, sceneEventValue('action', p.id, '', at[0], at[1], at[2], 0, [], []), 'in ' + this.event + ' (the player\\'s button \"' + (p.player as ScenePlayer).action + '\" at frame ' + frame.toString() + ')')",[["if","frame === STICK_FROM + STICK_AHEAD / 2 && (p.player as ScenePlayer).action.length > 0 && this.event.length > 0","then"],["if","frame === STICK_FROM + STICK_AHEAD + STICK_RIGHT","else"],["if","frame === STICK_FROM + STICK_AHEAD","else"],["if","frame === STICK_FROM","else"]]]
+["this.handle(this.event, sceneEventValue('action', p.id, labels[k], at[0], at[1], at[2], 0, [], [], facing), 'in ' + this.event + ' (the player\\'s button \"' + labels[k] + '\" at frame ' + frame.toString() + ')')",[["for","k < labels.length"]]]
 @playWorld
 ["state = vm.execute('init')",[["try","body"]]]
 ["decodeVeraUi(vm.execute('view', [state]))",[["loop","let root","decodeVeraUi(vm.execute('view', [state]))"],["try","body"]]]
@@ -3116,6 +3250,8 @@ runtime/AppActor.ets
 ["AppActor.activate","publication = await this.manager!.publishGeneration()",[["try","body"]]]
 ["AppActor.activate","this.coordinator = new AppActorTurnCoordinator(this.manager!, this.vm!, this.host!, this.mode, policy, {\n    snapshot: (snapshot): void => this.publishSnapshot(snapshot.encoded, snapshot),\n    effects: (delivery): void => {\n        if (this.cancelled || this.disposed) {\n            return;\n        }\n        this.align(delivery);\n        this.callback(() => this.callbacks.effects(delivery.effects, delivery));\n    },\n    render: (version, pure): Promise<void> => this.render(version, pure),\n    durable: (): void => this.markDurable(),\n    saved: (version): void => {\n        if (this.cancelled || this.disposed) {\n            return;\n        }\n        this.align(version);\n        this.callback(() => this.callbacks.saved(this.persistKey.split('/')[0]));\n    },\n    resumed: (changed: boolean): void => {\n        if (!this.cancelled && !this.disposed) {\n            StageTrace.emit(this.traceOwner, 'RESUME_STATE_RELOAD', { changed: changed });\n        }\n    },\n    error: (error): void => {\n        reportedFailure = error;\n        StageTrace.emit(this.traceOwner, 'ERROR', { kind: error.kind });\n        if (!this.cancelled && !this.disposed) {\n            this.callback(() => this.callbacks.error(error.kind, error.code));\n        }\n    }\n}, this.safety)",[["try","body"]]]
 ["AppActor.activate","this.manager!.getWorkingState()",[["if","restored","then"],["try","body"]]]
+["AppActor.activate","loaded = await this.manager!.recoverLost()",[["if","loaded.kind === 'LOST' && recoveryOwner !== null && working === null && persistent","then"],["try","body"]]]
+["AppActor.activate","snapshot = this.manager!.committedSnapshot()",[["if","loaded.kind === 'LOST' && recoveryOwner !== null && working === null && persistent","then"],["try","body"]]]
 ["AppActor.captureMemoryRuntime","runtime.manager = this.manager",[]]
 ["AppActor.restoreMemoryRuntime","this.manager = runtime.manager",[]]
 ["AppActor.closeMemoryRuntime","await this.closeRuntime(runtime.coordinator, runtime.manager, false)",[["try","body"]]]
@@ -3136,6 +3272,7 @@ runtime/StateManager.ets
 ["StateManager.whenIdle","this.pending !== 0 || this.active !== null",[["loop","this.pending !== 0 || this.active !== null"]]]
 ["StateManager.captureWorkingSnapshot","this.active !== null || this.exclusive !== 0",[["if","this.active !== null || this.exclusive !== 0","condition"]]]
 ["StateManager.load","this.active !== null || this.pending !== 0 || this.phase !== 'NEW'",[["if","this.active !== null || this.pending !== 0 || this.phase !== 'NEW'","condition"]]]
+["StateManager.recoverLost","this.active !== null || this.pending !== 0",[["if","this.active !== null || this.pending !== 0","condition"]]]
 ["StateManager.publishGeneration","this.active !== null || this.pending !== 0 || this.needsReload",[["if","this.active !== null || this.pending !== 0 || this.needsReload","condition"]]]
 ["StateManager.beginTurn","this.closing || ['IMMEDIATE', 'THROTTLED', 'VOLATILE'].indexOf(commitClass) < 0 ||\n    ['INIT', 'CARRY', 'INPUT', 'EFFECT_RESULT', 'TICK', 'SURFACE', 'MOVE'].indexOf(source) < 0 ||\n    this.active !== null || this.exclusive !== 0 ||\n    (this.pending !== 0 && (this.pending !== 1 || !this.captureInFlight)) ||\n    (commitClass === 'IMMEDIATE' && this.pending !== 0)",[["if","this.closing || ['IMMEDIATE', 'THROTTLED', 'VOLATILE'].indexOf(commitClass) < 0 ||\n    ['INIT', 'CARRY', 'INPUT', 'EFFECT_RESULT', 'TICK', 'SURFACE', 'MOVE'].indexOf(source) < 0 ||\n    this.active !== null || this.exclusive !== 0 ||\n    (this.pending !== 0 && (this.pending !== 1 || !this.captureInFlight)) ||\n    (commitClass === 'IMMEDIATE' && this.pending !== 0)","condition"]]]
 ["StateManager.beginTurn","tx = new ManagedStateTransaction(this.sequence, commitClass, source, this.working, this.dirty)",[]]
@@ -3212,8 +3349,6 @@ runtime/StateManager.ets
 ["StateManager.handleRefusal","turn?.source",[]]
 ["StateManager.handleRefusal","turn !== null",[["if","turn !== null","condition"],["if","this.isTerminal()","then"]]]
 ["StateManager.handleRefusal","this.abandonTurn(turn)",[["if","turn !== null","then"],["if","this.isTerminal()","then"]]]
-["StateManager.handleRefusal","turn !== null",[["if","turn !== null","condition"],["if","this.lostRecoveryPending","then"]]]
-["StateManager.handleRefusal","this.abandonTurn(turn)",[["if","turn !== null","then"],["if","this.lostRecoveryPending","then"]]]
 ["StateManager.handleRefusal","turn !== null",[["if","turn !== null","condition"],["if","result.status === 'COMMIT_UNCERTAIN' || result.status === 'FENCED_COMMIT'","then"]]]
 ["StateManager.handleRefusal","this.abandonTurn(turn)",[["if","turn !== null","then"],["if","result.status === 'COMMIT_UNCERTAIN' || result.status === 'FENCED_COMMIT'","then"]]]
 ["StateManager.handleRefusal","turn !== null",[["if","turn !== null","condition"]]]
@@ -3247,6 +3382,19 @@ vera/VeraLiveWidget.ets
 ["runPreviewTap","result.state = session.encodedState()",[["try","body"]]]
 ["runPreviewTap","result.rested = session.lastTapRested",[["try","body"]]]
 ["sameCard","frame = new WidgetSession(vbc2, 'compare', seed).frame('', '', '')",[["try","body"]]]
+vera/VeraReachability.ets
+["checkScreenReachability","queue.length >= MAX_STATES",[["if","queue.length >= MAX_STATES","condition"]]]
+["checkScreenReachability","queue.push(new ReachState(state, path))",[]]
+["checkScreenReachability","index < queue.length && result.actions < MAX_ACTIONS && result.steps < MAX_STEPS",[["for","index < queue.length && result.actions < MAX_ACTIONS && result.steps < MAX_STEPS"],["try","body"]]]
+["checkScreenReachability","current = queue[index]",[["for","index < queue.length && result.actions < MAX_ACTIONS && result.steps < MAX_STEPS"],["try","body"]]]
+["checkScreenReachability","nodes = draw(current.state)",[["try","body"],["for","index < queue.length && result.actions < MAX_ACTIONS && result.steps < MAX_STEPS"],["try","body"]]]
+["checkScreenReachability","result.paths.push(id + ': ' + (current.path.length > 0 ? current.path.join(' -> ') : 'init'))",[["if","(node.screenId === id || node.screenId.startsWith(id + ':')) && result.reached.indexOf(id) < 0","then"],["loop","let id","screens"],["loop","let node","nodes"],["for","index < queue.length && result.actions < MAX_ACTIONS && result.steps < MAX_STEPS"],["try","body"]]]
+["checkScreenReachability","current.path.length >= MAX_DEPTH",[["if","current.path.length >= MAX_DEPTH","condition"],["for","index < queue.length && result.actions < MAX_ACTIONS && result.steps < MAX_STEPS"],["try","body"]]]
+["checkScreenReachability","filled = clone(current.state)",[["for","index < queue.length && result.actions < MAX_ACTIONS && result.steps < MAX_STEPS"],["try","body"]]]
+["checkScreenReachability","enqueue(filled, current.path.concat(['fill(' + filledNames.join(', ') + ')']))",[["if","filledNames.length > 0","then"],["for","index < queue.length && result.actions < MAX_ACTIONS && result.steps < MAX_STEPS"],["try","body"]]]
+["checkScreenReachability","next = act(current.state, node, value)",[["try","body"],["loop","let value","values"],["loop","let node","choices"],["for","index < queue.length && result.actions < MAX_ACTIONS && result.steps < MAX_STEPS"],["try","body"]]]
+["checkScreenReachability","!isInput(node) && stateKey(next) === stateKey(current.state)",[["if","!isInput(node) && stateKey(next) === stateKey(current.state)","condition"],["try","body"],["loop","let value","values"],["loop","let node","choices"],["for","index < queue.length && result.actions < MAX_ACTIONS && result.steps < MAX_STEPS"],["try","body"]]]
+["checkScreenReachability","enqueue(next, current.path.concat([label]))",[["try","body"],["loop","let value","values"],["loop","let node","choices"],["for","index < queue.length && result.actions < MAX_ACTIONS && result.steps < MAX_STEPS"],["try","body"]]]
 vera/VeraWidgetRefine.ets
 ["widgetProblem","session = new WidgetSession(vbc2, 'validation', saved)",[]]
 ["widgetProblem","frames = session.dimensions().map((dimension: number): LiveFrame => session.frame('project', 'App', '', dimension))",[]]
@@ -3297,6 +3445,9 @@ vera/VeraWorldPlay.ets
 ["playWorld","report.hitStepsMax = play.hitStepsMax",[["if","report !== null","then"]]]
 ["playWorld","report.playerMoved = play.playerMoved",[["if","report !== null","then"]]]
 ["playWorld","report.enterEvents = play.enterEvents",[["if","report !== null","then"]]]
+["playWorld","report.struckEvents = play.struckEvents",[["if","report !== null","then"]]]
+["playWorld","report.struckRead = play.struckRead",[["if","report !== null","then"]]]
+["playWorld","report.playerPresses = play.playerPresses",[["if","report !== null","then"]]]
 `.trim().split('\n').map(line => line.trim()).filter(Boolean)) {
     if (line.endsWith('.ets')) {
       originFile = line
@@ -3336,7 +3487,7 @@ vera/VeraWorldPlay.ets
     assert.deepEqual(actual.ownerEntries, reviewedOwnerOrigins.get(file) || [],
       'external inventory: ordered storage owner origin ' + file)
     assert.deepEqual(sorted(actual.accesses), sorted(expectedAccesses.filter(([module]) => module === path.basename(file, '.ets'))),
-      'external inventory: 46 reviewed direct graph accesses ' + file)
+      'external inventory: 49 reviewed direct graph accesses ' + file)
     assert.deepEqual(sorted(actual.imports), sorted(reviewedImports.filter(([name]) => name === file)),
       'external inventory: protected imports changed ' + file)
     assert.deepEqual(sorted(actual.fresh), sorted(ownership.A.fresh.filter(([module]) => file === 'vera/' + module + '.ets')
@@ -3374,7 +3525,7 @@ vera/VeraWorldPlay.ets
         assert.deepEqual(sites[index], expected[index], 'external inventory: ordered storage owner origin ' + file + ':' + index)
       }
     }
-    assert.deepEqual(sorted(actual.accesses), sorted(expectedAccesses), 'external inventory: 46 reviewed direct graph accesses')
+    assert.deepEqual(sorted(actual.accesses), sorted(expectedAccesses), 'external inventory: 49 reviewed direct graph accesses')
     assert.deepEqual(sorted(actual.imports), sorted(reviewedImports), 'external inventory: protected imports changed')
     assert.deepEqual(sorted(actual.constructors), sorted(['A', 'B'].flatMap(kind =>
       ownership[kind].constructors.map(([name, sig, body]) => {
@@ -3404,6 +3555,85 @@ vera/VeraWorldPlay.ets
     return new Map(sources).set(file, text.replace(before, after))
   }
   const reject = (name, file, before, after) => assert.throws(() => guard(replace(file, before, after)), /external inventory:/, name)
+  const reachFile = 'vera/VeraReachability.ets', selection = 'let current = queue[index]'
+  let reviewedSelection = false
+  guard(sources, (file, result) => {
+    if (file !== reachFile) return
+    assert.deepEqual(result.ownerEntries.filter(([, expression]) => expression === 'current = queue[index]'),
+      [['checkScreenReachability', 'current = queue[index]', [
+        ['for', 'index < queue.length && result.actions < MAX_ACTIONS && result.steps < MAX_STEPS'], ['try', 'body']]]])
+    assert(result.ownerEntries.some(([, expression]) => expression === 'nodes = draw(current.state)'),
+      'selected owner remains tracked downstream')
+    reviewedSelection = true
+  })
+  assert(reviewedSelection, 'reviewed numeric selection inspected')
+  let selectionProbes = 0
+  const rejectSelection = (name, after, expected, origin = false) => {
+    let inspected = false
+    assert.throws(() => guard(replace(reachFile, selection, after), (file, result) => {
+      if (file !== reachFile || !origin) return
+      assert(result.ownerEntries.some(([, expression]) => expression === expected), name + ' owner origin inspected')
+      inspected = true
+    }), origin ? /external inventory: ordered storage owner origin/ : expected, name)
+    if (origin) assert(inspected, name + ' inspected before baseline rejection')
+    selectionProbes++
+  }
+  for (const [name, after] of [
+    ['computed owner variable', selection + '; let key = "state"; let bad = current[key]'],
+    ['computed owner concatenation', selection + '; let bad = current["sta" + "te"]'],
+    ['numeric owner intersection', selection + '; let bad = (current as ReachState & { [n: number]: RuntimeValue })[index]'],
+    ['string array key', 'let key: string = "0"; let current = queue[key]'],
+    ['union array key', 'let key = index as number | string; let current = queue[key]'],
+    ['any array key', 'let current = queue[index as any]'],
+    ['unknown array key', 'let current = queue[index as unknown]'],
+    ['erased declaration', 'let current: Object = queue[index]'],
+    ['selection assignment', 'let current: ReachState; current = queue[index]'],
+    ['selection delete', selection + '; delete queue[index]'],
+    ['selection update', selection + '; queue[index]++'],
+    ['selection write', selection + '; queue[index] = current'],
+    ['nested selected state write', selection + '; queue[index].state = current.state'],
+    ['nested graph write', selection + '; (queue[index].state as VeraArrayValue).elements.push(current.state)'],
+    ['selection destructuring', 'let {state} = queue[index]; let current = queue[0]'],
+    ['cast selected owner', 'let current = queue[index] as Object as ReachState']
+  ]) rejectSelection(name, after, /external inventory: computed protected owner access/)
+  for (const [name, addition, expected] of [
+    ['inferred alias escape', '; let alias = current; Object.assign(alias, {state: current.state})', 'Object.assign(alias, { state: current.state })'],
+    ['selected alias escape', '; let alias = queue[index]; Object.assign(alias, {state: current.state})', 'Object.assign(alias, { state: current.state })'],
+    ['erased owner escape', '; let erased: Object = current; Object.assign(erased, {state: null})', 'erased: Object = current'],
+    ['destructured owner escape', '; let {state: erased} = current; Object.assign(erased, {fields: new Map()})', '{ state: erased } = current'],
+    ['computed erased state', '; let erased: Object = current; Object.assign((erased as { [key: string]: Object })["sta" + "te"], {fields: new Map()})', 'erased: Object = current'],
+    ['any receiver escape', '; let erased = queue as any; Object.assign(erased[index], {state: null})', 'erased = queue as any'],
+    ['Object receiver escape', '; let erased = queue as Object; Object.assign((erased as { [n: number]: Object })[index], {state: null})', 'erased = queue as Object'],
+    ['duplicate selection', '; let duplicate = queue[index]', 'duplicate = queue[index]'],
+    ['selected direct root write', '; current.state = clone(current.state)', 'current.state = clone(current.state)']
+  ]) rejectSelection(name, selection + addition, expected, true)
+  rejectSelection('structural numeric receiver', 'let current = (queue as { [n: number]: ReachState })[index]',
+    'current = (queue as {\n    [n: number]: ReachState;\n})[index]', true)
+  rejectSelection('conditional selection', 'let current = queue[index]; if (false) { let duplicate = queue[index] }',
+    'duplicate = queue[index]', true)
+  rejectSelection('moved selection', 'if (false) { let current = queue[index] }', 'current = queue[index]', true)
+  rejectSelection('index traversal mutation', 'let current = queue[(queue.push(new ReachState(queue[0].state, [])), index)]',
+    /external inventory: computed protected owner access/)
+  let indexMutationInspected = false
+  assert.throws(() => guard(replace(reachFile, selection,
+    'let current = queue[(Object.assign(queue, {length: 0}), index)]'), (file, result) => {
+    if (file !== reachFile) return
+    assert(result.ownerEntries.some(([, expression]) =>
+      expression === 'current = queue[(Object.assign(queue, { length: 0 }), index)]'), 'numeric index mutation remains inventoried')
+    assert(result.ownerEntries.some(([, expression]) => expression === 'nodes = draw(current.state)'),
+      'numeric index mutation does not erase inferred owner')
+    indexMutationInspected = true
+  }), /external inventory: ordered storage owner origin/, 'numeric index expression cannot hide mutation')
+  assert(indexMutationInspected, 'numeric index subtree inspected')
+  selectionProbes++
+  assert.throws(() => guard(new Map(sources).set('vera/ExternalSelectionProbe.ets', `
+    import { StateManager } from '../runtime/StateManager'
+    export function consume(queue: StateManager[], index: number): void {
+      let alias = queue[index]; Object.assign(alias, {working: null})
+    }`)), /external inventory:/, 'new numeric selection consumer without interpreter import')
+  selectionProbes++
+  console.log('protected-owner selection: reviewed numeric alias and downstream origins tracked; ' + selectionProbes +
+    ' computed-access, erasure, escape, write, order/context and nested-index rejection probes')
   const arrayFile = 'vera/VeraGfx.ets', arrayAnchor = 'let items = (v as VeraArrayValue).elements'
   reject('new elements push', arrayFile, arrayAnchor, arrayAnchor + '; items.push(v)')
   reject('borrowed graph alias', arrayFile, arrayAnchor, arrayAnchor + '; let borrowed = items; borrowed.reverse()')
@@ -3505,7 +3735,7 @@ vera/VeraWorldPlay.ets
   guard(newFile('@Component struct UnrelatedArkUi { build() { Column() { Text("safe") } } }'))
   guard(replace(arrayFile, 'expected number argument', 'expected numeric argument'))
   guard(replace(arrayFile, arrayAnchor, 'let items = ( v as VeraArrayValue ).elements'))
-  console.log('external-graph inventory: 46 accesses; A/B/C/D ownership; ordered owner/sites, storage-owner origins, retained-root contexts and read-only ownership body pin; cross-file graph/Cell rejection and benign probes ok (review guard, not semantic proof)')
+  console.log('external-graph inventory: 49 accesses; A/B/C/D ownership; ordered owner/sites, storage-owner origins, retained-root contexts and read-only ownership body pin; cross-file graph/Cell rejection and benign probes ok (review guard, not semantic proof)')
 }
 externalGraphChecks()
 
@@ -3686,9 +3916,22 @@ allocationProvenanceChecks()
   assert.notStrictEqual(p1, p2)
   assert.notStrictEqual(p1.fields, p2.fields)
   for (const [name, value] of p1.fields) assert.notStrictEqual(value, p2.fields.get(name))
-  const bodies = ['body'], values = [4]
-  const e1 = sceneEventValue('hit', 'a', 'b', 1, 2, 3, 4, bodies, values)
-  const e2 = sceneEventValue('hit', 'a', 'b', 1, 2, 3, 4, bodies, values)
+  const bodies = ['body'], values = [4], direction = [0.25, -0.5, 0.75]
+  const e1 = sceneEventValue('hit', 'a', 'b', 1, 2, 3, 4, bodies, values, direction)
+  const e2 = sceneEventValue('hit', 'a', 'b', 1, 2, 3, 4, bodies, values, direction)
+  for (const [index, name] of ['dx', 'dy', 'dz'].entries()) {
+    assert.equal(e1.fields.get(name).value, direction[index])
+    assert.equal(e2.fields.get(name).value, direction[index])
+    assert.notStrictEqual(e1.fields.get(name), e2.fields.get(name), 'direction scalar wrappers are independent')
+  }
+  direction[0] = 99; direction[1] = 98; direction[2] = 97
+  for (const event of [e1, e2]) assert.deepEqual(['dx', 'dy', 'dz'].map(name => event.fields.get(name).value),
+    [0.25, -0.5, 0.75], 'direction is isolated from later input mutation')
+  for (const [args, expected] of [[[], [0, 0, 0]], [[[]], [0, 0, 0]], [[[2]], [2, 0, 0]], [[[2, 3]], [2, 3, 0]]]) {
+    const event = sceneEventValue('tap', '', '', 0, 0, 0, 0, [], [], ...args)
+    assert.deepEqual(['dx', 'dy', 'dz'].map(name => event.fields.get(name).value), expected,
+      'omitted and short directions use zero defaults')
+  }
   assert.notStrictEqual(e1.fields, e2.fields)
   for (const name of ['bodies', 'values']) {
     assert.notStrictEqual(e1.fields.get(name), e2.fields.get(name))
@@ -3725,7 +3968,7 @@ async function projectStateChecks() {
       assert([...worker.memory.nodes.values()].every(node => node.owner === null), 'project read releases worker locks')
     })
   }
-  const projectSource = fs.readFileSync(path.join(sourceRoot, 'vera/ProjectStore.ets'), 'utf8')
+  const projectSource = fs.readFileSync(path.join(sourceRoot, 'vera/ProjectStore.ets'), 'utf8').replace(/\r\n/g, '\n')
   const transpiled = ts.transpileModule(projectSource, {fileName: 'ProjectStore.ts',
     compilerOptions: {module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020}, reportDiagnostics: true})
   assert.deepEqual((transpiled.diagnostics || []).filter(d => d.category === ts.DiagnosticCategory.Error), [])
@@ -3759,7 +4002,7 @@ async function projectStateChecks() {
     function load(file) {
       if (cache.has(file)) return cache.get(file).exports
       const compiled = file === path.join(sourceRoot, 'vera/ProjectStore.ets') ? transpiled :
-        ts.transpileModule(fs.readFileSync(file, 'utf8').replace(/^@Concurrent\s*$/gm, ''), {
+        ts.transpileModule(fs.readFileSync(file, 'utf8').replace(/\r\n/g, '\n').replace(/^@Concurrent\s*$/gm, ''), {
           fileName: file.replace(/\.ets$/, '.ts'),
           compilerOptions: {module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020}, reportDiagnostics: true
         })
@@ -4180,7 +4423,7 @@ async function cleanupTaskPoolChecks(projectFixture) {
   function load(name) {
     assert(['StateCleanupTaskPool', 'StateIo', 'StateFileFormat'].includes(name))
     if (cache.has(name)) return cache.get(name).exports
-    const source = fs.readFileSync(path.join(sourceRoot, 'runtime', name + '.ets'), 'utf8')
+    const source = fs.readFileSync(path.join(sourceRoot, 'runtime', name + '.ets'), 'utf8').replace(/\r\n/g, '\n')
     if (name === 'StateCleanupTaskPool') {
       assert.match(source, /@Concurrent\s+function stateCleanupTask/)
       assert.doesNotMatch(source, /Object\.freeze/)

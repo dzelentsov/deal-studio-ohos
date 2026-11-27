@@ -1618,7 +1618,7 @@ const hostBaseline = {
     "import { UiHostEnvironment, HostEffect, VeraUiNode, decodeVeraUi } from '../vera/VeraUi';",
     'export interface AppActorTurnEffects extends AppActorTurnVersion { readonly effects: HostEffect[]; }',
     'export interface AppActorTurnCallbacks { snapshot: (snapshot: AppActorTurnSnapshot) => void; effects: (delivery: AppActorTurnEffects) => void; render: (version: AppActorTurnVersion, pure: (call: AppActorTurnCall) => RuntimeValue) => void | Promise<void>; error: (error: AppActorTurnError) => void; durable?: () => void; saved?: (version: AppActorTurnVersion) => void; resumed?: (changed: boolean) => void; }',
-    'export interface AppActorCallbacks { render: (paint: boolean, reveal: boolean, version?: AppActorTurnVersion) => void | Promise<void>; snapshot: (encoded: string, version?: AppActorTurnVersion) => void; saved: (projectId: string) => void; effects: (effects: HostEffect[], version?: AppActorTurnVersion) => void; error: (kind: string, message: string) => void; version?: (version: AppActorTurnVersion) => void; durable?: () => void; identity?: () => string; generation?: () => number; }'
+    'export interface AppActorCallbacks { render: (paint: boolean, reveal: boolean, version?: AppActorTurnVersion) => void | Promise<void>; snapshot: (encoded: string, version?: AppActorTurnVersion) => void; saved: (projectId: string) => void; effects: (effects: HostEffect[], version?: AppActorTurnVersion) => void; error: (kind: string, message: string) => void; version?: (version: AppActorTurnVersion) => void; durable?: () => void; identity?: () => string; generation?: () => number; recoveryOwner?: (owner: ProjectStateRecoveryOwner | null) => void; }'
   ],
   'entry/src/main/ets/runtime/AppActor.ets:AppActorTurnCoordinator': ['private host: UiHostEnvironment;'],
   'entry/src/main/ets/runtime/AppActor.ets:AppActorTurnCoordinator.constructor': [
@@ -1668,6 +1668,14 @@ const hostBaseline = {
   'entry/src/main/ets/vera/VeraLiveWidget.ets:WidgetSession.sourceRequests': ['this.host.pendingEffects'],
   'entry/src/main/ets/vera/VeraMovingPart.ets:<module>': ["import { decodeVeraUi, UiHostEnvironment, VeraUiNode } from './VeraUi';"],
   'entry/src/main/ets/vera/VeraMovingPart.ets:appMovingPart': ['host = new UiHostEnvironment()', 'host.effectsAllowed = true;', 'vm = new VirtualMachine(deserializeVbc2(vbc2), host, PART_MAX_VM_STEPS)', 'host.pendingEffects = [];', 'host.pendingEffects = [];', 'host.effectsAllowed = false;', 'host.pendingEffects = [];'],
+  'entry/src/main/ets/vera/VeraReachability.ets:<module>': ["import { UiHostEnvironment, VeraUiNode, decodeVeraUi } from './VeraUi';"],
+  'entry/src/main/ets/vera/VeraReachability.ets:ReachHost': [
+    'extends UiHostEnvironment', 'invoke(module: string, name: string, args: RuntimeValue[], awaited: boolean): RuntimeValue'
+  ],
+  'entry/src/main/ets/vera/VeraReachability.ets:checkScreenReachability': [
+    'host = new ReachHost()', 'vm = new VirtualMachine(deserializeVbc2(vbc2), host, 100000)',
+    'host.effectsAllowed = true;', 'host.pendingEffects.length > 0', 'host.effectsAllowed = false;', 'host.pendingEffects = [];'
+  ],
   'entry/src/main/ets/vera/VeraSearchBenchmark.ets:<module>': [
     "import { UiHostEnvironment, VeraUiNode, decodeVeraUi } from './VeraUi';",
     'interface P2LogRecord { event?: string; runId?: string; protocol?: number; outcome?: string; mode?: string; modes?: string[]; workload?: number; corpus?: number; kind?: number; handlers?: number; pure?: number; maxSteps?: number; deadlineMs?: number; steps?: number; sample?: number; operations?: number; successfulOperations?: number; failedOperations?: number; unexecutedOperations?: number; stepsPerOperation?: number; batchMs?: number; msPerOperation?: number; failedBatchMs?: number; warmup?: number; warmups?: number; successfulSamples?: number; failedSamples?: number; journalReservations?: number; journalUndoRecords?: number; hostReservations?: number; runtimeBirthSerialDelta?: number; blockedCalls?: number; deferredEffects?: number; rootUnchanged?: number; callIndex?: number; inputUnchanged?: number; resultMatchesInputBefore?: number; resultMatchesInputAfter?: number; returnSameRuntimeValue?: number; persistenceFormatValid?: number; stateRoundTripEqual?: number; postStatePureViewChecked?: number; postStatePureViewOutcome?: string; stateSchemaChecked?: number; rollbackSucceeded?: number; checkScope?: string; ownershipAliasCorrectnessChecked?: number; minimumUndo?: number; minimumHost?: number; expectedReservations?: number; reservationExpectationsMet?: number; journalLimit?: number; executionOutcome?: string; rootRestored?: number; rollbackMs?: number; synchronousHostMs?: number; hostCalls?: number; cooperative?: number; elapsedMs?: number; projectsListed?: number; projectsVisited?: number; versionsListed?: number; bytecodesRead?: number; statesRead?: number; versionsSelected?: number; versionsNotSelected?: number; rejected?: number; oversized?: number; versionSelectionCap?: number; seedMode?: number; nodesVisited?: number; traversalLimited?: number; unvisitedNodesCountKnown?: number; handlersDiscovered?: number; handlersSelected?: number; handlersSkipped?: number; twoParameterFunctions?: number; pureEntriesSelected?: number; handlerSelectionCap?: number; pureSelectionCap?: number; explorationPasses?: number; effectCallbacksExercised?: number; samples?: number; widgetMaxSteps?: number; widgetDeadlineMs?: number; runLimitMs?: number; workLimitMs?: number; preflightLimitMs?: number; preflightMaxSteps?: number; referenceMs?: number; stopReason?: string; batchCap?: number; targetBatchMs?: number; baselineCurrentInfrastructure?: number; nativeEffectsExecuted?: number; gcForced?: number; clock?: string; birthSerialIsAllocationBytes?: number; journalPureHandlers?: number; hardPreemption?: number; compileTimed?: number; setupTimed?: number; codecsTimed?: number; fingerprintsTimed?: number; journalBeginExecuteAcceptTimed?: number; rollbackInSamples?: number; budgetEnabled?: number; journalEnabled?: number; executePure?: number; preInfrastructureBaseline?: number; pureOnly?: number; workloadsPlanned?: number; workloadsAttempted?: number; workloadsComplete?: number; inventoryComplete?: number; selectedWorkloadsComplete?: number; workloadsSkipped?: number; }'
@@ -1717,7 +1725,7 @@ const hostBaseline = {
     "record: P2LogRecord = { event: 'host-deadline', mode: 'budget', deadlineMs: 4, synchronousHostMs: 8, hostCalls: host.probeCalls, cooperative: 1, steps: vm.stepsExecuted(), outcome: correct ? 'ok' : 'failed', executionOutcome: outcome }"
   ],
   'entry/src/main/ets/vera/VeraSmoke.ets:<module>': ["import { UiHostEnvironment, decodeVeraUi, VeraUiNode } from './VeraUi';"],
-  'entry/src/main/ets/vera/VeraSmoke.ets:smokeRun': ['host = new UiHostEnvironment()', 'vm = new VirtualMachine(deserializeVbc2(compiled.vbc2), host)', 'host.effectsAllowed = true;', 'host.effectsAllowed = false;', 'host.pendingEffects = [];'],
+  'entry/src/main/ets/vera/VeraSmoke.ets:smokeRun': ['host = new UiHostEnvironment()', 'vm = new VirtualMachine(module, host)', 'host.effectsAllowed = true;', 'host.effectsAllowed = false;', 'host.pendingEffects = [];'],
   'entry/src/main/ets/vera/VeraSourceFind.ets:<module>': ["import { UiHostEnvironment, VeraUiNode, decodeVeraUi, formatVeraNumber } from './VeraUi';"],
   'entry/src/main/ets/vera/VeraSourceFind.ets:sourceShownError': ['host = new UiHostEnvironment()', 'vm = new VirtualMachine(deserializeVbc2(vbc2), host)', 'host.effectsAllowed = true;', 'host.effectsAllowed = false;'],
   'entry/src/main/ets/vera/VeraSurfacePlay.ets:<module>': ["import { UiHostEnvironment, decodeVeraUi, VeraUiNode } from './VeraUi';"],
@@ -2207,6 +2215,9 @@ const hostBodyBaseline = {
       switch (key) {
         case 'type':
           if (v instanceof VeraStringValue) { node.kind = (v as VeraStringValue).value }
+          break
+        case 'screenId':
+          if (v instanceof VeraStringValue) { node.screenId = (v as VeraStringValue).value }
           break
         case 'style':
           if (v instanceof VeraStringValue) { node.style = (v as VeraStringValue).value }

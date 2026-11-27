@@ -19,6 +19,7 @@ const worker = require('./state-io-check').createWorkerFixture('/host-fixture/ve
   if (event.op === 'stat' && event.path.endsWith('.state.json')) records.push({ type: 'load-attempt', file: event.path })
   if (event.op === 'read' && event.path.endsWith('.state.json')) records.push({ type: 'load', file: event.path })
   if (event.op === 'rename' && event.to.endsWith('.state.json')) records.push({ type: 'save-attempt', file: event.to })
+  if (event.op === 'rename' && event.to.endsWith('.quarantine')) records.push({ type: 'quarantine', file: event.path, to: event.to })
 }, () => failure)
 const disk = worker.disk
 const filesystem = new Proxy(worker.filesystem, { get(target, key) {
@@ -105,7 +106,8 @@ const { InProcessHost, makeRevisionedFrame, makeRevisionedEffect, makeStateSnaps
 const { compileVeraSource } = vera('VeraCompiler')
 const { veraStateStamp } = vera('VeraStateStamp')
 const { assembleStateFile, validateStateFile } = load(path.join(root, 'runtime/StateFileFormat.ets'))
-const { store } = vera('ProjectStore')
+const storeModule = vera('ProjectStore')
+let store = storeModule.store
 store.init('/host-fixture')
 const target = 'com.example.host/entry/EntryAbility/Record'
 const effect = label => `sdk.call("${target}", ["label", "${label}", "value", ui.numberToString(state.n)], "answered");`
@@ -1996,7 +1998,7 @@ test('frames and effects are detached plain DTOs and delivered frames never muta
   assert.deepEqual(subscriber.members.map(node => node.getText(messages).replace(/\s/g, '')), [
     'onViewFrame(frame:RevisionedFrameEnvelope):void', 'onError(kind:string,message:string,inputSeq?:number):void',
     'onStateSnapshot(encoded:string,snapshot?:StateSnapshotEnvelope):void', 'onStateSaved(projectId:string):void',
-    'onEffectRequest(effect:RevisionedEffectRequest):void', 'onActorHandle?(handle:ActorHandle):void',
+    'onEffectRequest(effect:RevisionedEffectRequest):void', "onActorHandle?(handle:ActorHandle,reason?:'REPLACE'|'PROMOTE'):void",
     'flushPendingInputFor(appId:string):void|Promise<void>', 'onMailboxWritable():void'
   ])
   previous.view.text = 'subscriber edit'
@@ -3167,6 +3169,58 @@ test('async replacement reserves source and target until cleanup and refresh set
   assert.equal(actors[0].calls.filter(call => call === 'dispose').length, 1)
 })
 
+for (const reason of ['REPLACE', 'PROMOTE']) test('committed ' + reason + ' handle precedes candidate publications', async () => {
+  const h = host(), p = probe(), a = await acquire(h, p, programs.basic, options('PREVIEW'))
+  const events = []
+  const onHandle = p.subscriber.onActorHandle
+  p.subscriber.onActorHandle = (handle, committedReason) => {
+    events.push({ type: 'handle', handle, reason: committedReason, owned: h.leases.get(handle.leaseId).handle === handle })
+    onHandle(handle)
+  }
+  for (const method of ['onViewFrame', 'onStateSnapshot', 'onEffectRequest']) {
+    const original = p.subscriber[method]
+    p.subscriber[method] = (...args) => { events.push({ type: method }); original(...args) }
+  }
+  const b = await finish(reason === 'REPLACE' ? h.replaceProgram(a, programs.newer, persistent()) :
+    h.promote(a, 'LIVE_PERSISTENT', persistent().persistKey))
+  assert.equal(events[0].type, 'handle')
+  assert.equal(events[0].handle, b)
+  assert.equal(events[0].reason, reason)
+  assert.equal(events[0].owned, true)
+  assert.equal(events.filter(event => event.type === 'handle').length, 1)
+  assert(events.some(event => event.type === 'onViewFrame'))
+  assert(events.some(event => event.type === 'onStateSnapshot'))
+  rejected(post(h, a))
+  rejected(post(h, { ...b }))
+  accepted(post(h, b))
+})
+
+for (const stage of ['cleanup', 'boundary']) test('dispose at replacement ' + stage + ' suppresses candidate publications', async () => {
+  const { actors, factory } = delayedActors()
+  const h = host(factory), p = probe(), a = await acquire(h, p, programs.basic, options('PREVIEW'))
+  const cleanup = actors[0].hold('dispose')
+  const handles = p.handles.length
+  let closing
+  p.subscriber.onActorHandle = handle => {
+    p.handles.push(handle)
+    if (stage === 'boundary') closing = watch(h.dispose())
+  }
+  p.reset()
+  const replacing = watch(h.replaceProgram(a, programs.newer, persistent()))
+  await until(() => actors[0].calls.includes('dispose'))
+  assert.equal(p.handles.length, handles)
+  assert.equal(p.frames.length + p.snapshots.length + p.effects.length, 0)
+  if (stage === 'cleanup') closing = watch(h.dispose())
+  cleanup.resolve()
+  await rejects(replacing, 'ACTOR_NOT_READY')
+  await finish(closing)
+  await finish(h.whenIdle())
+  assert.equal(p.handles.length, handles + (stage === 'boundary' ? 1 : 0))
+  assert.equal(p.frames.length + p.snapshots.length + p.effects.length, 0)
+  assert.equal(h.leases.size, 0)
+  assert.equal(h.registry.size, 0)
+})
+
 test('async preview replacement rollback keeps target reserved through candidate cleanup', async () => {
   const { actors, factory } = delayedActors()
   const h = host(factory), p = probe(), a = await acquire(h, p, programs.basic, options('PREVIEW'))
@@ -3584,6 +3638,540 @@ test('preview replacement rollback propagates candidate disposal rejection and c
   hosts.splice(hosts.indexOf(h), 1)
 })
 
+test('recovery preserves exact initiating owner without waiting for its current mailbox or checkpoints', async () => {
+  const { actors, factory } = delayedActors()
+  const h = host(factory), p = probe(), key = 'recovery-owner/v'
+  const a = await acquire(h, p, programs.basic, persistent(key))
+  const record = actors[0].owner
+  const gate = actors[0].hold('dispatch')
+  accepted(post(h, a, 'add', 2))
+  const queuedSnapshot = watch(h.requestSnapshot(a))
+  record.checkpoints++
+  const scopeGate = deferred(), entered = deferred()
+  const activation = watch(store.trackStateActivation(key, async owner => {
+    actors[0].callbacks.recoveryOwner(owner)
+    assert.equal(record.recoveryOwner, owner)
+    try {
+      return await store.withExclusiveStateRecovery(key, owner, async scope => {
+        entered.resolve()
+        scope.complete()
+        await scopeGate.promise
+      })
+    } finally { actors[0].callbacks.recoveryOwner(null) }
+  }))
+  await finish(entered.promise)
+  assert.equal(record.fenced, false)
+  assert.equal(record.current.kind, 'INPUT')
+  assert.equal(record.mailbox.length, 1)
+  assert.equal(record.checkpoints, 1)
+  assert.equal(queuedSnapshot.done, false)
+  await rejects(h.acquire('', programs.basic, persistent(key), p.subscriber))
+  rejected(post(h, a))
+  await rejects(h.release(a))
+  await rejects(h.checkpointBackground())
+  assert.equal(activation.done, false, 'complete alone must not release admissions before the scope returns')
+  scopeGate.resolve()
+  await finish(activation)
+  assert.equal(record.recoveryOwner, null)
+  record.checkpoints--
+  gate.resolve()
+  await finish(queuedSnapshot)
+  await finish(h.whenIdle())
+  accepted(post(h, a))
+})
+
+test('recovery retires competitors through final save and cleanup without reviving released records', async () => {
+  const { actors, factory } = delayedActors()
+  const other = host(factory), q = probe(), key = 'recovery-retire/v'
+  const b = await acquire(other, q, programs.basic, persistent(key))
+  const h = host(factory), p = probe()
+  const a = await acquire(h, p, programs.basic, persistent(key))
+  const competitor = actors[0], initiator = actors[1]
+  const save = competitor.hold('saveNow'), cleanup = competitor.hold('dispose')
+  const entered = deferred(), scopeGate = deferred()
+  const recovery = watch(store.trackStateActivation(key, async owner => {
+    initiator.callbacks.recoveryOwner(owner)
+    try {
+      await store.withExclusiveStateRecovery(key, owner, async scope => {
+        entered.resolve()
+        await scopeGate.promise
+        scope.complete()
+      })
+    } finally { initiator.callbacks.recoveryOwner(null) }
+  }))
+  await until(() => competitor.calls.includes('saveNow'))
+  assert.equal(competitor.owner.fenced, true)
+  assert.equal(initiator.owner.fenced, false)
+  rejected(post(other, b))
+  await rejects(other.release(b), 'INVALID_HANDLE')
+  assert.equal(competitor.calls.includes('dispose'), false)
+  save.resolve()
+  await until(() => competitor.calls.includes('dispose'))
+  assert.equal(recovery.done, false)
+  cleanup.resolve()
+  await finish(entered.promise)
+  assert.equal(other.records.size, 0)
+  assert.equal(other.registry.size, 0)
+  await rejects(other.acquire('', programs.basic, persistent(key), q.subscriber))
+  scopeGate.resolve()
+  await finish(recovery)
+  assert.equal(competitor.owner.fenced, true)
+  assert.equal(competitor.owner.destroyed, true)
+  rejected(post(other, b))
+  accepted(post(h, a))
+  assert(competitor.calls.indexOf('quiesce') < competitor.calls.indexOf('saveNow'))
+  assert(competitor.calls.indexOf('saveNow') < competitor.calls.indexOf('dispose'))
+})
+
+test('recovery discards queued promotion and replacement targets behind the initiating scheduler turn', async () => {
+  for (const operation of ['promote', 'replace']) {
+    const { actors, factory } = delayedActors()
+    const h = host(factory), p = probe(), key = 'recovery-queued-' + operation + '/v'
+    const a = await acquire(h, p, programs.basic, persistent(key))
+    const b = await acquire(h, p, programs.basic, options('PREVIEW'))
+    const initiator = actors[0], competitor = actors[1], owner = {}
+    initiator.callbacks.recoveryOwner(owner)
+    let pending, barrier
+    await queued(h, a, p, () => {
+      pending = watch(operation === 'promote' ? h.promote(b, 'LIVE_PERSISTENT', key) :
+        h.replaceProgram(b, programs.basic, persistent(key)))
+      assert.equal(competitor.owner.current, null)
+      barrier = h.fenceRecoveryAdmissions(key, owner)
+      assert.equal(competitor.owner.mailbox.length, 0)
+      assert.equal(initiator.owner.fenced, false)
+    })
+    await rejects(pending, 'ACTOR_NOT_READY')
+    const drain = barrier.drainOtherActorsAndStorage()
+    assert.strictEqual(barrier.drainOtherActorsAndStorage(), drain)
+    await finish(drain)
+    barrier.release()
+    assert.equal(competitor.calls.includes('promote'), false)
+    assert.equal(competitor.calls.filter(call => call === 'initialize').length, 1)
+    assert.equal(actors.length, 2, 'discarded replacement must not construct a candidate')
+    assert.equal(competitor.owner.fenced, true)
+    assert.equal(competitor.owner.destroyed, true)
+    rejected(h.requestView(b))
+    initiator.callbacks.recoveryOwner(null)
+  }
+})
+
+test('real actor recovery waits for independent busy ephemeral work and discards its queued promotion', async () => {
+  const { actors, factory } = delayedActors()
+  const h = host(factory), p = probe(), q = probe(), r = probe(), key = 'recovery-independent/v'
+  const b = await acquire(h, q)
+  const c = await acquire(h, r)
+  const competitor = actors[0], gate = competitor.hold('dispatch')
+  accepted(post(h, b, 'add', 2))
+  await until(() => competitor.calls.includes('dispatch'))
+  const promoting = watch(h.promote(b, 'LIVE_PERSISTENT', key))
+  assert.equal(competitor.owner.current.kind, 'INPUT')
+  assert.equal(competitor.owner.mailbox[0].kind, 'PROMOTE')
+  disk.set(stateFile(key), '{broken-main')
+  disk.set(stateFile(key) + '.bak', '{broken-backup')
+  const opening = watch(h.acquire('', programs.basic, persistent(key), p.subscriber))
+  await until(() => competitor.owner.fenced)
+  const initiator = actors[2]
+  assert.notEqual(initiator.owner.recoveryOwner, null)
+  assert.equal(initiator.owner.current.kind, 'INITIALIZE')
+  assert.equal(initiator.owner.fenced, false)
+  assert.equal(competitor.owner.current.kind, 'INPUT')
+  assert.equal(competitor.owner.mailbox.length, 0)
+  await rejects(promoting, 'ACTOR_NOT_READY')
+  await microtasks()
+  assert.equal(opening.done, false)
+  assert.equal(competitor.calls.includes('dispose'), false)
+  assert.equal(records.some(event => event.type === 'task-submit' && event.request.kind === 'recoverLost'), false)
+  assert.throws(() => store.assertStateAdmission(key), /fenced/)
+  accepted(post(h, c, 'add', 7))
+  assert.equal((await snapshot(h, c)).n, 8)
+  assert.equal(opening.done, false, 'independent actors must progress while recovery waits for the competitor')
+  gate.resolve()
+  const a = await finish(opening)
+  await finish(h.whenIdle())
+  assert.equal(initiator.owner.recoveryOwner, null)
+  assert.equal(initiator.owner.fenced, false)
+  assert.equal(competitor.owner.fenced, true)
+  assert.equal(competitor.owner.destroyed, true)
+  assert.equal(competitor.calls.includes('promote'), false)
+  assert.equal(competitor.calls.includes('saveNow'), false)
+  assert.equal(competitor.calls.filter(call => call === 'dispose').length, 1)
+  assert.equal(q.frames.length, 1, 'fenced current work must not publish its late frame')
+  assert.equal((await snapshot(h, a)).n, 1)
+  assert.equal(p.errors.filter(error => error.kind === 'state' && error.message === 'STATE_RECOVERY').length, 1)
+  assert.equal(count('quarantine'), 2)
+  assert.doesNotThrow(() => store.assertStateAdmission(key))
+  rejected(post(h, b))
+  accepted(post(h, a, 'add', 4))
+  assert.equal((await snapshot(h, a)).n, 5)
+})
+
+for (const seed of ['', encoded(7)]) {
+  test('real actor recovery owns its activation through committed init and scope release; seed=' + Boolean(seed), async () => {
+    const h = host(), p = probe(), key = 'recovery-scope-' + Boolean(seed) + '/v'
+    assert.equal(store.constructor.name, 'ProjectStore')
+    disk.set(stateFile(key), '{broken-main')
+    disk.set(stateFile(key) + '.bak', '{broken-backup')
+    const observations = []
+    let initiatingRecord, ownerToken, released = false
+    const unregister = store.registerStateLifecycle({
+      fenceAllAdmissions() { throw Error('recovery must not use removal fencing') },
+      fenceRecoveryAdmissions(appId, owner) {
+        assert.equal(appId, key)
+        initiatingRecord = [...h.records].find(record => record.recoveryOwner === owner)
+        assert(initiatingRecord, 'real AppActor must install the exact store activation token before recovery')
+        assert.equal(initiatingRecord.actor.constructor.name, 'AppActor')
+        assert.equal(initiatingRecord.current.kind, 'INITIALIZE')
+        assert.equal(initiatingRecord.fenced, false)
+        ownerToken = owner
+        observations.push('fence')
+        return {
+          async drainOtherActorsAndStorage() {
+            assert.equal(initiatingRecord.recoveryOwner, owner)
+            assert.throws(() => store.assertStateAdmission(key), /fenced/)
+            observations.push('drain')
+          },
+          release() {
+            assert.equal(initiatingRecord.recoveryOwner, owner)
+            assert.equal(initiatingRecord.actor.ready(), true)
+            const committed = validateStateFile(disk.get(stateFile(key)), key, 1)
+            assert.equal(stateOf(committed.encodedState).n, seed ? 7 : 1)
+            assert.equal(committed.revision, 1)
+            assert.equal(p.errors.filter(error => error.message === 'STATE_RECOVERY').length, 1)
+            assert.throws(() => store.assertStateAdmission(key), /fenced/)
+            released = true
+            observations.push('release')
+          }
+        }
+      }
+    })
+    p.frameHook = () => {
+      assert.equal(released, false)
+      assert.equal(initiatingRecord.recoveryOwner, ownerToken)
+      assert.throws(() => store.assertStateAdmission(key), /fenced/)
+      observations.push('frame')
+    }
+    p.errorHook = error => {
+      if (error.kind !== 'state' || error.message !== 'STATE_RECOVERY') return
+      assert.equal(released, false)
+      assert.throws(() => store.assertStateAdmission(key), /fenced/)
+      observations.push('recovery')
+    }
+    try {
+      const a = await acquire(h, p, programs.basic, persistent(key, seed))
+      p.frameHook = null
+      assert.deepEqual(observations, ['fence', 'drain', 'frame', 'recovery', 'release'])
+      assert.equal(initiatingRecord.recoveryOwner, null)
+      assert.equal(initiatingRecord.fenced, false)
+      assert.doesNotThrow(() => store.assertStateAdmission(key))
+      assert.deepEqual(records.filter(event => event.type === 'task-submit').map(event => event.request.kind),
+        ['load', 'recoverLost', 'commit'])
+      assert.deepEqual(records.filter(event => event.type === 'quarantine').map(event => [event.file, disk.get(event.to)]),
+        [[stateFile(key), '{broken-main'], [stateFile(key) + '.bak', '{broken-backup']])
+      assert.equal((await snapshot(h, a)).n, seed ? 7 : 1)
+      accepted(post(h, a, 'add', 3))
+      assert.equal((await snapshot(h, a)).n, seed ? 10 : 4)
+    } finally { unregister() }
+  })
+}
+
+for (const mode of ['PREVIEW', 'LIVE_EPHEMERAL']) {
+  test('real actor replacement recovery signals before fence release and buffered publications; source=' + mode, async () => {
+    const h = host(), p = probe(), key = 'replacement-recovery/v'
+    const old = await acquire(h, p, programs.basic, options(mode))
+    const record = h.registry.get(old.appId), oldActor = record.actor
+    disk.set(stateFile(key), '{broken-main')
+    disk.set(stateFile(key) + '.bak', '{broken-backup')
+    p.reset()
+    const observations = []
+    const unregister = store.registerStateLifecycle({
+      fenceAllAdmissions() { throw Error('unexpected removal fence') },
+      fenceRecoveryAdmissions(appId, owner) {
+        assert.equal(appId, key)
+        assert.equal(record.recoveryOwner, owner)
+        assert.equal(record.current.kind, 'REPLACE')
+        assert.equal(record.fenced, false)
+        observations.push('fence')
+        return {
+          async drainOtherActorsAndStorage() { observations.push('drain') },
+          release() {
+            assert.throws(() => store.assertStateAdmission(key), /fenced/)
+            assert.equal(p.errors.length, 1)
+            assert.equal(p.frames.length + p.snapshots.length + p.effects.length + p.saved.length, 0)
+            observations.push('release')
+          }
+        }
+      }
+    })
+    p.errorHook = error => {
+      assert.deepEqual(error, { kind: 'state', message: 'STATE_RECOVERY', inputSeq: undefined })
+      assert.throws(() => store.assertStateAdmission(key), /fenced/)
+      assert.equal(record.transitioning, true)
+      assert.notEqual(record.recoveryOwner, null)
+      assert.notEqual(record.actor, oldActor)
+      assert.equal(record.actor.constructor.name, 'AppActor')
+      assert.equal(record.actor.ready(), true)
+      assert.equal(record.leases.get(old.leaseId).handle, old)
+      assert(record.deliveries.length >= 4)
+      assert.equal(p.frames.length + p.snapshots.length + p.effects.length + p.saved.length, 0)
+      observations.push('recovery')
+    }
+    const onError = p.subscriber.onError
+    p.subscriber.onError = (...args) => { onError(...args); throw Error('fixture recovery subscriber failure') }
+    p.frameHook = () => {
+      assert.doesNotThrow(() => store.assertStateAdmission(key))
+      assert.equal(record.deliveries, null)
+      assert.notEqual(record.leases.get(old.leaseId).handle, old)
+      observations.push('frame')
+    }
+    try {
+      const a = await finish(h.replaceProgram(old, programs.initEffect, persistent(key)))
+      await finish(h.whenIdle())
+      assert.deepEqual(observations, ['fence', 'drain', 'recovery', 'release', 'frame'])
+      assert.deepEqual(sequence(), ['save', 'error', 'snapshot', 'effect', 'saved', 'frame'])
+      assert.equal(p.errors.length, 1)
+      assert.equal(p.effects.length, 1)
+      assert.equal(p.frames.length, 1)
+      assert.equal(p.snapshots.length, 1)
+      assert.equal(count('quarantine'), 2)
+      assert.equal(record.recoveryOwner, null)
+      assert.equal(oldActor.ready(), false)
+      assert.equal((await snapshot(h, a)).n, 1)
+      assert.doesNotThrow(() => store.assertStateAdmission(key))
+      rejected(post(h, old))
+      accepted(post(h, a, 'add', 3))
+      assert.equal((await snapshot(h, a)).n, 4)
+    } finally { unregister() }
+  })
+
+  test('real actor replacement recovery subscriber disposal rejects and retains fence without buffered publications; source=' + mode, async () => {
+    const h = host(), p = probe(), key = 'replacement-cancel/v'
+    const old = await acquire(h, p, programs.basic, options(mode))
+    const record = h.registry.get(old.appId), oldActor = record.actor
+    disk.set(stateFile(key), '{broken-main')
+    disk.set(stateFile(key) + '.bak', '{broken-backup')
+    p.reset()
+    let closing
+    p.errorHook = error => {
+      assert.deepEqual(error, { kind: 'state', message: 'STATE_RECOVERY', inputSeq: undefined })
+      assert.throws(() => store.assertStateAdmission(key), /fenced/)
+      assert.equal(record.current.kind, 'REPLACE')
+      assert.equal(record.transitioning, true)
+      assert.notEqual(record.recoveryOwner, null)
+      assert.equal(record.actor.constructor.name, 'AppActor')
+      assert.equal(record.actor.ready(), true)
+      assert(record.deliveries.length >= 4)
+      assert.equal(p.frames.length + p.snapshots.length + p.effects.length + p.saved.length, 0)
+      closing = watch(h.dispose())
+    }
+    const error = await rejects(h.replaceProgram(old, programs.initEffect, persistent(key)), 'STATE_COMMIT_UNCERTAIN')
+    assert.equal(error.handleInvalidated, true)
+    assert(closing, 'recovery must synchronously invoke the subscriber')
+    await finish(closing)
+    await finish(h.whenIdle())
+    assert.deepEqual(sequence(), ['save', 'error'])
+    assert.equal(p.errors.length, 1)
+    assert.equal(p.frames.length + p.snapshots.length + p.effects.length + p.saved.length, 0)
+    assert.equal(count('save'), 1)
+    assert.equal(count('quarantine'), 2)
+    assert.equal(record.actor.ready(), false)
+    assert.equal(record.destroyed, true)
+    assert.equal(oldActor.ready(), false)
+    assert.equal(h.records.size + h.registry.size + h.leases.size, 0)
+    assert.throws(() => store.assertStateAdmission(key), /fenced/)
+    assert.equal(validateStateFile(disk.get(stateFile(key)), key, 1).revision, 1)
+    rejected(post(h, old))
+    await rejects(h.acquire('', programs.basic, persistent(key), p.subscriber), 'ACTOR_NOT_READY')
+  })
+}
+
+test('only exact normalized recovery signal bypasses replacement buffering with delivery ownership and deduplication', async () => {
+  const { actors, factory } = delayedActors()
+  const h = host(factory), p = probe(), old = await acquire(h, p, programs.basic, options('PREVIEW'))
+  p.reset()
+  let startup
+  actors.configure = actor => { startup = actor.hold('initialize') }
+  const replacing = watch(h.replaceProgram(old, programs.basic, options()))
+  await until(() => startup !== undefined)
+  const candidate = actors[1], record = candidate.owner
+  const ordinary = [
+    ['state', 'STATE_RECOVERY_FAILED'], ['recovery', 'STATE_RECOVERY'],
+    ['state', 'STATE_RECOVERY extra'], ['state ', 'STATE_RECOVERY']
+  ]
+  for (const [kind, message] of ordinary) candidate.callbacks.error(kind, message)
+  assert.equal(p.errors.length, 0)
+  assert.equal(record.deliveries.length, ordinary.length)
+  actors[0].callbacks.error('state', 'STATE_RECOVERY')
+  assert.equal(p.errors.length, 0)
+  const inputSeq = record.current.inputSeq
+  record.current.inputSeq = 123
+  candidate.callbacks.error('STATE', 'STATE_RECOVERY')
+  candidate.callbacks.error('state', 'STATE_RECOVERY')
+  assert.deepEqual(p.errors, [{ kind: 'state', message: 'STATE_RECOVERY', inputSeq: undefined }])
+  assert.equal(record.deliveries.length, ordinary.length)
+  assert.equal(record.turnFailed, false)
+  record.current.inputSeq = inputSeq
+  startup.resolve()
+  const a = await finish(replacing)
+  await finish(h.whenIdle())
+  assert.deepEqual(p.errors.map(error => [error.kind, error.message]), [['state', 'STATE_RECOVERY'], ...ordinary])
+  assert.deepEqual(sequence(), ['error', 'error', 'error', 'error', 'error', 'snapshot', 'frame'])
+  p.reset()
+  record.fenced = true
+  candidate.callbacks.error('state', 'STATE_RECOVERY')
+  assert.equal(p.errors.length, 0)
+  record.fenced = false
+  record.reportedErrors.clear()
+  const lease = record.leases.get(a.leaseId)
+  record.current = { lease }
+  lease.state = 'RELEASED'
+  candidate.callbacks.error('state', 'STATE_RECOVERY')
+  assert.equal(p.errors.length, 0)
+  lease.state = 'ACTIVE'
+  record.current = null
+  record.reportedErrors.clear()
+  record.subscriber = null
+  candidate.callbacks.error('state', 'STATE_RECOVERY')
+  assert.equal(p.errors.length, 0)
+  record.subscriber = p.subscriber
+  await finish(h.dispose())
+  candidate.callbacks.error('state', 'STATE_RECOVERY')
+  assert.equal(p.errors.length, 0)
+  rejected(post(h, a))
+})
+
+test('real actor recovery failure clears ownership but keeps admissions and competitors fenced', async () => {
+  const { actors, factory } = delayedActors()
+  const h = host(factory), p = probe(), q = probe(), key = 'recovery-real-failure/v'
+  const b = await acquire(h, q)
+  const competitor = actors[0], gate = competitor.hold('dispatch')
+  accepted(post(h, b, 'add', 2))
+  await until(() => competitor.calls.includes('dispatch'))
+  const promoting = watch(h.promote(b, 'LIVE_PERSISTENT', key))
+  disk.set(stateFile(key), '{broken')
+  const opening = watch(h.acquire('', programs.initTrap, persistent(key), p.subscriber))
+  await until(() => competitor.owner.fenced)
+  const initiator = actors[1]
+  assert.notEqual(initiator.owner.recoveryOwner, null)
+  await rejects(promoting, 'ACTOR_NOT_READY')
+  gate.resolve()
+  await rejects(opening, 'ACTOR_NOT_READY')
+  await finish(h.whenIdle())
+  assert.equal(initiator.owner.recoveryOwner, null)
+  assert.equal(initiator.owner.destroyed, true)
+  assert.equal(competitor.owner.fenced, true)
+  assert.equal(competitor.owner.destroyed, true)
+  assert.throws(() => store.assertStateAdmission(key), /fenced/)
+  await rejects(h.acquire('', programs.basic, persistent(key), p.subscriber))
+  rejected(post(h, b))
+  assert.equal(p.frames.length + p.snapshots.length + p.effects.length, 0)
+  assert.equal(p.errors.filter(error => error.message === 'STATE_RECOVERY').length, 0)
+  assert.equal(count('save'), 0)
+  assert.equal(count('quarantine'), 1)
+})
+
+test('recovery waits for a current promotion and retires its fenced runtime after failure', async () => {
+  const { actors, factory } = delayedActors()
+  const h = host(factory), p = probe(), key = 'recovery-dependent/v'
+  const a = await acquire(h, p, programs.basic, persistent(key))
+  const b = await acquire(h, p, programs.basic, options('PREVIEW'))
+  const initiator = actors[0], competitor = actors[1], owner = {}
+  initiator.callbacks.recoveryOwner(owner)
+  const gate = competitor.hold('promote')
+  const promoting = watch(h.promote(b, 'LIVE_PERSISTENT', 'recovery-alias/v'))
+  await until(() => competitor.calls.includes('promote'))
+  assert.equal(h.registry.get(b.appId), competitor.owner)
+  assert.equal(h.registry.get('recovery-alias/v'), competitor.owner)
+  let barrier
+  await queued(h, a, p, () => {
+    barrier = h.fenceRecoveryAdmissions('recovery-alias/v', owner)
+  })
+  const drain = watch(barrier.drainOtherActorsAndStorage())
+  await microtasks()
+  assert.equal(drain.done, false)
+  assert.equal(promoting.done, false)
+  assert.equal(competitor.owner.fenced, true)
+  assert.equal(initiator.owner.fenced, false)
+  rejected(h.requestView(b))
+  gate.reject(Error('independent promotion failed'))
+  await rejects(promoting)
+  await finish(drain)
+  barrier.release()
+  await finish(h.whenIdle())
+  assert.equal(competitor.owner.fenced, true)
+  assert.equal(competitor.owner.destroyed, true)
+  assert.equal(competitor.calls.filter(call => call === 'promote').length, 1, 'fenced competitors must not restore their old runtime')
+  initiator.callbacks.recoveryOwner(null)
+})
+
+test('recovery final save failure destroys competitors and release never restores their handles', async () => {
+  const { actors, factory } = delayedActors()
+  const h = host(factory), p = probe(), key = 'recovery-failure/v'
+  const a = await acquire(h, p, programs.basic, persistent(key))
+  const competitor = actors[0], owner = {}, reason = Error('recovery final save refused')
+  competitor.callbacks.recoveryOwner({})
+  const save = competitor.hold('saveNow')
+  const barrier = h.fenceRecoveryAdmissions(key, owner)
+  const drain = watch(barrier.drainOtherActorsAndStorage())
+  await until(() => competitor.calls.includes('saveNow'))
+  save.reject(reason)
+  assert.equal(await rejects(drain), reason)
+  assert.equal(competitor.owner.destroyed, true)
+  assert.equal(competitor.calls.filter(call => call === 'dispose').length, 1)
+  barrier.release()
+  assert.equal(competitor.owner.fenced, true)
+  rejected(post(h, a))
+  await rejects(h.requestSnapshot(a), 'INVALID_HANDLE')
+})
+
+test('recovery waits for competing checkpoints and suppresses fenced deliveries until retirement', async () => {
+  const { actors, factory } = delayedActors()
+  const h = host(factory), p = probe(), key = 'recovery-checkpoint/v'
+  const a = await acquire(h, p, programs.basic, persistent(key))
+  const competitor = actors[0], record = competitor.owner
+  record.checkpoints++
+  p.reset()
+  const barrier = h.fenceRecoveryAdmissions(key, {})
+  const drain = watch(barrier.drainOtherActorsAndStorage())
+  await microtasks()
+  assert.equal(drain.done, false)
+  competitor.callbacks.snapshot(encoded(), { mode: 'LIVE_PERSISTENT', vmGeneration: a.vmGeneration,
+    stateRevision: record.stateRevision })
+  competitor.callbacks.error('state', 'late checkpoint')
+  assert.equal(p.snapshots.length + p.errors.length, 0)
+  assert.equal(record.destroyed, false)
+  rejected(post(h, a))
+  record.checkpoints--
+  h.settleRecord(record)
+  await finish(drain)
+  barrier.release()
+  await finish(h.whenIdle())
+  assert.equal(record.fenced, true)
+  assert.equal(competitor.calls.filter(call => call === 'saveNow').length, 1)
+  assert.equal(competitor.calls.filter(call => call === 'dispose').length, 1)
+})
+
+test('recovery owner callbacks from replaced actors cannot overwrite the current incarnation token', async () => {
+  const { actors, factory } = delayedActors()
+  const h = host(factory), p = probe(), a = await acquire(h, p, programs.basic, options('PREVIEW'))
+  const b = await finish(h.replaceProgram(a, programs.newer, options('PREVIEW')))
+  const record = actors[1].owner, owner = {}
+  actors[1].callbacks.recoveryOwner(owner)
+  actors[0].callbacks.recoveryOwner(null)
+  assert.equal(record.recoveryOwner, owner)
+  actors[0].callbacks.recoveryOwner({})
+  assert.equal(record.recoveryOwner, owner)
+  const barrier = h.fenceRecoveryAdmissions(b.appId, owner)
+  await finish(barrier.drainOtherActorsAndStorage())
+  barrier.release()
+  assert.equal(record.fenced, false)
+  actors[1].callbacks.recoveryOwner(null)
+  assert.equal(record.recoveryOwner, null)
+})
+
+const selectedNames = process.argv.slice(2)
+const selectedTests = selectedNames.length === 0 ? tests : tests.filter(({ name }) => selectedNames.includes(name))
+for (const name of selectedNames) assert(tests.some(test => test.name === name), 'Unknown test: ' + name)
+
 const originals = {
   now: Date.now, random: Math.random, setTimeout: global.setTimeout, clearTimeout: global.clearTimeout,
   setInterval: global.setInterval, clearInterval: global.clearInterval,
@@ -3604,8 +4192,11 @@ async function main() {
     global.setInterval = () => { throw Error('unexpected actor-owned interval') }
     global.clearInterval = () => { throw Error('unexpected actor-owned interval cleanup') }
     for (const level of ['info', 'warn', 'error']) console[level] = (...args) => records.push({ type: 'log-' + level, message: args.join(' ') })
-    for (const { name, run } of tests) {
+    for (const { name, run } of selectedTests) {
       disk.clear()
+      store = new storeModule.ProjectStore()
+      storeModule.store = store
+      store.init('/host-fixture')
       committedStates.clear()
       records = []
       failure = ''
@@ -3641,7 +4232,7 @@ async function main() {
     global.clearInterval = originals.clearInterval
     Object.assign(console, originals.console)
   }
-  console.log(`in-process-host-check: ${passed}/${tests.length} deterministic actual-source scenarios passed`)
+  console.log(`in-process-host-check: ${passed}/${selectedTests.length} deterministic actual-source scenarios passed`)
   console.log('Scope: public InProcessHost API, real AppActor/compiler/VM/UI/Gfx/carry/ProjectStore; in-memory IO and fake clock/timers; no device, private corpus, model or service calls.')
 }
 main().catch(error => {

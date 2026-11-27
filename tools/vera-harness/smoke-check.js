@@ -1192,7 +1192,7 @@ function indirect(state: AppState): AppState { return mutate(state); }
   const ts = require(process.env.VERA_TYPESCRIPT_PATH || loaderRequire.resolve('typescript'))
   const file = path.resolve(__dirname, '../../entry/src/main/ets/vera/VeraInterpreter.ets')
   assert.equal(path.join(require('./source-loader').sourceRoot, 'vera/VeraInterpreter.ets'), file)
-  const source = fs.readFileSync(file, 'utf8')
+  const source = fs.readFileSync(file, 'utf8').replace(/\r\n/g, '\n')
   const protectedClasses = new Set(['RuntimeValue', 'VeraNumberValue', 'VeraStringValue', 'VeraBooleanValue',
     'VeraNullValue', 'VeraArrayValue', 'VeraObjectValue', 'Cell', 'FunctionValue', 'ExternalFunctionValue', 'Frame'])
   const mutationOpcodes = new Set(['array-push', 'array-pop', 'store-index', 'store-field', 'store-local', 'store-capture'])
@@ -1228,7 +1228,7 @@ function indirect(state: AppState): AppState { return mutate(state); }
   const bodyHash = text => require('node:crypto').createHash('sha256').update(text).digest('hex')
   const inventory = text => {
     assert.ok(text.length <= 256 * 1024, 'mutation inventory: source size bound')
-    const filename = file + '.ts'
+    const filename = file.replace(/\\/g, '/').replace(/\.ets$/, '.ts')
     const options = {target: ts.ScriptTarget.ES2020, strict: true, noEmit: true, types: [], noResolve: true}
     const parsed = ts.createSourceFile(filename, text, options.target, true, ts.ScriptKind.TS)
     assert.equal(parsed.parseDiagnostics.length, 0, 'mutation inventory: parse diagnostics')
@@ -1238,6 +1238,8 @@ function indirect(state: AppState): AppState { return mutate(state); }
       ts.isExportDeclaration(node) || ts.isModuleDeclaration(node)), 'mutation inventory: module surface changed')
     const host = ts.createCompilerHost(options)
     const original = host.getSourceFile.bind(host)
+    const originalFileExists = host.fileExists.bind(host)
+    host.fileExists = name => name === filename || originalFileExists(name)
     host.getSourceFile = (name, languageVersion, onError, shouldCreateNewSourceFile) => name === filename ?
       parsed :
       original(name, languageVersion, onError, shouldCreateNewSourceFile)

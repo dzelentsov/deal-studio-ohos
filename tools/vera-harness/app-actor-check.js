@@ -16,6 +16,7 @@ const worker = require('./state-io-check').createWorkerFixture('/actor-fixture/v
   if (event.op === 'stat' && event.path.endsWith('.state.json')) records.push({ type: 'load-attempt', file: event.path })
   if (event.op === 'read' && event.path.endsWith('.state.json')) records.push({ type: 'load', file: event.path })
   if (event.op === 'rename' && event.to.endsWith('.state.json')) records.push({ type: 'save-attempt', file: event.to })
+  if (event.op === 'rename' && event.to.endsWith('.quarantine')) records.push({ type: 'quarantine', file: event.path, to: event.to })
 }, () => failure)
 const disk = worker.disk
 const filesystem = new Proxy(worker.filesystem, { get(target, key) {
@@ -121,7 +122,7 @@ store.init('/actor-fixture')
 const target = 'com.example.actor/entry/EntryAbility/Record'
 const effect = label => `sdk.call("${target}", ["label", "${label}", "value", ui.numberToString(state.n)], "answered");`
 const trap = 'let empty: number[] = []; state.n = empty[2];'
-function fixture({ initial = 1, refresh = '', init = '', view = '', extraFields = '', extraInit = '' } = {}) {
+function fixture({ initial = 1, refresh = '', init = '', initResult = '', view = '', extraFields = '', extraInit = '' } = {}) {
   return `
 @jsonable class AppState {
   n: number;
@@ -133,7 +134,7 @@ function fixture({ initial = 1, refresh = '', init = '', view = '', extraFields 
 }
 function init(): AppState {
   ${init}
-  return {n: ${initial}, calls: 0, refreshes: 0, marks: [], badView: false${extraInit}};
+  return ${initResult || `{n: ${initial}, calls: 0, refreshes: 0, marks: [], badView: false${extraInit}}`};
 }
 function change(state: AppState, value: number): AppState {
   state.n = state.n + value;
@@ -283,7 +284,7 @@ function saveExternal(program, encoded, key = 'project/version') {
   disk.set(stateFile(key), format2.assembleStateFile({ appId: key, schemaVersion: 1,
     vmGeneration: prior?.vmGeneration || 1, revision: (prior?.revision || 0) + 1, stamp: program.stamp }, encoded))
 }
-function probe() {
+function probe({ onError, diagnostics = false } = {}) {
   const events = []
   records = events
   const snapshots = [], frames = [], effects = []
@@ -320,9 +321,13 @@ function probe() {
         events.push(request)
       }
     },
-    error(kind, message) { error(kind, message, kind !== 'INIT') }
+    error(kind, message) {
+      error(kind, message, kind !== 'INIT' && !(kind === 'state' && message === 'STATE_RECOVERY'))
+      if (onError) onError(kind, message, actor)
+    }
   }, events)
   StageTrace.configure(true, record => {
+    if (diagnostics) events.push({ type: 'diagnostic', event: record.event, attributes: record.attributes })
     if (record.event === 'EXECUTE') events.push({ type: 'execute', entry: record.attributes.entry })
     if (record.event === 'RESUME_STATE_RELOAD') events.push({ type: 'reload', changed: record.attributes.changed })
   })
@@ -453,21 +458,50 @@ test('saved persistent state beats seed and init; mismatched stamp uses seed', a
   assert.equal((await p.state()).added, 42)
 })
 
-test('malformed disk and seed reject activation; carry view validation fails without a second init', async () => {
+test('malformed disk recovers through init; malformed seed rejects and carry view validation fails without a second init', async () => {
+  let scenario = 0
   for (const stored of ['{broken', JSON.stringify({ stamp: programs.basic.stamp, value: ['unknown'] })]) {
-    disk.set(stateFile(), stored)
     for (const seed of ['', '{broken', JSON.stringify(['unknown'])]) {
+      disk.clear()
+      const key = seed ? 'malformed-recovery-' + ++scenario + '/version' : 'project/version'
+      const file = stateFile(key)
+      disk.set(file, stored)
       const p = probe()
-      await assert.rejects(p.actor.initialize(programs.basic, options('LIVE_PERSISTENT', 'project/version', seed)), /STATE_LOST/)
-      assert.equal(p.actor.ready(), false)
-      assert.equal(entries(p).filter(e => e === 'init').length, 0)
-      assert.equal(p.snapshots.length + p.frames.length + p.effects.length, 0)
-      assert.equal(count(p, 'save'), 0)
-      assert.equal(disk.get(stateFile()), stored)
+      if (seed) {
+        await assert.rejects(p.actor.initialize(programs.basic, options('LIVE_PERSISTENT', key, seed)), error => error.code === 'STATE_VALIDATION_FAILED')
+        assert.equal(p.actor.ready(), false)
+        assert.equal(await p.actor.snapshot(), '')
+        assert.equal(entries(p).filter(e => e === 'init').length, 0)
+        assert.equal(p.snapshots.length + p.frames.length + p.effects.length + count(p, 'saved'), 0)
+        assert.equal(count(p, 'save') + count(p, 'publication'), 0)
+        assert.equal(disk.has(file), false)
+        assert.equal(disk.has(file + '.bak'), false)
+        assert.equal(count(p, 'ui-error'), 1)
+        assert.equal(p.events.find(e => e.type === 'ui-error').kind, 'carry')
+        assert(!p.events.some(e => e.message === 'STATE_RECOVERY'))
+        assert.throws(() => store.assertStateAdmission(key), /admission fenced/)
+      } else {
+        await p.actor.initialize(programs.basic, options('LIVE_PERSISTENT', key))
+        assert(p.actor.ready())
+        assert.deepEqual(entries(p), ['init', 'view'])
+        assert.equal(await p.actor.snapshot(), fresh)
+        assert.equal(count(p, 'save'), 1)
+        assert.equal(count(p, 'snapshot'), 1)
+        assert.equal(p.frames[0].root.text, 'n=1')
+        assert.deepEqual(p.events.filter(e => e.type === 'ui-error'), [{ type: 'ui-error', kind: 'state', message: 'STATE_RECOVERY' }])
+        assert.equal(count(p, 'stop'), 0)
+        assert.doesNotThrow(() => store.assertStateAdmission(key))
+      }
+      const quarantines = p.events.filter(e => e.type === 'quarantine')
+      assert.equal(quarantines.length, 1)
+      assert.equal(quarantines[0].file, file)
+      assert.equal(disk.get(quarantines[0].to), stored)
+      assert.deepEqual(p.events.filter(e => e.type === 'task-submit').map(e => e.request.kind), seed ? ['load', 'recoverLost'] : ['load', 'recoverLost', 'commit'])
       assert.equal(count(p, 'task-submit'), count(p, 'task-result'))
+      await p.actor.dispose()
     }
   }
-  disk.delete(stateFile())
+  disk.clear()
   const p = probe()
   await assert.rejects(p.actor.initialize(programs.basic, options('LIVE_PERSISTENT', 'project/version', '{broken')))
   assert.equal(p.actor.ready(), false)
@@ -1407,6 +1441,463 @@ test('actors own independent real VM/state/host; dispose is idempotent and all e
   assert.deepEqual(p.events, [])
   assert.equal((await q.state()).n, 9)
   await q.actor.dispose()
+})
+
+test('initial corrupt main and backup commit the actual init once before effects and recovery notification', async () => {
+  const program = compile(fixture({ initial: '6 * 7', init: `sdk.call("${target}", ["label", "init"], "answered");` }))
+  const file = stateFile()
+  disk.set(file, '{broken-main')
+  disk.set(file + '.bak', '{broken-backup')
+  const p = probe()
+  await p.actor.initialize(program, options())
+  assert(p.actor.ready())
+  assert.deepEqual(await p.state(), { n: 42, calls: 0, refreshes: 0, marks: [], badView: false })
+  assert.deepEqual(sequence(p), ['init', 'save', 'snapshot', 'effect:init', 'saved', 'view', 'frame', 'ui-error:state'])
+  assert.equal(count(p, 'publication'), 0)
+  assert.equal(p.snapshots.length, 1)
+  assert.equal(p.frames[0].root.text, 'n=42')
+  assert.equal(p.effects.length, 1)
+  assert.equal(p.effects[0].target, target)
+  assert.equal(p.effects[0].handler, 'answered')
+  assert.equal(count(p, 'stop'), 0)
+  const saved = format2.validateStateFile(disk.get(file), 'project/version')
+  assert.equal(saved.stamp, program.stamp)
+  assert.equal(saved.revision, 1)
+  assert.equal(saved.encodedState, await p.actor.snapshot())
+  assert.deepEqual(p.events.filter(e => e.type === 'quarantine').map(e => [e.file, disk.get(e.to)]), [[file, '{broken-main'], [file + '.bak', '{broken-backup']])
+  assert.deepEqual(p.events.filter(e => e.type === 'task-submit').map(e => e.request.kind), ['load', 'recoverLost', 'commit'])
+  assert.equal(count(p, 'task-submit'), count(p, 'task-result'))
+  assert.doesNotThrow(() => store.assertStateAdmission('project/version'))
+  p.reset()
+  await p.actor.dispatch('change', number(1))
+  assert.equal((await p.state()).n, 43)
+  assert.equal(count(p, 'ui-error'), 0)
+  assert.deepEqual(entries(p), ['change', 'view'])
+  await p.actor.dispose()
+})
+
+async function withoutVmJournal(run) {
+  const file = store.stateRoot() + '/runtime-flags.json'
+  const previous = disk.get(file)
+  disk.set(file, JSON.stringify({ vmJournal: 'off', journalMode: 'JOURNAL' }))
+  try {
+    assert.deepEqual(store.runtimeFlags(), { vmJournal: false, journalMode: 'JOURNAL' })
+    await run()
+  } finally {
+    if (previous === undefined) disk.delete(file)
+    else disk.set(file, previous)
+    assert.equal(store.runtimeFlags().vmJournal, previous === undefined ? true : JSON.parse(previous).vmJournal === 'on')
+  }
+}
+const mutatedRecoveryInit = `
+  let state: AppState = {n: 6, calls: 0, refreshes: 0, marks: [], badView: false};
+  state.n = state.n * 7;
+  state.calls = state.calls + 1;
+  state.marks.push(state.n);
+  ${effect('init')}
+`
+
+test('vmJournal:false LOST recovery commits the actual mutated init once before any publication or success notification', async () => {
+  await withoutVmJournal(async () => {
+    const key = 'no-journal-recovery-success/version'
+    const file = stateFile(key)
+    const program = compile(fixture({ init: mutatedRecoveryInit, initResult: 'state' }))
+    disk.set(file, '{broken-main')
+    disk.set(file + '.bak', '{broken-backup')
+    const p = probe({ diagnostics: true })
+    worker.taskpool.plans.push({}, {}, { hold: true })
+    const initializing = p.actor.initialize(program, options('LIVE_PERSISTENT', key))
+    try {
+      await turnMicrotasks()
+      const held = worker.taskpool.executions.find(entry => !entry.finished && entry.args[2].kind === 'commit')
+      assert(held, 'actual init waits for its real TaskPool commit')
+      assert.deepEqual(entries(p), ['init'])
+      assert.equal(p.events.filter(e => e.type === 'diagnostic' && e.event === 'VM_EXECUTE' && e.attributes.entryCategory === 'INIT').length, 1)
+      assert.equal(p.snapshots.length + p.frames.length + p.effects.length + count(p, 'save') + count(p, 'saved') + count(p, 'publication'), 0)
+      assert(!p.events.some(e => e.message === 'STATE_RECOVERY'))
+      assert.equal(disk.has(file), false)
+      assert.throws(() => store.assertStateAdmission(key), /admission fenced/)
+      worker.taskpool.finish(held)
+      await initializing
+      assert(p.actor.ready())
+      const expected = { n: 42, calls: 1, refreshes: 0, marks: [42], badView: false }
+      assert.deepEqual(await p.state(), expected)
+      assert.deepEqual(sequence(p), ['init', 'save', 'snapshot', 'effect:init', 'saved', 'view', 'frame', 'ui-error:state'])
+      assert.equal(p.snapshots.length, 1)
+      assert.deepEqual(stateOf(p.snapshots[0]), expected)
+      assert.equal(p.frames[0].root.text, 'n=42')
+      assert.equal(p.effects.length, 1)
+      assert.deepEqual(p.effects[0].params, [['label', 'init'], ['value', '42']])
+      assert.equal(p.effects[0].target, target)
+      assert.equal(p.effects[0].handler, 'answered')
+      assert.deepEqual(p.events.filter(e => e.type === 'ui-error'), [{ type: 'ui-error', kind: 'state', message: 'STATE_RECOVERY' }])
+      assert.equal(count(p, 'stop') + count(p, 'publication'), 0)
+      const saved = format2.validateStateFile(disk.get(file), key)
+      assert.equal(saved.stamp, program.stamp)
+      assert.equal(saved.revision, 1)
+      assert.equal(saved.encodedState, await p.actor.snapshot())
+      assert.deepEqual(p.events.filter(e => e.type === 'quarantine').map(e => [e.file, disk.get(e.to)]), [[file, '{broken-main'], [file + '.bak', '{broken-backup']])
+      assert.deepEqual(p.events.filter(e => e.type === 'task-result' && e.reply.load).map(e => e.reply.load.kind), ['LOST', 'ABSENT'])
+      assert.deepEqual(p.events.filter(e => e.type === 'task-submit').map(e => e.request.kind), ['load', 'recoverLost', 'commit'])
+      assert.equal(count(p, 'task-submit'), count(p, 'task-result'))
+      assert(p.events.some(e => e.type === 'diagnostic' && e.event === 'VM_SAFETY_SWITCH' && e.attributes.safety === false))
+      assert.equal(p.events.filter(e => e.type === 'diagnostic' && e.event === 'VM_EXECUTE' && e.attributes.entryCategory === 'INIT').length, 1)
+      assert(!p.events.some(e => e.type === 'diagnostic' && e.event === 'VM_JOURNAL'))
+      assert.doesNotThrow(() => store.assertStateAdmission(key))
+    } finally {
+      for (const held of worker.taskpool.executions.filter(entry => !entry.finished)) worker.taskpool.finish(held)
+      await initializing.catch(() => {})
+      await p.actor.dispose()
+    }
+  })
+})
+
+for (const ending of ['trap', 'commit-refusal']) {
+  test('vmJournal:false LOST recovery ' + ending + ' after mutated init fails closed without rollback, publication or retry and retains its fence', async () => {
+    await withoutVmJournal(async () => {
+      const key = 'no-journal-recovery-' + ending + '/version'
+      const file = stateFile(key)
+      const program = compile(fixture({ init: mutatedRecoveryInit + (ending === 'trap' ? trap : ''), initResult: 'state' }))
+      disk.set(file, '{broken-main')
+      disk.set(file + '.bak', '{broken-backup')
+      let rule
+      if (ending === 'commit-refusal') {
+        worker.memory.fail('write', event => event.path.startsWith(file + '.') && event.path.endsWith('.tmp'))
+        rule = worker.memory.rules[worker.memory.rules.length - 1]
+      }
+      const p = probe({ diagnostics: true })
+      try {
+        await assert.rejects(p.actor.initialize(program, options('LIVE_PERSISTENT', key)), ending === 'trap' ? /array index out of bounds/ : /STATE_WRITE_FAILED/)
+        if (rule) assert.equal(rule.remaining, 0)
+        assert.equal(p.actor.ready(), false)
+        assert.equal(await p.actor.snapshot(), '')
+        assert.equal(p.actor.view(), null)
+        assert.deepEqual(entries(p), ['init'])
+        assert.equal(p.snapshots.length + p.frames.length + p.effects.length + count(p, 'save') + count(p, 'saved') + count(p, 'publication'), 0)
+        assert.equal(disk.has(file), false)
+        assert.equal(disk.has(file + '.bak'), false)
+        assert.deepEqual(p.events.filter(e => e.type === 'quarantine').map(e => [e.file, disk.get(e.to)]), [[file, '{broken-main'], [file + '.bak', '{broken-backup']])
+        assert(![...disk.keys()].some(name => name.endsWith('.tmp')))
+        assert.equal(count(p, 'ui-error'), 1)
+        assert.equal(p.events.find(e => e.type === 'ui-error').kind, ending === 'trap' ? 'init' : 'state')
+        assert(!p.events.some(e => e.message === 'STATE_RECOVERY'))
+        assert.deepEqual(p.events.filter(e => e.type === 'task-result' && e.reply.load).map(e => e.reply.load.kind), ['LOST', 'ABSENT'])
+        assert.deepEqual(p.events.filter(e => e.type === 'task-submit').map(e => e.request.kind), ending === 'trap' ? ['load', 'recoverLost'] : ['load', 'recoverLost', 'commit'])
+        assert.equal(count(p, 'task-submit'), count(p, 'task-result'))
+        if (rule) assert(p.events.some(e => e.type === 'task-result' && e.reply.result?.status === 'FAILED' && e.reply.result.code === 'STATE_WRITE_FAILED'))
+        assert(p.events.some(e => e.type === 'diagnostic' && e.event === 'VM_SAFETY_SWITCH' && e.attributes.safety === false))
+        const executions = p.events.filter(e => e.type === 'diagnostic' && e.event === 'VM_EXECUTE' && e.attributes.entryCategory === 'INIT')
+        assert.equal(executions.length, 1)
+        assert.equal(executions[0].attributes.outcome, ending === 'trap' ? 'TRAP' : 'OK')
+        assert(p.events.some(e => e.type === 'diagnostic' && e.event === 'VM_ROLLBACK_SKIPPED' && e.attributes.stage === 'turn-refusal'))
+        assert(p.events.some(e => e.type === 'diagnostic' && e.event === 'STATE_MUTATION_REFUSED' && e.attributes.stage === 'safety-off'))
+        assert(!p.events.some(e => e.type === 'diagnostic' && e.event === 'VM_JOURNAL'))
+        assert.throws(() => store.assertStateAdmission(key), /admission fenced/)
+        p.reset()
+        await p.actor.dispatch('change', number(5))
+        await p.actor.resume()
+        await p.actor.notifyStateSnapshot()
+        assert.equal(await p.actor.persistState(), false)
+        assert.equal(await p.actor.snapshot(), '')
+        await assert.rejects(p.actor.initialize(program, options('LIVE_PERSISTENT', key)), /admission fenced/)
+        assert.deepEqual(p.events, [])
+        await p.actor.dispose()
+        assert.throws(() => store.assertStateAdmission(key), /admission fenced/)
+        const q = probe()
+        try {
+          await assert.rejects(q.actor.initialize(programs.basic, options('LIVE_PERSISTENT', key)), /admission fenced/)
+          assert.deepEqual(q.events, [])
+          assert.equal(q.actor.ready(), false)
+        } finally { await q.actor.dispose() }
+      } finally {
+        if (rule) worker.memory.rules.splice(worker.memory.rules.indexOf(rule), 1)
+        await p.actor.dispose()
+      }
+    })
+  })
+}
+
+test('initial corrupt disk carries seed into new defaults once and refreshes only after recovery commit', async () => {
+  const seed = edited(fresh, { n: 7, calls: 3 })
+  const file = stateFile()
+  disk.set(file, '{broken')
+  const p = probe()
+  await p.actor.initialize(programs.newer, options('LIVE_PERSISTENT', 'project/version', seed))
+  assert(p.actor.ready())
+  assert.deepEqual(await p.state(), { n: 17, calls: 3, refreshes: 1, marks: [], badView: false, added: 42 })
+  assert.deepEqual(entries(p), ['init', 'view', 'widgetRefresh', 'view'])
+  assert.deepEqual(p.snapshots.map(encoded => stateOf(encoded)), [
+    { n: 7, calls: 3, refreshes: 0, marks: [], badView: false, added: 42 },
+    { n: 17, calls: 3, refreshes: 1, marks: [], badView: false, added: 42 }
+  ])
+  assert.deepEqual(sequence(p), ['init', 'save', 'snapshot', 'saved', 'view', 'frame', 'ui-error:state', 'widgetRefresh', 'save', 'snapshot', 'effect:refresh', 'saved', 'view', 'frame'])
+  assert.deepEqual(p.frames.map(frame => frame.root.text), ['n=7', 'n=17'])
+  assert.equal(count(p, 'stop'), 0)
+  assert.equal(p.events.filter(e => e.type === 'ui-error' && e.message === 'STATE_RECOVERY').length, 1)
+  const saved = format2.validateStateFile(disk.get(file), 'project/version')
+  assert.equal(saved.revision, 2)
+  assert.equal(saved.encodedState, await p.actor.snapshot())
+  assert.equal(await store.loadState('project', 'version', programs.newer.stamp), saved.encodedState)
+  assert.equal(count(p, 'task-submit'), count(p, 'task-result'))
+  await p.actor.dispose()
+})
+
+test('initial recovery init and carry failures discard queued effects without publishing a placeholder', async () => {
+  const initEffectTrap = compile(fixture({ init: `sdk.call("${target}", ["label", "init-fail"], "answered"); let empty: number[] = []; let n: number = empty[2];` }))
+  const cases = [
+    { program: programs.initTrap, seed: '', error: /array index out of bounds/, kind: 'init' },
+    { program: initEffectTrap, seed: '', error: /array index out of bounds/, kind: 'init' },
+    { program: programs.initEffect, seed: edited(fresh, { n: -4 }), error: /array index out of bounds/, kind: 'carry' }
+  ]
+  for (const [index, scenario] of cases.entries()) {
+    disk.clear()
+    const key = 'failed-init-recovery-' + index + '/version'
+    const file = stateFile(key)
+    disk.set(file, '{broken')
+    const p = probe()
+    await assert.rejects(p.actor.initialize(scenario.program, options('LIVE_PERSISTENT', key, scenario.seed)), scenario.error)
+    assert.equal(p.actor.ready(), false)
+    assert.equal(await p.actor.snapshot(), '')
+    assert.equal(p.actor.view(), null)
+    assert.deepEqual(entries(p), ['init'])
+    assert.equal(p.snapshots.length + p.frames.length + p.effects.length + count(p, 'saved') + count(p, 'save') + count(p, 'publication'), 0)
+    assert.equal(disk.has(file), false)
+    assert.equal(disk.has(file + '.bak'), false)
+    assert.equal(count(p, 'quarantine'), 1)
+    assert.equal(disk.get(p.events.find(e => e.type === 'quarantine').to), '{broken')
+    assert.equal(count(p, 'ui-error'), 1)
+    assert.equal(p.events.find(e => e.type === 'ui-error').kind, scenario.kind)
+    assert(!p.events.some(e => e.message === 'STATE_RECOVERY'))
+    assert.equal(count(p, 'task-submit'), count(p, 'task-result'))
+    assert.throws(() => store.assertStateAdmission(key), /admission fenced/)
+    p.reset()
+    await p.actor.dispatch('change', number(5))
+    assert.equal(p.snapshots.length + p.frames.length + p.effects.length + count(p, 'save'), 0)
+    await assert.rejects(p.actor.initialize(programs.basic, options('LIVE_PERSISTENT', key)), /admission fenced/)
+    assert.equal(count(p, 'task-submit'), 0)
+    await p.actor.dispose()
+  }
+})
+
+test('initial recovery commit failure publishes no state, effects or success notification and retains its fence', async () => {
+  const key = 'failed-commit-recovery/version'
+  const file = stateFile(key)
+  disk.set(file, '{broken')
+  worker.memory.fail('write', event => event.path.startsWith(file + '.') && event.path.endsWith('.tmp'))
+  const rule = worker.memory.rules[worker.memory.rules.length - 1]
+  const p = probe()
+  await assert.rejects(p.actor.initialize(programs.initEffect, options('LIVE_PERSISTENT', key)), /STATE_WRITE_FAILED/)
+  assert.equal(rule.remaining, 0)
+  assert.equal(p.actor.ready(), false)
+  assert.equal(await p.actor.snapshot(), '')
+  assert.deepEqual(entries(p), ['init'])
+  assert.equal(p.snapshots.length + p.frames.length + p.effects.length + count(p, 'save') + count(p, 'saved') + count(p, 'publication'), 0)
+  assert.equal(disk.has(file), false)
+  assert.equal(disk.has(file + '.bak'), false)
+  assert.equal(count(p, 'quarantine'), 1)
+  assert.equal(count(p, 'ui-error'), 1)
+  assert(!p.events.some(e => e.message === 'STATE_RECOVERY'))
+  assert(![...disk.keys()].some(name => name.endsWith('.tmp')))
+  assert.equal(count(p, 'task-submit'), count(p, 'task-result'))
+  assert.throws(() => store.assertStateAdmission(key), /admission fenced/)
+  await p.actor.dispose()
+})
+
+test('initial recovery rechecks a valid disk race and restores it without reset, seed, init or quarantine', async () => {
+  const file = stateFile()
+  const encoded = edited(fresh, { n: 91, calls: 8 })
+  const valid = format2.assembleStateFile({ appId: 'project/version', schemaVersion: 1,
+    vmGeneration: 4, revision: 7, stamp: programs.initEffect.stamp }, encoded)
+  disk.set(file, '{broken')
+  let raced = false
+  worker.taskpool.plans.push({ reply(reply) {
+    assert.equal(reply.load.kind, 'LOST')
+    disk.set(file, valid)
+    raced = true
+    return reply
+  } })
+  const p = probe()
+  await p.actor.initialize(programs.initEffect, options('LIVE_PERSISTENT', 'project/version', '{broken-seed'))
+  assert(raced)
+  assert(p.actor.ready())
+  assert.equal(await p.actor.snapshot(), encoded)
+  assert.deepEqual(entries(p), ['restore', 'view'])
+  assert.deepEqual(sequence(p), ['restore', 'snapshot', 'view', 'frame', 'ui-error:state'])
+  assert.equal(p.frames[0].root.text, 'n=91')
+  assert.equal(p.effects.length + count(p, 'save') + count(p, 'saved') + count(p, 'quarantine') + count(p, 'stop'), 0)
+  assert.equal(count(p, 'publication'), 1)
+  const saved = format2.validateStateFile(disk.get(file), 'project/version')
+  assert.equal(saved.revision, 7)
+  assert.equal(saved.vmGeneration, 5)
+  assert.equal(saved.encodedState, encoded)
+  assert.deepEqual(p.events.filter(e => e.type === 'task-submit').map(e => e.request.kind), ['load', 'recoverLost', 'publishGeneration'])
+  assert.equal(count(p, 'task-submit'), count(p, 'task-result'))
+  assert.doesNotThrow(() => store.assertStateAdmission('project/version'))
+  await p.actor.dispose()
+})
+
+test('unavailable initial disk never grants recovery or quarantines and can retry normally', async () => {
+  for (const stage of ['stat', 'open', 'read']) {
+    disk.clear()
+    const key = 'unavailable-initial-' + stage + '/version'
+    const file = stateFile(key)
+    disk.set(file, '{broken')
+    disk.set(file + '.bak', '{broken-backup')
+    worker.memory.fail(stage, event => event.path === file)
+    const rule = worker.memory.rules[worker.memory.rules.length - 1]
+    const p = probe()
+    await assert.rejects(p.actor.initialize(programs.initEffect, options('LIVE_PERSISTENT', key)), /STATE_READ_FAILED/)
+    assert.equal(rule.remaining, 0)
+    assert.equal(p.actor.ready(), false)
+    assert.equal(await p.actor.snapshot(), '')
+    assert.deepEqual(entries(p), [])
+    assert.equal(p.snapshots.length + p.frames.length + p.effects.length + count(p, 'save') + count(p, 'saved') + count(p, 'quarantine'), 0)
+    assert.equal(disk.get(file), '{broken')
+    assert.equal(disk.get(file + '.bak'), '{broken-backup')
+    assert.deepEqual(p.events.filter(e => e.type === 'task-submit').map(e => e.request.kind), ['load'])
+    assert.equal(count(p, 'ui-error'), 1)
+    assert.equal(p.events.find(e => e.type === 'ui-error').kind, 'state')
+    assert(!p.events.some(e => e.message === 'STATE_RECOVERY'))
+    assert.equal(count(p, 'task-submit'), count(p, 'task-result'))
+    assert.doesNotThrow(() => store.assertStateAdmission(key))
+    disk.delete(file)
+    disk.delete(file + '.bak')
+    p.reset()
+    await p.actor.initialize(programs.basic, options('LIVE_PERSISTENT', key))
+    assert(p.actor.ready())
+    assert.equal(await p.actor.snapshot(), fresh)
+    assert.equal(count(p, 'quarantine'), 0)
+    noErrors(p)
+    await p.actor.dispose()
+  }
+})
+
+test('unavailable recovery recheck preserves corrupt files without quarantine, init or notification', async () => {
+  const key = 'unavailable-recovery-recheck/version'
+  const file = stateFile(key)
+  disk.set(file, '{broken')
+  disk.set(file + '.bak', '{broken-backup')
+  let rule
+  worker.taskpool.plans.push({ reply(reply) {
+    assert.equal(reply.load.kind, 'LOST')
+    worker.memory.fail('read', event => event.path === file)
+    rule = worker.memory.rules[worker.memory.rules.length - 1]
+    return reply
+  } })
+  const p = probe()
+  await assert.rejects(p.actor.initialize(programs.initEffect, options('LIVE_PERSISTENT', key)), /STATE_READ_FAILED/)
+  assert.equal(rule.remaining, 0)
+  assert.equal(p.actor.ready(), false)
+  assert.equal(await p.actor.snapshot(), '')
+  assert.deepEqual(entries(p), [])
+  assert.equal(p.snapshots.length + p.frames.length + p.effects.length + count(p, 'save') + count(p, 'saved') + count(p, 'quarantine'), 0)
+  assert.equal(disk.get(file), '{broken')
+  assert.equal(disk.get(file + '.bak'), '{broken-backup')
+  assert.deepEqual(p.events.filter(e => e.type === 'task-submit').map(e => e.request.kind), ['load', 'recoverLost'])
+  assert.equal(count(p, 'task-submit'), count(p, 'task-result'))
+  assert.equal(count(p, 'ui-error'), 1)
+  assert.equal(p.events.find(e => e.type === 'ui-error').kind, 'state')
+  assert(!p.events.some(e => e.message === 'STATE_RECOVERY'))
+  assert.throws(() => store.assertStateAdmission(key), /admission fenced/)
+  await p.actor.dispose()
+})
+
+test('public pending initialization rejects promotion before tracking and lets recovery and queued input settle', async () => {
+  const key = 'pending-init-promotion/version'
+  disk.set(stateFile(key), '{broken')
+  const p = probe()
+  const initializing = p.actor.initialize(programs.basic, options('LIVE_PERSISTENT', key))
+  const promoting = assert.rejects(p.actor.promote(options('LIVE_PERSISTENT', key)), turnError('STATE_TURN_PENDING', 'state'))
+  const input = p.actor.dispatch('change', number(2))
+  await turnBounded(Promise.all([initializing, promoting, input]))
+  assert(p.actor.ready())
+  assert.equal((await p.state()).n, 3)
+  assert.deepEqual(entries(p), ['init', 'view', 'change', 'view'])
+  assert.equal(count(p, 'quarantine'), 1)
+  assert.equal(count(p, 'save'), 2)
+  assert.equal(p.events.filter(e => e.message === 'STATE_RECOVERY').length, 1)
+  assert.equal(count(p, 'task-submit'), count(p, 'task-result'))
+  assert.doesNotThrow(() => store.assertStateAdmission(key))
+  await turnBounded(p.actor.promote(options('LIVE_EPHEMERAL', '')))
+  assert.equal((await p.state()).n, 3)
+  await p.actor.dispose()
+})
+
+test('different-key queued initializations recover without dependencies and retain the exact pending admission count', async () => {
+  const firstKey = 'queued-init-first/version', secondKey = 'queued-init-second/version'
+  disk.set(stateFile(firstKey), '{broken-first')
+  disk.set(stateFile(secondKey), '{broken-second')
+  const p = probe()
+  worker.taskpool.plans.push({}, {}, {}, { hold: true })
+  const first = p.actor.initialize(programs.basic, options('LIVE_PERSISTENT', firstKey))
+  const second = p.actor.initialize(programs.basic, options('LIVE_PERSISTENT', secondKey))
+  await turnBounded(assert.rejects(p.actor.initialize(programs.basic, options('LIVE_PERSISTENT', firstKey)), /activation already pending/))
+  await turnBounded(first)
+  await turnMicrotasks()
+  const held = worker.taskpool.executions.find(entry => !entry.finished && entry.args[2].appId === secondKey)
+  assert(held, 'second initialization remains pending after the first settles')
+  assert.equal(held.args[2].kind, 'load')
+  await turnBounded(assert.rejects(p.actor.promote(options('LIVE_PERSISTENT', firstKey)), turnError('STATE_TURN_PENDING', 'state')))
+  assert.equal(count(p, 'quarantine'), 1)
+  worker.taskpool.finish(held)
+  await turnBounded(second)
+  assert(p.actor.ready())
+  assert.equal(await p.actor.snapshot(), fresh)
+  assert.equal(count(p, 'quarantine'), 2)
+  assert.equal(p.events.filter(e => e.message === 'STATE_RECOVERY').length, 2)
+  assert.equal(count(p, 'task-submit'), count(p, 'task-result'))
+  assert.doesNotThrow(() => store.assertStateAdmission(firstKey))
+  assert.doesNotThrow(() => store.assertStateAdmission(secondKey))
+  await turnBounded(p.actor.promote(options('LIVE_EPHEMERAL', '')))
+  assert.equal(await p.actor.snapshot(), fresh)
+  await p.actor.dispose()
+})
+
+test('failed initialization releases its pending count and admits a later successful promotion', async () => {
+  const p = probe()
+  await assert.rejects(p.actor.initialize(programs.basic, options('LIVE_PERSISTENT', 'invalid')), /Invalid project state identity/)
+  await assert.rejects(p.actor.promote(options('LIVE_EPHEMERAL', '')), turnError('ACTOR_NOT_READY', 'state'))
+  await assert.rejects(p.actor.initialize(programs.initTrap, options('LIVE_EPHEMERAL', '')), /array index out of bounds/)
+  await p.actor.initialize(programs.basic, options('PREVIEW', ''))
+  await turnBounded(p.actor.promote(options('LIVE_PERSISTENT', 'after-failed-init/version')))
+  assert(p.actor.ready())
+  assert.equal(await p.actor.snapshot(), fresh)
+  await p.actor.dispose()
+})
+
+test('recovery notification cancellation or disposal rejects activation and retains its fence after commit', async () => {
+  for (const ending of ['cancel', 'dispose']) {
+    const key = 'recovery-callback-' + ending + '/version'
+    disk.set(stateFile(key), '{broken')
+    let disposal
+    const p = probe({ onError(kind, message, actor) {
+      if (kind !== 'state' || message !== 'STATE_RECOVERY') return
+      assert(actor.ready())
+      assert.throws(() => store.assertStateAdmission(key), /admission fenced/)
+      if (ending === 'dispose') disposal = actor.dispose()
+      else actor.cancel()
+    } })
+    await turnBounded(assert.rejects(p.actor.initialize(programs.refreshed, options('LIVE_PERSISTENT', key)),
+      turnError('STATE_COMMIT_UNCERTAIN', 'state')))
+    if (disposal) await turnBounded(disposal)
+    assert.equal(p.actor.ready(), false)
+    assert.equal(p.actor.view(), null)
+    assert.deepEqual(entries(p), ['init', 'view'])
+    assert.equal(count(p, 'save'), 1)
+    assert.equal(p.snapshots.length, 1)
+    assert.equal(p.frames.length, 1)
+    assert.equal(p.effects.length, 0)
+    assert.equal(p.events.filter(e => e.message === 'STATE_RECOVERY').length, 1)
+    assert.equal(count(p, 'ui-error'), 1)
+    assert.equal(count(p, 'task-submit'), count(p, 'task-result'))
+    assert.equal(format2.validateStateFile(disk.get(stateFile(key)), key).encodedState, fresh)
+    assert.throws(() => store.assertStateAdmission(key), /admission fenced/)
+    const q = probe()
+    await turnBounded(assert.rejects(q.actor.initialize(programs.basic, options('LIVE_PERSISTENT', key)), /admission fenced/))
+    assert.equal(count(q, 'task-submit'), 0)
+    await q.actor.dispose()
+    await p.actor.dispose()
+  }
 })
 
 const legacyTestCount = tests.length

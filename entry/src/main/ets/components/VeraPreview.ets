@@ -69,7 +69,7 @@ class PreviewSubscriber implements AppSubscriber {
   private effectRequest: (effect: RevisionedEffectRequest) => void
   private flushInput: (appId: string) => void | Promise<void>
   private mailboxWritable: () => void
-  private actorHandle: (handle: ActorHandle) => void
+  private actorHandle: (handle: ActorHandle, reason?: 'REPLACE' | 'PROMOTE') => void
 
   constructor(
     viewFrame: (frame: RevisionedFrameEnvelope) => void,
@@ -79,7 +79,7 @@ class PreviewSubscriber implements AppSubscriber {
     effectRequest: (effect: RevisionedEffectRequest) => void,
     flushInput: (appId: string) => void | Promise<void>,
     mailboxWritable: () => void,
-    actorHandle: (handle: ActorHandle) => void
+    actorHandle: (handle: ActorHandle, reason?: 'REPLACE' | 'PROMOTE') => void
   ) {
     this.viewFrame = viewFrame
     this.errorHandler = errorHandler
@@ -98,7 +98,7 @@ class PreviewSubscriber implements AppSubscriber {
   onStateSnapshot(encoded: string, snapshot?: StateSnapshotEnvelope): void { this.stateSnapshot(encoded, snapshot) }
   onStateSaved(projectId: string): void { this.stateSaved(projectId) }
   onEffectRequest(effect: RevisionedEffectRequest): void { this.effectRequest(effect) }
-  onActorHandle(handle: ActorHandle): void { this.actorHandle(handle) }
+  onActorHandle(handle: ActorHandle, reason?: 'REPLACE' | 'PROMOTE'): void { this.actorHandle(handle, reason) }
   flushPendingInputFor(appId: string): void | Promise<void> { return this.flushInput(appId) }
   onMailboxWritable(): void { this.mailboxWritable() }
 }
@@ -559,6 +559,7 @@ export struct VeraPreview {
   private draining: boolean = false
   private mountRequested: boolean = false
   private transitioning: boolean = false
+  private awaitingReplacement: boolean = false
   private activeProgram: string = ''
   private activeOptions: AcquireOptions = { mode: 'PREVIEW', persistKey: '', seedState: '' }
   private frameAppId: string = ''
@@ -827,7 +828,7 @@ export struct VeraPreview {
   }
 
   private acceptPublication(publication: PreviewPublicationVersion, allowPreview: boolean): boolean {
-    if (publication === undefined || publication === null ||
+    if (this.awaitingReplacement || publication === undefined || publication === null ||
         publication.runtimeMode !== this.activeOptions.mode ||
         (!allowPreview && publication.runtimeMode === 'PREVIEW') ||
         typeof publication.appId !== 'string' || publication.appId.length === 0 ||
@@ -856,6 +857,14 @@ export struct VeraPreview {
       vmGeneration: publication.vmGeneration, stateRevision: publication.stateRevision }
     this.publicationAppId = publication.appId
     return true
+  }
+
+  private resetPublicationLineage(): void {
+    this.publicationVersion = null
+    this.frameAppId = ''
+    this.frameVmGeneration = 0
+    this.lastFrameSeq = 0
+    this.lastAppliedSeq = 0
   }
 
   private acceptActorHandle(handle: ActorHandle): void {
@@ -896,6 +905,7 @@ export struct VeraPreview {
 
       (kind: string, message: string, inputSeq?: number): void => {
         if (!current()) { return }
+        if (kind.toUpperCase() === 'STATE' && message === 'STATE_RECOVERY') { return }
         if (inputSeq !== undefined) { this.observedErrors.add(inputSeq) }
         let viewFailure = kind.toUpperCase() === 'VIEW'
         this.worldTransitionError = ''
@@ -942,8 +952,18 @@ export struct VeraPreview {
         this.syncEditGate()
       },
 
-      (handle: ActorHandle): void => {
-        if (current()) { this.acceptActorHandle(handle) }
+      (handle: ActorHandle, reason?: 'REPLACE' | 'PROMOTE'): void => {
+        if (!current()) { return }
+        if (reason === 'REPLACE' && this.transitioning && this.awaitingReplacement && this.handle !== null &&
+            handle !== this.handle && handle.leaseId === this.handle!.leaseId &&
+            (this.publicationAppId.length === 0 || handle.appId === this.publicationAppId) &&
+            Number.isSafeInteger(handle.vmGeneration) && handle.vmGeneration >= 0 &&
+            handle.vmGeneration < Number.MAX_SAFE_INTEGER) {
+          this.resetPublicationLineage()
+          this.publicationAppId = handle.appId
+          this.awaitingReplacement = false
+        }
+        this.acceptActorHandle(handle)
       }
     )
   }
@@ -994,6 +1014,9 @@ export struct VeraPreview {
     this.activeOptions = options
     this.publicationAppId = options.mode === 'LIVE_PERSISTENT' ? options.persistKey :
       original !== null && originalOptions.mode === options.mode ? original.appId : ''
+    this.awaitingReplacement = original !== null && (originalProgram !== program.vbc2 ||
+      (options.mode === 'PREVIEW' && originalOptions.mode !== 'PREVIEW'))
+    if (original === null) { this.resetPublicationLineage() }
     this.pendingWorldProgram = this.worldProgram !== program.vbc2 ? program.vbc2 : null
     this.worldTransitionError = ''
     this.error = ''
@@ -1039,11 +1062,9 @@ export struct VeraPreview {
             }
             if (!this.activationCurrent(generation) || this.disposed) { throw new Error('Preview was released') }
             this.subscriber = this.createSubscriber(generation)
-            this.frameAppId = ''
-            this.frameVmGeneration = 0
+            this.awaitingReplacement = false
+            this.resetPublicationLineage()
             this.publicationAppId = options.mode === 'LIVE_PERSISTENT' ? options.persistKey : ''
-            this.lastFrameSeq = 0
-            this.lastAppliedSeq = 0
             this.observedErrors.clear()
             next = await this.runtime.acquire(options.mode === 'LIVE_PERSISTENT' ? options.persistKey : '',
               program, options, this.subscriber!)
@@ -1070,6 +1091,7 @@ export struct VeraPreview {
       binding.failBinding()
       if (e instanceof HostOperationFailure && e.handleInvalidated) { originalInvalid = true }
       if (this.activationCurrent(generation)) {
+        this.awaitingReplacement = false
         this.handle = originalReleased || originalInvalid ? null : original
         this.activeProgram = originalProgram
         this.activeOptions = originalOptions
@@ -1092,6 +1114,7 @@ export struct VeraPreview {
           try {
             if (originalReleased) {
               this.subscriber = this.createSubscriber(generation)
+              this.resetPublicationLineage()
               let restored = await this.runtime.acquire(originalAppId,
                 { vbc2: originalProgram, stamp: veraStateStamp(originalProgram) }, originalOptions, this.subscriber!)
               if (!this.activationCurrent(generation) || this.disposed) {

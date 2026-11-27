@@ -38,7 +38,8 @@ const allowed = new Set([
   'runtime/StateFileFormat.ets', 'runtime/CommitPolicy.ets', 'vera/VeraInterpreter.ets',
   'vera/VeraUi.ets', 'vera/VeraUiCatalog.ets', 'vera/VeraIcons.ets', 'vera/VeraGfx.ets',
   'vera/GfxPaint.ets', 'vera/VeraTheme.ets', 'vera/VeraMotion.ets', 'vera/VeraScene.ets',
-  'vera/VeraSurfaces.ets', 'vera/VeraShapes.ets', 'widget/CardModel.ets'
+  'vera/VeraSurfaces.ets', 'vera/VeraShapes.ets', 'vera/VeraParticles.ets', 'vera/VeraNoise.ets',
+  'vera/VeraTextures.ets', 'vera/VeraModels.ets', 'widget/CardModel.ets'
 ].map(file => path.join(root, file)))
 function load(file) {
   file = path.resolve(file)
@@ -283,21 +284,21 @@ class StorageFixture {
   }
 }
 class RecoveryStorageFixture extends StorageFixture {
-  constructor(disk, authority) {
+  constructor(disk, reservation) {
     super(disk)
-    this.authority = authority
+    this.reservation = reservation
     this.plans.recoverLost = []
     this.quarantine = []
     this.ownership = []
   }
   run(kind, input, fallback) {
-    this.ownership.push([kind, this.authority.held])
+    this.ownership.push([kind, this.reservation.held])
     return super.run(kind, input, fallback)
   }
   recoverLost(appId, expectedStamp) {
     assert.equal(appId, APP)
     assert.equal(expectedStamp, STAMP)
-    assert.equal(this.authority.held, true, 'reset requires exclusive drained authority')
+    assert.equal(this.reservation.held, true, 'actor holds reservation during reset')
     return this.run('recoverLost', { appId, expectedStamp }, () => {
       if (this.disk.kind !== 'LOST') return this.disk
       this.quarantine.push(structuredClone(this.disk))
@@ -306,23 +307,17 @@ class RecoveryStorageFixture extends StorageFixture {
     })
   }
 }
-function recoveryFixture(options = {}, strategy) {
-  const authority = { held: false, calls: 0, callback: null, release: deferred(), waitRelease: false,
-    async withExclusiveDrained(appId, operation) {
-      assert.equal(appId, APP)
+function recoveryFixture(options = {}) {
+  const reservation = { held: false, calls: 0,
+    async run(operation) {
       assert.equal(this.held, false)
       this.calls++
       this.held = true
-      this.callback = operation
-      try {
-        if (strategy) return await strategy(operation, this)
-        await operation()
-        if (this.waitRelease) await this.release.promise
-      } finally { this.held = false }
+      try { return await operation() } finally { this.held = false }
     } }
-  const storage = new RecoveryStorageFixture({ kind: 'LOST', code: 'STATE_CORRUPTED', stage: 'lost-backup-format' }, authority)
-  const c = fixture({ storage, lostRecoveryAuthority: authority, policy: new CommitPolicy(), ...options })
-  return { ...c, authority }
+  const storage = new RecoveryStorageFixture({ kind: 'LOST', code: 'STATE_CORRUPTED', stage: 'lost-backup-format' }, reservation)
+  const c = fixture({ storage, allowInitialLostRecovery: true, policy: new CommitPolicy(), ...options })
+  return { ...c, reservation }
 }
 function recoveryAdmissionDenied(c) {
   for (const commitClass of ['IMMEDIATE', 'VOLATILE', 'THROTTLED']) {
@@ -330,17 +325,8 @@ function recoveryAdmissionDenied(c) {
   }
   fails(() => c.manager.checkpoint(), 'STATE_NOT_READY')
   fails(() => c.manager.captureWorkingSnapshot(), 'STATE_NOT_READY')
-  fails(() => c.manager.publishGeneration(), 'STATE_TURN_PENDING')
+  fails(() => c.manager.publishGeneration(), c.manager.status().pendingOperations ? 'STATE_TURN_PENDING' : 'STATE_NOT_READY')
   assert.equal(c.guard.count('begin'), 0)
-}
-async function recoveryFault(c, loading) {
-  assert.deepEqual(await bounded(loading), {
-    kind: 'UNAVAILABLE', code: 'STATE_COMMIT_UNCERTAIN', stage: 'lost-recovery'
-  })
-  assert.equal(c.authority.held, false)
-  assert.equal(c.manager.committedSnapshot(), null)
-  assert(c.events.some(event => event.code === 'STATE_COMMIT_UNCERTAIN'))
-  await quarantined(c)
 }
 function reply(result) { return { result: request => ({ operationId: request.operationId, result }) } }
 function assertLoadMetadata(actual, expected) {
@@ -492,7 +478,7 @@ test('StatePort current source exposes the manager contract without runtime stor
   const source = ts.createSourceFile('StatePort.ts', fs.readFileSync(portFile, 'utf8'), ts.ScriptTarget.ES2020, true)
   const port = source.statements.find(node => ts.isInterfaceDeclaration(node) && node.name.text === 'StatePort')
   assert(port)
-  const expected = ['load', 'beginTurn', 'getWorkingState', 'setWorkingState', 'markEffects', 'proveNoMutation',
+  const expected = ['load', 'recoverLost', 'beginTurn', 'getWorkingState', 'setWorkingState', 'markEffects', 'proveNoMutation',
     'commitTurn', 'rollbackTurn', 'checkpointIfDue', 'checkpoint', 'reloadAfterExternalWrite', 'checkOnResume',
     'finalSave', 'committedSnapshot', 'captureWorkingSnapshot', 'publishGeneration', 'preparePromotion',
     'awaitReadyForImmediate', 'whenIdle', 'status', 'close']
@@ -1539,281 +1525,178 @@ for (const pathName of ['LOAD', 'RELOAD', 'RESUME', 'PROMOTION', 'PROMOTION_RETR
   })
 }
 
-test('current recovery contracts expose optional reset and callback-scoped drained authority', () => {
+test('current recovery contracts expose explicit manager reset without authority injection', () => {
   const source = ts.createSourceFile('StatePort.ts', fs.readFileSync(path.join(root, 'runtime/shared/StatePort.ets'), 'utf8'),
     ts.ScriptTarget.ES2020, true)
-  const authority = source.statements.find(node => ts.isInterfaceDeclaration(node) && node.name.text === 'StateLostRecoveryAuthority')
-  assert.equal(authority.members.length, 1)
-  const method = authority.members[0]
-  assert.equal(method.name.text, 'withExclusiveDrained')
-  assert.equal(method.type.getText(source), 'Promise<void>')
-  assert.deepEqual(method.parameters.map(parameter => [parameter.name.text, parameter.type.getText(source)]),
-    [['appId', 'string'], ['operation', '() => Promise<void>']])
-  const storage = source.statements.find(node => ts.isInterfaceDeclaration(node) && node.name.text === 'StateStoragePort')
-  const reset = storage.members.find(member => member.name.text === 'recoverLost')
-  assert(reset.questionToken)
-  assert.equal(reset.type.getText(source), 'Promise<LoadResult>')
+  assert(!source.statements.some(node => ts.isInterfaceDeclaration(node) && node.name.text === 'StateLostRecoveryAuthority'))
+  for (const name of ['StateStoragePort', 'StatePort']) {
+    const port = source.statements.find(node => ts.isInterfaceDeclaration(node) && node.name.text === name)
+    const reset = port.members.find(member => member.name.text === 'recoverLost')
+    assert.equal(Boolean(reset.questionToken), name === 'StateStoragePort')
+    assert.equal(reset.type.getText(source), 'Promise<LoadResult>')
+    assert.equal(reset.parameters.length, name === 'StateStoragePort' ? 2 : 0)
+  }
+  const manager = ts.createSourceFile('StateManager.ts', fs.readFileSync(path.join(root, 'runtime/StateManager.ets'), 'utf8'),
+    ts.ScriptTarget.ES2020, true)
+  const options = manager.statements.find(node => ts.isInterfaceDeclaration(node) && node.name.text === 'StateManagerOptions')
+  assert(!options.members.some(member => member.name.text === 'lostRecoveryAuthority'))
+  const optin = options.members.find(member => member.name.text === 'allowInitialLostRecovery')
+  assert(optin.questionToken)
+  assert.equal(optin.type.getText(manager), 'boolean')
 })
 for (const kind of ['ABSENT', 'READY']) {
-  test('ordinary initial ' + kind + ' never invokes LOST recovery authority', async () => {
+  test('ordinary initial ' + kind + ' never enables LOST reset', async () => {
     const c = recoveryFixture()
     c.storage.disk = kind === 'ABSENT' ? { kind } : diskState(seed(88))
+    fails(() => c.manager.recoverLost(), 'STATE_NOT_READY')
     assert.equal((await c.manager.load()).kind, kind)
-    assert.equal(c.authority.calls, 0)
+    fails(() => c.manager.recoverLost(), 'STATE_NOT_READY')
+    assert.equal(c.reservation.calls, 0)
     assert.equal(c.storage.count('recoverLost'), 0)
     assert.equal(c.storage.count('commit'), 0)
     await c.manager.publishGeneration()
     assert.equal(c.manager.status().phase, 'READY')
+    const tx = c.manager.beginTurn('VOLATILE')
+    fails(() => c.manager.recoverLost(), 'STATE_TURN_PENDING')
+    c.manager.rollbackTurn(tx)
   })
 }
-test('recovery authority stays held through seed snapshot reread and validation', async () => {
-  const c = recoveryFixture()
-  const rereadGate = deferred()
-  c.storage.plan('commit', { after: result => {
-    cryptoHook = stage => { if (stage === 'create') { cryptoHook = null; throw Error('snapshot once') } }
-    c.storage.plan('load', { gate: rereadGate })
-    return result
-  } })
-  const loading = c.manager.load()
-  const outcome = observe(loading)
-  await tick(80)
-  try {
-    assert.equal(c.storage.count('commit'), 1)
-    assert.equal(c.storage.count('load'), 2)
-    assert.equal(c.storage.disk.header.revision, 1)
-    assert.equal(c.authority.held, true)
-    assert.equal(outcome.settled, false)
-    recoveryAdmissionDenied(c)
-  } finally { rereadGate.resolve() }
-  assert.equal((await bounded(loading)).kind, 'READY')
-  assert.equal(c.authority.held, false)
-  assert.equal(c.manager.status().phase, 'READY')
-  assert.equal(c.manager.committedSnapshot().version.revision, 1)
-  assert.deepEqual(c.storage.ownership.filter(([kind]) => kind === 'load'), [['load', false], ['load', true]])
-  assert.equal(c.storage.count('commit'), 1)
-})
-test('repeated callback after successful authority release faults without another reset or seed', async () => {
-  const c = recoveryFixture()
-  assert.equal((await bounded(c.manager.load())).kind, 'READY')
-  assert.equal(c.manager.status().phase, 'READY')
-  const durable = structuredClone(c.storage.disk)
-  await assert.rejects(c.authority.callback(), errorCode('STATE_COMMIT_UNCERTAIN'))
-  await quarantined(c)
-  assert.equal(c.storage.count('recoverLost'), 1)
-  assert.equal(c.storage.count('commit'), 1)
-  assert.deepEqual(c.storage.disk, durable)
-})
-for (const stage of ['load', 'publishGeneration']) {
-  test('retained LOST recovery callback during reload ' + stage + ' leaves invalidation sticky', async () => {
-    const c = recoveryFixture({ initialState: seed(42) })
-    assert.equal((await bounded(c.manager.load())).kind, 'READY')
-    assert.equal(c.authority.held, false)
-    c.storage.disk = diskState(seed(88))
-    const gate = c.storage.hold(stage)
-    const reloading = c.manager.reloadAfterExternalWrite('APP_RESUME')
-    const outcome = observe(reloading)
-    await tick(80)
-    const graph = c.manager.getWorkingState()
-    const snapshot = c.manager.committedSnapshot()
-    const generation = c.manager.status().vmGeneration
-    try {
-      assert.equal(c.storage.count('load'), 2)
-      assert.equal(c.storage.count('publishGeneration'), stage === 'load' ? 0 : 1)
-      assert.equal(c.storage.active, 1)
-      assert.equal(outcome.settled, false)
-      await assert.rejects(c.authority.callback(), errorCode('STATE_COMMIT_UNCERTAIN'))
-      assert.equal(c.manager.status().phase, 'FAULTED')
-      for (const commitClass of ['IMMEDIATE', 'VOLATILE', 'THROTTLED']) {
-        fails(() => c.manager.beginTurn(commitClass), 'STATE_UNAVAILABLE')
-      }
-      fails(() => c.manager.publishGeneration(), 'STATE_UNAVAILABLE')
-      fails(() => c.manager.captureWorkingSnapshot(), 'STATE_UNAVAILABLE')
-      assert.equal(c.storage.count('close'), 0)
-      assert.equal(c.storage.active, 1)
-      assert.equal(outcome.settled, false)
-    } finally { gate.resolve() }
-    const result = await bounded(reloading)
-    assert.equal(result.status, 'FAULTED')
-    if (stage === 'load') {
-      assert.deepEqual(result.load, { kind: 'UNAVAILABLE', code: 'STATE_UNAVAILABLE', stage: 'load-invalidated' })
-    }
-    assert.equal(c.manager.getWorkingState(), graph)
-    assert.deepEqual(c.manager.committedSnapshot(), snapshot)
-    assert.equal(c.manager.status().vmGeneration, generation)
-    assert.equal(c.storage.count('publishGeneration'), stage === 'load' ? 0 : 1)
-    assert.equal(c.storage.count('commit'), 1)
-    assert.equal(c.storage.count('recoverLost'), 1)
-    assert.equal(c.authority.calls, 1)
-    assert.equal(c.guard.count('begin'), 0)
-    await quarantined(c)
-    fails(() => c.manager.publishGeneration(), 'STATE_UNAVAILABLE')
-    assert.equal(c.manager.status().phase, 'FAULTED')
-    assert.equal(c.storage.active, 0)
-    assert.equal(c.storage.closed, true)
-  })
-}
-test('early recovery authority release drains committed seed without snapshot digest or unauthorized confirming load', async () => {
-  let work
-  let digestAttempts = 0
-  const releaseAuthority = deferred()
-  const c = recoveryFixture({}, async operation => {
-    work = observe(operation())
-    await releaseAuthority.promise
-  })
-  const gate = deferred()
-  c.storage.plan('commit', { gate, after: result => {
-    assert.equal(result.result.status, 'COMMITTED')
-    assert.equal(c.authority.held, false)
-    cryptoHook = stage => {
-      if (stage === 'digest') { digestAttempts++; throw Error('snapshot digest unavailable after authority release') }
-    }
-    return result
-  } })
-  const loading = c.manager.load()
-  const outcome = observe(loading)
-  await tick(80)
-  try {
-    assert.equal(c.storage.count('commit'), 1)
-    assert.equal(c.storage.active, 1)
-    assert.equal(c.authority.held, true)
-    releaseAuthority.resolve()
-    await tick(80)
-    assert.equal(c.authority.held, false)
-    assert.equal(c.manager.status().phase, 'FAULTED')
-    assert.equal(outcome.settled, false)
-    assert.equal(work.settled, false)
-    assert.equal(c.storage.count('close'), 0)
-    assert.equal(c.storage.count('load'), 1)
-    for (const commitClass of ['IMMEDIATE', 'VOLATILE', 'THROTTLED']) {
-      fails(() => c.manager.beginTurn(commitClass), 'STATE_UNAVAILABLE')
-    }
-    fails(() => c.manager.publishGeneration(), 'STATE_UNAVAILABLE')
-  } finally { releaseAuthority.resolve(); gate.resolve() }
-  try {
-    await recoveryFault(c, loading)
-    assert.equal(work.settled, true)
-    assert.equal(work.error.code, 'STATE_COMMIT_UNCERTAIN')
-    assert.equal(digestAttempts, 0, 'invalidated committed continuation must not attempt snapshot confirmation')
-    assert.equal(c.storage.disk.kind, 'READY')
-    assert.equal(c.storage.disk.header.revision, 1)
-    assert.equal(c.storage.count('commit'), 1)
-    assert.equal(c.storage.count('load'), 1, 'snapshot failure must not trigger a confirming load outside authority')
-    assert.deepEqual(c.storage.ownership.filter(([kind]) => kind === 'load'), [['load', false]])
-    assert.equal(c.storage.count('publishGeneration'), 0)
-    assert.equal(c.storage.active, 0)
-    assert.equal(c.storage.closed, true)
-    assert.equal(c.guard.count('begin'), 0)
-    fails(() => c.manager.publishGeneration(), 'STATE_UNAVAILABLE')
-  } finally { cryptoHook = null }
-})
-test('authorized initial LOST holds authority through quarantine, generation publication and durable seed confirmation', async () => {
-  const initialState = seed(42)
-  const c = recoveryFixture({ initialState, vmGeneration: 5 })
-  c.authority.waitRelease = true
-  const recoveryGate = c.storage.hold('recoverLost')
-  const commitGate = c.storage.hold('commit')
-  const loading = c.manager.load()
-  const outcome = observe(loading)
+test('opted-in initial LOST waits for actor reset and never persists placeholder before ordinary INIT transaction', async () => {
+  const placeholder = seed(42)
+  placeholder.fields.set('self', placeholder)
+  const c = recoveryFixture({ initialState: placeholder, vmGeneration: 5 })
+  const lost = structuredClone(c.storage.disk)
+  const loaded = await c.manager.load()
+  assertLoadMetadata(loaded, lost)
+  loaded.kind = 'ABSENT'
+  assert.equal(c.manager.status().phase, 'STARTING')
+  assert.equal(c.manager.status().dirty, false)
+  assert.equal(c.storage.count('recoverLost'), 0)
+  assert.equal(c.reservation.calls, 0)
+  recoveryAdmissionDenied(c)
+  await assert.rejects(c.manager.awaitReadyForImmediate(), errorCode('STATE_NOT_READY'))
+  await assert.rejects(c.manager.finalSave(), errorCode('STATE_NOT_READY'))
+  const gate = c.storage.hold('recoverLost')
+  const recovering = c.reservation.run(() => c.manager.recoverLost())
+  const outcome = observe(recovering)
   const idle = observe(c.manager.whenIdle())
   const immediate = observe(c.manager.awaitReadyForImmediate())
   try {
     await tick()
-    assert.equal(c.authority.calls, 1)
-    assert.equal(c.authority.held, true)
-    assert.equal(c.storage.count('recoverLost'), 1)
-    assert.equal(c.storage.count('commit'), 0)
-    recoveryAdmissionDenied(c)
-    recoveryGate.resolve()
-    await tick(60)
-    assert.equal(c.storage.quarantine.length, 1)
-    assert.equal(c.storage.disk.kind, 'ABSENT')
-    assert.equal(c.storage.count('publishGeneration'), 0)
-    assert.equal(c.storage.count('commit'), 1)
-    assert.equal(c.manager.status().vmGeneration, 1)
-    assert.equal(c.manager.status().baseRevision, 0)
-    assert.equal(c.manager.committedSnapshot(), null)
-    assert.equal(c.authority.held, true)
-    recoveryAdmissionDenied(c)
-    const request = c.storage.calls.find(call => call.kind === 'commit').input
-    assert.deepEqual(request.pre, { appId: APP, vmGeneration: 1, baseRevision: 0 })
-    assert.equal(encodedN(Buffer.from(request.payload).toString('utf8')), 42)
+    assert.equal(c.reservation.held, true)
+    assert.equal(c.manager.status().pendingOperations, 1)
+    assert.equal(c.storage.active, 1)
     assert.equal(outcome.settled, false)
     assert.equal(idle.settled, false)
     assert.equal(immediate.settled, false)
-    commitGate.resolve()
-    await tick(80)
-    assert.equal(c.storage.disk.kind, 'READY')
-    assert.equal(c.storage.disk.header.revision, 1)
-    assert.equal(encodedN(c.storage.disk.encodedState), 42)
-    assert.equal(c.manager.committedSnapshot().version.revision, 1)
-    assert.equal(c.manager.status().dirty, false)
-    assert.equal(c.authority.held, true, 'authority remains held after durable initialization until wrapper release')
-    assert.equal(outcome.settled, false)
+    fails(() => c.manager.recoverLost(), 'STATE_TURN_PENDING')
     recoveryAdmissionDenied(c)
-  } finally {
-    recoveryGate.resolve()
-    commitGate.resolve()
-    c.authority.release.resolve()
-  }
-  const loaded = await bounded(loading)
-  assertLoadMetadata(loaded, c.storage.disk)
-  assert.equal(c.authority.held, false)
+    assert.equal(c.storage.count('commit'), 0)
+    assert.equal(c.storage.count('publishGeneration'), 0)
+  } finally { gate.resolve() }
+  assertLoadMetadata(await bounded(recovering), { kind: 'ABSENT' })
   await bounded(c.manager.whenIdle())
-  assert.equal(idle.settled, true)
-  assert.equal(immediate.settled, true)
-  assert.equal(immediate.error, null)
-  assert.equal(c.manager.getWorkingState(), initialState)
-  assert.equal(c.manager.status().phase, 'READY')
-  assert.deepEqual(c.storage.ownership.filter(([kind]) => ['recoverLost', 'commit', 'publishGeneration'].includes(kind)),
-    [['recoverLost', true], ['commit', true]])
-  assert.equal((await c.manager.publishGeneration()).reason, 'CLEAN')
+  await tick()
+  assert.equal(immediate.error.code, 'STATE_NOT_READY')
+  assert.equal(c.reservation.held, false)
+  assert.equal(c.storage.quarantine.length, 1)
+  assert.equal(c.storage.disk.kind, 'ABSENT')
+  assert.equal(c.manager.getWorkingState(), placeholder)
+  assert.equal(c.manager.committedSnapshot(), null)
+  assert.equal(c.manager.status().phase, 'STARTING')
+  assert.equal(c.manager.status().dirty, false)
+  assert.equal(c.manager.status().vmGeneration, 5)
+  assert.equal(c.manager.status().baseRevision, 0)
+  fails(() => c.manager.recoverLost(), 'STATE_NOT_READY')
+  fails(() => c.manager.beginTurn('IMMEDIATE', 'INIT'), 'STATE_NOT_READY')
+  assert.equal(c.storage.count('commit'), 0)
+  assert.equal(c.storage.count('publishGeneration'), 0)
+  assert.equal((await c.manager.publishGeneration()).reason, 'ABSENT')
   assert.equal((await c.manager.finalSave()).reason, 'CLEAN')
+  assert.equal(c.storage.disk.kind, 'ABSENT')
+  assert.equal(c.storage.count('commit'), 0)
+  const tx = c.manager.beginTurn('VOLATILE', 'INIT')
+  const initialized = seed(99)
+  c.manager.setWorkingState(tx, initialized)
+  assert.equal((await c.manager.commitTurn(tx)).status, 'COMMITTED')
+  assert.equal(c.manager.getWorkingState(), initialized)
+  assert.equal(encodedN(c.storage.disk.encodedState), 99)
+  assert.equal(encodedN(c.manager.committedSnapshot().encoded), 99)
   assert.equal(c.storage.count('commit'), 1)
-  const tx = c.manager.beginTurn('VOLATILE')
-  c.manager.rollbackTurn(tx)
+  assert.equal(c.storage.count('load'), 1)
+  assert.equal(c.storage.maxActive, 1)
+  assert.deepEqual(c.storage.calls.find(call => call.kind === 'commit').input.pre,
+    { appId: APP, vmGeneration: 1, baseRevision: 0 })
+  assert.deepEqual(c.storage.ownership.filter(([kind]) => ['recoverLost', 'commit', 'publishGeneration'].includes(kind)),
+    [['recoverLost', true], ['commit', false]])
+  fails(() => c.manager.recoverLost(), 'STATE_NOT_READY')
 })
 for (const variant of ['MAIN', 'BAK', 'LEGACY', 'MISMATCH']) {
-  test('LOST recheck restored valid ' + variant + ' wins without quarantine or seed overwrite', async () => {
+  test('explicit LOST reset recheck restored valid ' + variant + ' wins without quarantine or placeholder overwrite', async () => {
     const restored = diskState(seed(88), { source: variant === 'BAK' ? 'BAK' : 'MAIN',
       format: variant === 'LEGACY' ? 'LEGACY' : 'FORMAT2', stamp: variant === 'MISMATCH' ? 'old-stamp' : STAMP })
-    const c = recoveryFixture({ initialState: seed(42) }, async operation => {
+    const c = recoveryFixture({ initialState: seed(42) })
+    assert.equal((await c.manager.load()).kind, 'LOST')
+    await c.reservation.run(async () => {
       c.storage.disk = structuredClone(restored)
-      await operation()
+      assertLoadMetadata(await c.manager.recoverLost(), restored)
     })
-    assertLoadMetadata(await bounded(c.manager.load()), restored)
-    assert.equal(c.authority.calls, 1)
     assert.equal(c.storage.count('recoverLost'), 1)
     assert.equal(c.storage.quarantine.length, 0)
     assert.equal(c.storage.count('commit'), 0)
     assert.equal(c.storage.count('publishGeneration'), 0)
     assert.deepEqual(c.storage.disk, restored)
     assert.equal(c.manager.status().phase, 'STARTING')
+    assert.equal(c.manager.status().dirty, false)
     fails(() => c.manager.beginTurn('VOLATILE'), 'STATE_NOT_READY')
+    fails(() => c.manager.recoverLost(), 'STATE_NOT_READY')
     assert.equal(get(c.manager), variant === 'MISMATCH' ? 42 : 88)
     assert.equal((await c.manager.publishGeneration()).status, 'COMMITTED')
     assert.equal(c.storage.count('commit'), 0)
     assert.equal(c.storage.disk.encodedState, restored.encodedState)
     assert.equal(c.storage.disk.stamp, restored.stamp)
+    const tx = c.manager.beginTurn('IMMEDIATE', 'INIT')
+    c.manager.setWorkingState(tx, seed(88))
+    const result = await c.manager.commitTurn(tx)
+    assert.equal(result.status, variant === 'MISMATCH' ? 'COMMITTED' : 'UNCHANGED')
+    if (variant !== 'MISMATCH') assert.equal(result.reason, 'INIT_EQUAL')
+    assert.equal(c.storage.count('commit'), variant === 'MISMATCH' ? 1 : 0)
   })
 }
-for (const missing of ['AUTHORITY', 'CAPABILITY']) {
-  test('initial LOST without ' + missing + ' fails closed without resetting', async () => {
-    const c = recoveryFixture(missing === 'AUTHORITY' ? { lostRecoveryAuthority: undefined } : {})
-    if (missing === 'CAPABILITY') c.storage.recoverLost = undefined
+for (const optin of [undefined, false]) {
+  test('initial LOST without opt-in ' + optin + ' fails closed without resetting', async () => {
+    const c = recoveryFixture({ allowInitialLostRecovery: optin })
     assert.equal((await c.manager.load()).kind, 'LOST')
-    assert.equal(c.authority.calls, 0)
+    fails(() => c.manager.recoverLost(), 'STATE_UNAVAILABLE')
     assert.equal(c.storage.count('recoverLost'), 0)
     assert.equal(c.storage.count('commit'), 0)
     assert.equal(c.storage.disk.kind, 'LOST')
     await quarantined(c)
   })
 }
-for (const pathName of ['PRESERVE', 'RELOAD', 'RESUME', 'PROMOTION', 'PROMOTION_RETRY']) {
-  test('authorized ' + pathName + ' LOST never invokes destructive reset', async () => {
+test('opted-in initial LOST without storage capability remains blocked and reset cannot retry', async () => {
+  const c = recoveryFixture()
+  c.storage.recoverLost = undefined
+  assert.equal((await c.manager.load()).kind, 'LOST')
+  recoveryAdmissionDenied(c)
+  const result = await c.reservation.run(() => c.manager.recoverLost())
+  assert.deepEqual(result, { kind: 'UNAVAILABLE', code: 'STATE_RECOVERY_FAILED', stage: 'lost-capability' })
+  assert.equal(c.manager.status().phase, 'RELOAD_PENDING')
+  fails(() => c.manager.recoverLost(), 'STATE_NOT_READY')
+  fails(() => c.manager.publishGeneration(), 'STATE_TURN_PENDING')
+  assert.equal(c.storage.count('recoverLost'), 0)
+  assert.equal(c.storage.count('commit'), 0)
+})
+for (const pathName of ['PRESERVE', 'RELOAD', 'RESUME', 'PROMOTION', 'PROMOTION_RETRY', 'INITIAL_RETRY']) {
+  test('opted-in ' + pathName + ' LOST never enables destructive reset', async () => {
     const c = recoveryFixture({ mode: pathName.startsWith('PROMOTION') ? 'LIVE_EPHEMERAL' : 'LIVE_PERSISTENT' })
     let result
     if (pathName === 'PRESERVE') result = await c.manager.load(true)
-    else {
+    else if (pathName === 'INITIAL_RETRY') {
+      c.storage.plan('load', { result: { kind: 'UNAVAILABLE', code: 'STATE_READ_FAILED' } })
+      await c.manager.load()
+      result = await c.manager.checkOnResume()
+    } else {
       if (!pathName.startsWith('PROMOTION')) c.storage.disk = diskState()
       await c.manager.load()
       if (!pathName.startsWith('PROMOTION')) await c.manager.publishGeneration()
@@ -1828,7 +1711,8 @@ for (const pathName of ['PRESERVE', 'RELOAD', 'RESUME', 'PROMOTION', 'PROMOTION_
       else result = await c.manager.reloadAfterExternalWrite('APP_RESUME')
     }
     assert.equal(['PRESERVE', 'PROMOTION'].includes(pathName) ? result.kind : result.reason, 'LOST')
-    assert.equal(c.authority.calls, 0)
+    fails(() => c.manager.recoverLost(), 'STATE_UNAVAILABLE')
+    assert.equal(c.reservation.calls, 0)
     assert.equal(c.storage.count('recoverLost'), 0)
     assert.equal(c.storage.quarantine.length, 0)
     assert.equal(c.storage.count('commit'), 0)
@@ -1837,19 +1721,20 @@ for (const pathName of ['PRESERVE', 'RELOAD', 'RESUME', 'PROMOTION', 'PROMOTION_
   })
 }
 for (const code of ['STATE_READ_FAILED', 'STATE_LOCK_UNAVAILABLE', 'STATE_COMMIT_UNCERTAIN']) {
-  test('initial unavailable ' + code + ' never invokes authorized reset', async () => {
+  test('initial unavailable ' + code + ' never enables explicit reset', async () => {
     const c = recoveryFixture()
     c.storage.disk = { kind: 'UNAVAILABLE', code, stage: 'initial-read' }
     assert.equal((await c.manager.load()).code, code)
-    assert.equal(c.authority.calls, 0)
+    fails(() => c.manager.recoverLost(), code === 'STATE_COMMIT_UNCERTAIN' ? 'STATE_UNAVAILABLE' : 'STATE_NOT_READY')
     assert.equal(c.storage.count('recoverLost'), 0)
     assert.equal(c.storage.count('commit'), 0)
     assert.equal(c.manager.status().phase, code === 'STATE_COMMIT_UNCERTAIN' ? 'FAULTED' : 'RELOAD_PENDING')
   })
 }
 for (const failure of ['LOST', 'UNAVAILABLE', 'PARTIAL_RESET', 'THROW', 'BAD_READY']) {
-  test('authorized recovery ' + failure + ' faults without publishing or seeding', async () => {
+  test('explicit LOST reset ' + failure + ' fails closed without publishing or seeding', async () => {
     const c = recoveryFixture()
+    assert.equal((await c.manager.load()).kind, 'LOST')
     if (failure === 'THROW') c.storage.plan('recoverLost', { error: Error('reset worker lost') })
     else if (failure === 'PARTIAL_RESET') c.storage.plan('recoverLost', { result: () => {
       c.storage.quarantine.push(structuredClone(c.storage.disk))
@@ -1860,103 +1745,113 @@ for (const failure of ['LOST', 'UNAVAILABLE', 'PARTIAL_RESET', 'THROW', 'BAD_REA
       const bad = diskState()
       bad.encodedState = '["bad"]'
       c.storage.plan('recoverLost', { result: bad })
-    } else c.storage.plan('recoverLost', { result: { kind: failure, code: 'STATE_RECOVERY_FAILED' } })
-    await recoveryFault(c, c.manager.load())
+    } else c.storage.plan('recoverLost', { result: { kind: failure, code: 'STATE_RECOVERY_FAILED', stage: 'lost-reset' } })
+    const result = await c.reservation.run(() => c.manager.recoverLost())
+    assert.equal(c.manager.committedSnapshot(), null)
     assert.equal(c.storage.count('recoverLost'), 1)
     assert.equal(c.storage.count('commit'), 0)
     assert.equal(c.storage.count('publishGeneration'), 0)
     assert.equal(c.storage.quarantine.length, failure === 'PARTIAL_RESET' ? 1 : 0)
+    if (failure === 'UNAVAILABLE') {
+      assert.deepEqual(result, { kind: 'UNAVAILABLE', code: 'STATE_RECOVERY_FAILED', stage: 'lost-reset' })
+      assert.equal(c.manager.status().phase, 'RELOAD_PENDING')
+      fails(() => c.manager.beginTurn('IMMEDIATE'), 'STATE_NOT_READY')
+      fails(() => c.manager.recoverLost(), 'STATE_NOT_READY')
+      c.storage.disk = { kind: 'LOST', code: 'STATE_CORRUPTED' }
+      assert.equal((await c.manager.checkOnResume()).reason, 'LOST')
+    } else {
+      assert.equal(result.kind, failure === 'LOST' ? 'LOST' : 'UNAVAILABLE')
+      if (['THROW', 'PARTIAL_RESET'].includes(failure)) assert.equal(result.code, 'STATE_COMMIT_UNCERTAIN')
+      if (failure === 'BAD_READY') assert.equal(result.code, 'STATE_CORRUPTED')
+    }
+    fails(() => c.manager.recoverLost(), 'STATE_UNAVAILABLE')
+    await quarantined(c)
   })
 }
-for (const result of [refusal('STATE_WRITE_FAILED'), refusal('STATE_TASK_SUBMIT_FAILED'),
-  { status: 'STALE' }, { status: 'STALE_REVISION' }, { status: 'FENCED_COMMIT' }, uncertain()]) {
-  test('recovery seed refusal ' + (result.code || result.status) + ' prevents readiness and never retries', async () => {
-    const c = recoveryFixture()
-    c.storage.plan('commit', reply(result))
-    await recoveryFault(c, c.manager.load())
-    assert.equal(c.storage.count('commit'), 1)
-    assert.equal(c.storage.count('load'), 1)
-    assert.equal(c.storage.disk.kind, 'ABSENT')
-    assert.equal(c.manager.status().transientFailures, 0)
-    assert.deepEqual(c.storage.ownership.filter(([kind]) => kind === 'commit'), [['commit', true]])
-  })
-}
-for (const failure of ['SIZE', 'SERIALIZE', 'WORKER', 'CORRELATION', 'SNAPSHOT']) {
-  test('recovery seed ' + failure + ' failure cannot admit runtime', async () => {
-    const c = recoveryFixture(failure === 'SIZE' ? { stateMaxBytes: 1 } : {})
-    if (failure === 'SERIALIZE') c.manager.getWorkingState().fields.set('self', c.manager.getWorkingState())
-    if (failure === 'WORKER') c.storage.plan('commit', { error: Error('seed worker lost') })
-    if (failure === 'CORRELATION') c.storage.plan('commit', { result: {
-      operationId: 'wrong', result: { status: 'COMMITTED', revision: 1, backup: 'SKIPPED' }
-    } })
-    if (failure === 'SNAPSHOT') c.storage.plan('commit', { after: result => {
-      cryptoHook = stage => { if (stage === 'create') { cryptoHook = null; throw Error('snapshot unavailable') } }
-      c.storage.plan('load', { result: { kind: 'UNAVAILABLE', code: 'STATE_READ_FAILED' } })
-      return result
-    } })
-    await recoveryFault(c, c.manager.load())
-    assert.equal(c.storage.count('commit'), ['SIZE', 'SERIALIZE'].includes(failure) ? 0 : 1)
-  })
-}
-for (const failure of ['THROW_BEFORE', 'NO_CALLBACK', 'THROW_AFTER', 'REPEAT_SERIAL', 'REPEAT_CONCURRENT']) {
-  test('recovery authority ' + failure + ' fails closed and callback executes at most once', async () => {
-    const c = recoveryFixture({}, async operation => {
-      if (failure === 'THROW_BEFORE') throw Error('authority unavailable')
-      if (failure === 'NO_CALLBACK') return
-      if (failure === 'REPEAT_CONCURRENT') {
-        const first = observe(operation())
-        await assert.rejects(operation(), errorCode('STATE_COMMIT_UNCERTAIN'))
-        await tick(60)
-        assert.equal(first.settled, true)
-        return
-      }
-      await operation()
-      if (failure === 'THROW_AFTER') throw Error('authority release failed')
-      await assert.rejects(operation(), errorCode('STATE_COMMIT_UNCERTAIN'))
-    })
-    await recoveryFault(c, c.manager.load())
-    assert.equal(c.storage.count('recoverLost'), ['THROW_BEFORE', 'NO_CALLBACK'].includes(failure) ? 0 : 1)
-    assert(c.storage.count('commit') <= 1)
-    assert.equal(c.authority.calls, 1)
-  })
-}
-for (const stage of ['RESET', 'SEED']) {
-  test('authority returns before ' + stage + ' finishes: faults, drains callback and never admits', async () => {
-    let work
-    const releaseAuthority = deferred()
-    const c = recoveryFixture({}, async operation => {
-      work = observe(operation())
-      if (stage === 'SEED') await releaseAuthority.promise
-    })
-    const gate = c.storage.hold(stage === 'RESET' ? 'recoverLost' : 'commit')
-    const loading = c.manager.load()
-    const outcome = observe(loading)
-    await tick(80)
-    releaseAuthority.resolve()
-    await tick(80)
-    try {
-      assert.equal(c.authority.held, false)
-      assert.equal(c.manager.status().phase, 'FAULTED')
-      assert.equal(outcome.settled, false, 'load must drain outstanding callback before settling')
-      fails(() => c.manager.beginTurn('VOLATILE'), 'STATE_UNAVAILABLE')
-      assert.equal(c.storage.count('close'), 0)
-    } finally { gate.resolve() }
-    await recoveryFault(c, loading)
-    assert.equal(work.settled, true)
-    assert.equal(c.storage.count('commit'), stage === 'RESET' ? 0 : 1)
-    assert.equal(c.storage.active, 0)
-    assert.equal(c.storage.closed, true)
-  })
-}
-test('authority callback invoked after wrapper returned cannot reset or revive a faulted manager', async () => {
-  const c = recoveryFixture({}, async () => {})
-  await recoveryFault(c, c.manager.load())
-  await assert.rejects(c.authority.callback(), errorCode('STATE_COMMIT_UNCERTAIN'))
-  await bounded(c.manager.whenIdle())
-  assert.equal(c.storage.count('recoverLost'), 0)
-  assert.equal(c.storage.count('commit'), 0)
-  assert.equal(c.manager.status().phase, 'FAULTED')
+test('initial LOST reset cannot start while initial load is pending', async () => {
+  const c = recoveryFixture()
+  const gate = c.storage.hold('load')
+  const loading = c.manager.load()
+  try {
+    await tick()
+    fails(() => c.manager.recoverLost(), 'STATE_TURN_PENDING')
+    assert.equal(c.storage.count('recoverLost'), 0)
+  } finally { gate.resolve() }
+  assert.equal((await bounded(loading)).kind, 'LOST')
+  assert.equal((await c.reservation.run(() => c.manager.recoverLost())).kind, 'ABSENT')
+  assert.equal(c.storage.maxActive, 1)
 })
+test('explicit LOST reset unavailable result reloads valid state without retrying reset or committing placeholder', async () => {
+  const c = recoveryFixture({ initialState: seed(42) })
+  await c.manager.load()
+  c.storage.plan('recoverLost', { result: { kind: 'UNAVAILABLE', code: 'STATE_LOCK_UNAVAILABLE', stage: 'lost-lock' } })
+  assert.equal((await c.reservation.run(() => c.manager.recoverLost())).code, 'STATE_LOCK_UNAVAILABLE')
+  assert.equal(c.manager.status().phase, 'RELOAD_PENDING')
+  fails(() => c.manager.recoverLost(), 'STATE_NOT_READY')
+  c.storage.disk = diskState(seed(88))
+  assert.equal((await c.manager.checkOnResume()).status, 'RELOADED')
+  assert.equal(get(c.manager), 88)
+  assert.equal(c.storage.count('recoverLost'), 1)
+  assert.equal(c.storage.count('commit'), 0)
+  fails(() => c.manager.recoverLost(), 'STATE_NOT_READY')
+})
+test('explicit LOST reset followed by later resume LOST never permits another reset', async () => {
+  const c = recoveryFixture()
+  await c.manager.load()
+  await c.reservation.run(() => c.manager.recoverLost())
+  await c.manager.publishGeneration()
+  await turn(c, 99, 'IMMEDIATE', 'INIT')
+  c.storage.disk = { kind: 'LOST', code: 'STATE_CORRUPTED' }
+  assert.equal((await c.manager.checkOnResume()).reason, 'LOST')
+  fails(() => c.manager.recoverLost(), 'STATE_UNAVAILABLE')
+  assert.equal(c.storage.count('recoverLost'), 1)
+  assert.equal(c.storage.count('commit'), 1)
+  await quarantined(c)
+})
+test('explicit LOST reset uncertain ordinary INIT commit faults without reset retry or placeholder persistence', async () => {
+  const c = recoveryFixture({ initialState: seed(42) })
+  await c.manager.load()
+  await c.reservation.run(() => c.manager.recoverLost())
+  await c.manager.publishGeneration()
+  c.storage.plan('commit', reply(uncertain()))
+  const tx = c.manager.beginTurn('IMMEDIATE', 'INIT')
+  c.manager.setWorkingState(tx, seed(99))
+  assert.equal((await c.manager.commitTurn(tx)).status, 'COMMIT_UNCERTAIN')
+  assert.equal(c.storage.count('recoverLost'), 1)
+  assert.equal(c.storage.count('commit'), 1)
+  assert.equal(c.storage.disk.kind, 'ABSENT')
+  assert.equal(encodedN(Buffer.from(c.storage.calls.find(call => call.kind === 'commit').input.payload).toString('utf8')), 99)
+  fails(() => c.manager.recoverLost(), 'STATE_UNAVAILABLE')
+  await quarantined(c)
+})
+for (const stage of ['BEFORE', 'DURING']) {
+  test('explicit LOST reset close ' + stage + ' refuses new reset and drains queued storage', async () => {
+    const c = recoveryFixture()
+    await c.manager.load()
+    let gate, recovering
+    if (stage === 'DURING') {
+      gate = c.storage.hold('recoverLost')
+      recovering = c.reservation.run(() => c.manager.recoverLost())
+      await tick()
+    }
+    const closing = c.manager.close()
+    fails(() => c.manager.recoverLost(), 'STATE_UNAVAILABLE')
+    if (gate) {
+      await tick()
+      assert.equal(c.storage.count('close'), 0)
+      assert.equal(c.storage.active, 1)
+      gate.resolve()
+      assert.equal((await bounded(recovering)).kind, 'ABSENT')
+    }
+    await bounded(closing)
+    fails(() => c.manager.recoverLost(), 'STATE_UNAVAILABLE')
+    assert.equal(c.manager.status().phase, 'CLOSED')
+    assert.equal(c.storage.count('recoverLost'), stage === 'DURING' ? 1 : 0)
+    assert.equal(c.storage.count('commit'), 0)
+    assert.equal(c.storage.count('close'), 1)
+    assert.equal(c.storage.active, 0)
+  })
+}
 
 test('APP_RESUME unchanged header preserves dirty graph, age, seq and committed snapshot', async () => {
   const c = await ready({ disk: diskState() })

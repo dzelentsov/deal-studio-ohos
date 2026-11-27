@@ -710,6 +710,281 @@ for (const target of atomicTargets) {
   }
 }
 
+function deferred() {
+  let resolve, reject
+  const promise = new Promise((done, fail) => { resolve = done; reject = fail })
+  return {promise, resolve, reject}
+}
+
+const recoveryTick = () => new Promise(resolve => setImmediate(resolve))
+
+function recoveryLifecycle(f, options = {}) {
+  const events = []
+  const unregister = f.store.registerStateLifecycle({
+    fenceAllAdmissions() {
+      events.push('removal-fence')
+      return {
+        async quiesceActorsAndFinalSave() { events.push('removal-quiesce') },
+        async drainAllCallersAndStorage() { events.push('removal-drain') },
+        release(outcome) { events.push(outcome) }
+      }
+    },
+    fenceRecoveryAdmissions(appId, owner) {
+      events.push(['recovery-fence', appId, owner])
+      if (options.fenceError) throw options.fenceError
+      return {
+        async drainOtherActorsAndStorage() {
+          events.push('recovery-drain')
+          if (options.drain) await options.drain()
+        },
+        release() {
+          events.push('recovery-release')
+          if (options.releaseError) throw options.releaseError
+        }
+      }
+    }
+  })
+  return {events, unregister}
+}
+
+check('recovery excludes only its tracked activation and drains every other caller before completion', async () => {
+  const f = fixture(), writer = deferred(), reader = deferred(), host = deferred(), finish = deferred()
+  const lifecycle = recoveryLifecycle(f, {drain: () => host.promise})
+  const writing = f.store.trackStateOperation('target/v0', () => writer.promise)
+  const reading = f.store.trackStateOperation('target/v0', () => reader.promise)
+  let entered = false, token, scope
+  const activation = f.store.trackStateActivation('target/v0', async owner => {
+    token = owner
+    return f.store.withExclusiveStateRecovery('target/v0', owner, async recovery => {
+      entered = true
+      scope = recovery
+      await finish.promise
+      recovery.complete()
+      return 42
+    })
+  })
+  assert.deepEqual(lifecycle.events[0], ['recovery-fence', 'target/v0', token])
+  assert.throws(() => f.store.assertStateAdmission('target/v0'), /fenced/)
+  let admitted = false
+  await assert.rejects(f.store.trackStateOperation('target/v0', async () => { admitted = true }), /fenced/)
+  await assert.rejects(f.store.trackStateActivation('target/v0', async () => { admitted = true }), /fenced/)
+  await assert.rejects(f.store.loadState('target', 'v0', 'stamp'), /fenced/)
+  await assert.rejects(f.store.clearState('target', 'v0'), /fenced/)
+  await assert.rejects(f.store.deleteVersion('target', 'v1'), /fenced/)
+  await assert.rejects(f.store.deleteProject('target'), /fenced/)
+  assert.equal(admitted, false)
+  assert.equal(await f.store.trackStateOperation('target/v1', async () => 'other version'), 'other version')
+  assert.equal(await f.store.trackStateOperation('target-copy/v0', async () => 'other project'), 'other project')
+  writer.resolve(); host.resolve()
+  await Promise.all([writing, host.promise]); await recoveryTick()
+  assert.equal(entered, false, 'Every non-owner caller must drain')
+  reader.resolve(); await reading; await recoveryTick()
+  assert.equal(entered, true, 'The owner pending promise must not be awaited')
+  assert.throws(() => f.store.assertStateAdmission('target/v0'), /fenced/)
+  finish.resolve()
+  assert.equal(await activation, 42)
+  assert.equal(lifecycle.events.at(-1), 'recovery-release')
+  f.store.assertStateAdmission('target/v0')
+  assert.throws(() => scope.complete(), /closed/)
+  assert.deepEqual(mutations(f), [])
+})
+
+check('recovery drains migration loads, headers, and initial-state publication as non-owner operations', async () => {
+  const {ProjectStateMigration} = load('ProjectStateMigration', {}, console)
+  const loading = deferred(), header = deferred(), initial = deferred(), events = []
+  const version = {projectId: 'target', id: 'v0'}
+  const migration = new ProjectStateMigration({
+    prepareVersion: () => version,
+    publishVersion: () => events.push('publish')
+  }, {load: () => loading.promise, readHeader: () => header.promise}, {
+    acceptInitialState: () => initial.promise
+  }, {
+    fenceAllAdmissions() { assert.fail('No removal') },
+    fenceRecoveryAdmissions() { return {async drainOtherActorsAndStorage() {}, release() { events.push('release') }} }
+  }, {async removeStateFilesKeepingStableLocks() { assert.fail('No cleanup') }})
+  const loadState = migration.loadStateResult('target', 'v0', 'stamp')
+  const readHeader = migration.readHeader('target', 'v0')
+  const creating = migration.createVersion({projectId: 'target', initialState: '["n",1]', initialStamp: 'stamp'})
+  const activation = migration.trackStateActivation('target/v0', owner =>
+    migration.withExclusiveStateRecovery('target/v0', owner, async scope => { events.push('recover'); scope.complete() }))
+  loading.resolve({kind: 'ABSENT'}); header.resolve(null)
+  await Promise.all([loadState, readHeader]); await recoveryTick()
+  assert.deepEqual(events, [])
+  initial.resolve({status: 'COMMITTED'})
+  await Promise.all([creating, activation])
+  assert.deepEqual(events, ['publish', 'recover', 'release'])
+})
+
+check('activation reservation rejects competing uninitialized actors without waiting and allows reuse after settlement', async () => {
+  const f = fixture(), gate = deferred()
+  let firstToken, competing = false
+  const activation = f.store.trackStateActivation('target/v0', owner => {
+    firstToken = owner
+    return gate.promise
+  })
+  await assert.rejects(f.store.trackStateActivation('target/v0', async () => { competing = true }), /already pending/)
+  assert.equal(competing, false)
+  assert.equal(await f.store.trackStateActivation('target/v1', async () => 2), 2)
+  gate.resolve(); await activation; await recoveryTick()
+  await f.store.trackStateActivation('target/v0', async owner => {
+    assert.notStrictEqual(owner, firstToken)
+    return f.store.withExclusiveStateRecovery('target/v0', owner, async scope => { scope.complete() })
+  })
+  f.store.assertStateAdmission('target/v0')
+})
+
+check('recovery rejects fabricated, cross-app, stale, and foreign-authority tokens without fencing', async () => {
+  const f = fixture(), gate = deferred()
+  let token
+  const activation = f.store.trackStateActivation('target/v0', owner => { token = owner; return gate.promise })
+  let entered = false
+  const operation = async scope => { entered = true; scope.complete() }
+  await assert.rejects(f.store.withExclusiveStateRecovery('target/v0', {}, operation), /Invalid.*owner/)
+  await assert.rejects(f.store.withExclusiveStateRecovery('target/v1', token, operation), /Invalid.*owner/)
+  const {ProjectStore} = load('ProjectStore', {'@kit.CoreFileKit': {fileIo: f.disk}, '@kit.BasicServicesKit': {}}, console)
+  const foreign = new ProjectStore(); foreign.init('/foreign/files')
+  await assert.rejects(foreign.withExclusiveStateRecovery('target/v0', token, operation), /Invalid.*owner/)
+  gate.resolve(); await activation; await recoveryTick()
+  await assert.rejects(f.store.withExclusiveStateRecovery('target/v0', token, operation), /Invalid.*owner/)
+  f.store.assertStateAdmission('target/v0')
+  f.store.assertStateAdmission('target/v1')
+  assert.equal(entered, false)
+})
+
+check('recovery owner is single-use even while its activation remains pending', async () => {
+  const f = fixture()
+  await f.store.trackStateActivation('target/v0', async owner => {
+    await f.store.withExclusiveStateRecovery('target/v0', owner, async scope => { scope.complete() })
+    await assert.rejects(f.store.withExclusiveStateRecovery('target/v0', owner, async scope => {
+      scope.complete()
+    }), /Invalid.*owner/)
+  })
+  f.store.assertStateAdmission('target/v0')
+})
+
+for (const failure of ['callback', 'completed callback', 'missing completion', 'host drain', 'host release', 'host fence']) {
+  check('recovery remains fenced after ' + failure + ' failure', async () => {
+    const f = fixture(), error = new Error(failure)
+    const lifecycle = recoveryLifecycle(f, {
+      fenceError: failure === 'host fence' ? error : undefined,
+      releaseError: failure === 'host release' ? error : undefined,
+      drain: async () => { if (failure === 'host drain') throw error }
+    })
+    let entered = false
+    const activation = f.store.trackStateActivation('target/v0', owner =>
+      f.store.withExclusiveStateRecovery('target/v0', owner, async scope => {
+        entered = true
+        if (failure !== 'missing completion' && failure !== 'callback') scope.complete()
+        if (failure === 'callback' || failure === 'completed callback') throw error
+      }))
+    await assert.rejects(activation, failure === 'missing completion' ? /completion required/ : caught => caught === error)
+    assert.equal(entered, !['host drain', 'host fence'].includes(failure))
+    assert.throws(() => f.store.assertStateAdmission('target/v0'), /fenced/)
+    await assert.rejects(f.store.clearState('target', 'v0'), /fenced/)
+    await assert.rejects(f.store.deleteProject('target'), /fenced/)
+    await assert.rejects(f.store.deleteVersion('target', 'v1'), /fenced/)
+    assert.equal(lifecycle.events.includes('removal-fence'), false)
+    assert.equal(lifecycle.events.includes('recovery-release'), failure === 'host release')
+    f.store.assertStateAdmission('target/v1')
+    assert.deepEqual(mutations(f), [])
+  })
+}
+
+check('failed non-owner callers still drain all peers and prevent recovery', async () => {
+  const f = fixture(), first = deferred(), second = deferred(), error = new Error('writer failed')
+  const lifecycle = recoveryLifecycle(f)
+  const writer = f.store.trackStateOperation('target/v0', () => first.promise)
+  const rejected = assert.rejects(writer, caught => caught === error)
+  const peer = f.store.trackStateOperation('target/v0', () => second.promise)
+  let entered = false, settled = false
+  const activation = f.store.trackStateActivation('target/v0', owner =>
+    f.store.withExclusiveStateRecovery('target/v0', owner, async scope => { entered = true; scope.complete() }))
+  const recoveryFailed = assert.rejects(activation, caught => caught === error).then(() => { settled = true })
+  first.reject(error); await rejected; await recoveryTick()
+  assert.equal(settled, false)
+  second.resolve(); await peer; await recoveryFailed
+  assert.equal(entered, false)
+  assert.equal(lifecycle.events.includes('recovery-release'), false)
+  assert.throws(() => f.store.assertStateAdmission('target/v0'), /fenced/)
+})
+
+check('missing recovery capability fails closed while all capable hosts fence and drain', async () => {
+  const f = fixture(), first = recoveryLifecycle(f)
+  let removalCalled = false
+  f.store.registerStateLifecycle({fenceAllAdmissions() { removalCalled = true; assert.fail('No removal barrier') }})
+  const second = recoveryLifecycle(f)
+  let entered = false
+  await assert.rejects(f.store.trackStateActivation('target/v0', owner =>
+    f.store.withExclusiveStateRecovery('target/v0', owner, async scope => { entered = true; scope.complete() })), /unsupported/)
+  assert.equal(entered, false)
+  assert.equal(removalCalled, false)
+  for (const host of [first, second]) {
+    assert.equal(host.events[0][0], 'recovery-fence')
+    assert(host.events.includes('recovery-drain'))
+    assert.equal(host.events.includes('recovery-release'), false)
+  }
+  assert.throws(() => f.store.assertStateAdmission('target/v0'), /fenced/)
+})
+
+check('one host drain failure still waits for every other host and never releases', async () => {
+  const f = fixture(), gate = deferred(), error = new Error('host failed')
+  const first = recoveryLifecycle(f, {drain: async () => { throw error }})
+  const second = recoveryLifecycle(f, {drain: () => gate.promise})
+  let settled = false
+  const activation = f.store.trackStateActivation('target/v0', owner =>
+    f.store.withExclusiveStateRecovery('target/v0', owner, async () => { assert.fail('No recovery') }))
+  const failed = assert.rejects(activation, caught => caught === error).then(() => { settled = true })
+  await recoveryTick()
+  assert.equal(settled, false)
+  gate.resolve(); await failed
+  assert.equal(first.events.includes('recovery-release'), false)
+  assert.equal(second.events.includes('recovery-release'), false)
+})
+
+check('partial host release failure leaves authority and later hosts fenced', async () => {
+  const f = fixture(), error = new Error('release failed')
+  const first = recoveryLifecycle(f)
+  const second = recoveryLifecycle(f, {releaseError: error})
+  const third = recoveryLifecycle(f)
+  await assert.rejects(f.store.trackStateActivation('target/v0', owner =>
+    f.store.withExclusiveStateRecovery('target/v0', owner, async scope => { scope.complete() })), caught => caught === error)
+  assert(first.events.includes('recovery-release'))
+  assert(second.events.includes('recovery-release'))
+  assert.equal(third.events.includes('recovery-release'), false)
+  assert.throws(() => f.store.assertStateAdmission('target/v0'), /fenced/)
+})
+
+check('host registration cannot join an active or failed recovery without its fence', async () => {
+  const f = fixture(), gate = deferred()
+  const host = {fenceAllAdmissions() { assert.fail('No removal') }}
+  const activation = f.store.trackStateActivation('target/v0', owner =>
+    f.store.withExclusiveStateRecovery('target/v0', owner, async scope => { await gate.promise; scope.complete() }))
+  assert.throws(() => f.store.registerStateLifecycle(host), /registration fenced/)
+  gate.resolve(); await activation
+  f.store.registerStateLifecycle(host)()
+  await assert.rejects(f.store.trackStateActivation('target/v0', owner =>
+    f.store.withExclusiveStateRecovery('target/v0', owner, async () => {})), /completion required/)
+  assert.throws(() => f.store.registerStateLifecycle(host), /registration fenced/)
+})
+
+for (const removal of ['clearState', 'deleteVersion', 'deleteProject']) {
+  check(removal + ' reserves before recovery and drains the rejected activation without deadlock', async () => {
+    const f = fixture(), gate = deferred()
+    const lifecycle = recoveryLifecycle(f)
+    const activation = f.store.trackStateActivation('target/v0', async owner => {
+      await gate.promise
+      await assert.rejects(f.store.withExclusiveStateRecovery('target/v0', owner, async () => {
+        assert.fail('Removal wins')
+      }), /fenced/)
+    })
+    const removing = f.store[removal]('target', 'v0')
+    assert.equal(lifecycle.events[0], 'removal-fence')
+    gate.resolve(); await activation; await removing
+    assert.equal(lifecycle.events.some(event => Array.isArray(event)), false)
+    assert.equal(lifecycle.events.includes('removal-drain'), true)
+  })
+}
+
 ;(async () => {
   let failed = 0
   for (const {name, run} of checks) {

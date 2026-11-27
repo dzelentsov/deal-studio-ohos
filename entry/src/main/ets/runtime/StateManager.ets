@@ -13,7 +13,7 @@ import {
 } from './StateFormat'
 import type {
   StatePort, StateSnapshot, StateTransaction, StateRollbackGuard, StateRollbackScope,
-  StateStoragePort, StateStorageFactory, StateLostRecoveryAuthority, StateAcceptanceResult, StateLoadResult,
+  StateStoragePort, StateStorageFactory, StateAcceptanceResult, StateLoadResult,
   StateReloadReason, StateCheckpointReason, StateManagerPhase, StateManagerStatus,
   StateDiagnostic, StateDiagnosticMetrics, ReloadResult, StateRecreateReason, StateRecreateRequiredResult, UnchangedStateResult
 } from './shared/StatePort'
@@ -26,7 +26,7 @@ export interface StateManagerOptions {
   initialState: RuntimeValue
   storage?: StateStoragePort
   storageFactory?: StateStorageFactory
-  lostRecoveryAuthority?: StateLostRecoveryAuthority
+  allowInitialLostRecovery?: boolean
   rollbackGuard?: StateRollbackGuard
   vmJournal?: boolean
   journalMode?: 'JOURNAL'
@@ -109,8 +109,8 @@ export class StateManager implements StatePort {
   private readonly safety: boolean
   private readonly guard: StateRollbackGuard | undefined
   private readonly factory: StateStorageFactory | undefined
-  private readonly lostRecoveryAuthority: StateLostRecoveryAuthority | undefined
-  private lostRecoveryPending: boolean = false
+  private readonly allowInitialLostRecovery: boolean
+  private initialLostRecoveryAvailable: boolean = false
   private readonly clock: () => number
   private readonly sleeper: (ms: number) => Promise<void>
   private readonly diagnostic: ((event: StateDiagnostic) => void) | undefined
@@ -184,7 +184,7 @@ export class StateManager implements StatePort {
     this.policy = options.policy === undefined ? new CommitPolicy() : options.policy
     this.guard = options.rollbackGuard
     this.factory = options.storageFactory
-    this.lostRecoveryAuthority = options.lostRecoveryAuthority
+    this.allowInitialLostRecovery = options.allowInitialLostRecovery === true
     this.storage = options.storage === undefined ? null : options.storage
     let clock = options.now
     this.clock = (): number => {
@@ -274,7 +274,7 @@ export class StateManager implements StatePort {
 
   private assertReady(): void {
     this.assertLive()
-    if (this.lostRecoveryPending) { throw new StateManagerError('STATE_NOT_READY', 'lost-recovery') }
+    if (this.loaded?.kind === 'LOST') { throw new StateManagerError('STATE_NOT_READY', 'lost-recovery') }
     if (this.needsReload) { throw new StateManagerError('STATE_RELOAD_PENDING', 'admission') }
     if (this.phase !== 'READY' && this.phase !== 'DEGRADED') {
       throw new StateManagerError('STATE_NOT_READY', 'admission')
@@ -432,9 +432,13 @@ export class StateManager implements StatePort {
     if (this.isTerminal()) {
       return { kind: 'UNAVAILABLE', code: 'STATE_UNAVAILABLE', stage: 'load-invalidated' }
     }
-    if (result.kind === 'LOST' && initial && !preserve && this.lostRecoveryAuthority !== undefined &&
-        this.io().recoverLost !== undefined) {
-      return this.recoverInitialLost()
+    if (result.kind === 'LOST' && initial && !preserve && this.allowInitialLostRecovery) {
+      this.loaded = this.copyLoad(result)
+      this.snapshot = null
+      this.published = false
+      this.initialLostRecoveryAvailable = true
+      this.phase = 'STARTING'
+      return this.copyLoad(result)
     }
     return this.installLoad(result, preserve)
   }
@@ -497,75 +501,29 @@ export class StateManager implements StatePort {
     }
   }
 
-  private async recoverInitialLost(): Promise<LoadResult> {
-    let authority = this.lostRecoveryAuthority as StateLostRecoveryAuthority
-    let storage = this.io()
-    let active = true
-    let called = false
-    let finished = false
-    let work: Promise<void> | null = null
-    let outcome: LoadResult | null = null
-    this.lostRecoveryPending = true
-    try {
-      await authority.withExclusiveDrained(this.appId, (): Promise<void> => {
-        if (!active || called) {
-          this.fault('STATE_COMMIT_UNCERTAIN', 'lost-authority-callback')
-          return Promise.reject(new StateManagerError('STATE_COMMIT_UNCERTAIN', 'lost-authority-callback'))
-        }
-        called = true
-        work = (async (): Promise<void> => {
-          try {
-            if (storage.recoverLost === undefined) {
-              throw new StateManagerError('STATE_RECOVERY_FAILED', 'lost-capability')
-            }
-            let recovered = await storage.recoverLost(this.appId, this.stamp)
-            this.emitLockWait('recoverLost', recovered.lockWaitMs, recovered.kind)
-            if (!active || this.isFaulted()) {
-              throw new StateManagerError('STATE_COMMIT_UNCERTAIN', 'lost-authority-incomplete')
-            }
-            if (recovered.kind !== 'ABSENT' && recovered.kind !== 'READY') {
-              throw new StateManagerError('STATE_RECOVERY_FAILED', 'lost-reset')
-            }
-            let installed = this.installLoad(recovered, false)
-            if (installed.kind !== 'ABSENT' && installed.kind !== 'READY' || this.isFaulted()) {
-              throw new StateManagerError('STATE_RECOVERY_FAILED', 'lost-install')
-            }
-            if (installed.kind === 'READY') { outcome = installed; return }
-            let publication = await this.publish()
-            if (!active || this.isFaulted() || publication.status !== 'UNCHANGED' ||
-                this.generation !== 1 || this.revision !== 0) {
-              throw new StateManagerError('STATE_RECOVERY_FAILED', 'lost-publication')
-            }
-            this.markDirty()
-            let committed = await this.save('IMMEDIATE', null)
-            if (!active || this.isFaulted() || committed === null || committed.status !== 'COMMITTED' ||
-                committed.revision !== 1 || this.snapshot === null || this.loaded === null ||
-                this.generation !== 1 || this.status().baseRevision !== 1) {
-              throw new StateManagerError('STATE_COMMIT_UNCERTAIN', 'lost-initial-commit')
-            }
-            outcome = this.copyLoad(this.loaded)
-          } finally { finished = true }
-        })()
-        return work
-      })
-      if (!called || !finished || outcome === null || this.isFaulted()) {
-        throw new StateManagerError('STATE_COMMIT_UNCERTAIN', 'lost-authority-incomplete')
-      }
-    } catch (_error) {
-      this.fault('STATE_COMMIT_UNCERTAIN', 'lost-recovery')
-      outcome = null
-    } finally {
-      active = false
-      if (work !== null) {
-        try { await work } catch (_error) {}
-      }
-      this.lostRecoveryPending = false
+  recoverLost(): Promise<LoadResult> {
+    this.assertLive()
+    if (this.closing) { throw new StateManagerError('STATE_UNAVAILABLE', 'closing') }
+    if (this.active !== null || this.pending !== 0) {
+      throw new StateManagerError('STATE_TURN_PENDING', 'lost-recovery')
     }
-    if (outcome === null || this.isFaulted()) {
-      this.snapshot = null
-      return { kind: 'UNAVAILABLE', code: 'STATE_COMMIT_UNCERTAIN', stage: 'lost-recovery' }
+    if (!this.initialLostRecoveryAvailable || this.phase !== 'STARTING' || this.loaded?.kind !== 'LOST') {
+      throw new StateManagerError('STATE_NOT_READY', 'lost-recovery')
     }
-    return outcome
+    this.initialLostRecoveryAvailable = false
+    return this.enqueue<LoadResult>('RECOVER_LOST', async (): Promise<LoadResult> => {
+      let result: LoadResult
+      try {
+        let storage = this.io()
+        result = storage.recoverLost === undefined ?
+          { kind: 'UNAVAILABLE', code: 'STATE_RECOVERY_FAILED', stage: 'lost-capability' } :
+          await storage.recoverLost(this.appId, this.stamp)
+      } catch (_error) {
+        result = { kind: 'UNAVAILABLE', code: 'STATE_COMMIT_UNCERTAIN', stage: 'lost-recovery' }
+      }
+      this.emitLockWait('recoverLost', result.lockWaitMs, result.kind)
+      return this.installLoad(result, false)
+    })
   }
 
   private copyLoad(result: LoadResult): LoadResult {
@@ -590,6 +548,7 @@ export class StateManager implements StatePort {
     if (this.active !== null || this.pending !== 0 || this.needsReload) {
       throw new StateManagerError('STATE_TURN_PENDING', 'publication')
     }
+    if (this.loaded?.kind === 'LOST') { throw new StateManagerError('STATE_NOT_READY', 'publication') }
     return this.enqueue<StateAcceptanceResult>('PUBLICATION', () => this.publish(next))
   }
 
@@ -600,7 +559,9 @@ export class StateManager implements StatePort {
   private async publish(next?: number): Promise<StateAcceptanceResult> {
     if (this.isTerminal()) { return failed('STATE_UNAVAILABLE', 'publication-invalidated') }
     if (this.mode !== 'LIVE_PERSISTENT') { return this.unchanged('CLEAN') }
-    if (!this.loaded) { throw new StateManagerError('STATE_NOT_READY', 'publication') }
+    if (!this.loaded || (this.loaded.kind !== 'ABSENT' && this.loaded.kind !== 'READY')) {
+      throw new StateManagerError('STATE_NOT_READY', 'publication')
+    }
     if (this.published && next === undefined) { return this.unchanged('CLEAN') }
     if (this.loaded.kind === 'ABSENT') {
       if (next !== undefined && next !== 1) {
@@ -1069,11 +1030,6 @@ export class StateManager implements StatePort {
       commitClass: reason === 'THROTTLED' ? 'THROTTLED' : 'IMMEDIATE',
       turnSource: turn?.source })
     if (this.isTerminal()) {
-      if (turn !== null) { this.abandonTurn(turn) }
-      return
-    }
-    if (this.lostRecoveryPending) {
-      this.fault('STATE_COMMIT_UNCERTAIN', 'lost-initial-commit')
       if (turn !== null) { this.abandonTurn(turn) }
       return
     }

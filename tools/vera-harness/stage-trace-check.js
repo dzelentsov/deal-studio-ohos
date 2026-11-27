@@ -916,30 +916,84 @@ async function main() {
     assert.deepEqual(calls.filter(call => ['answer', 'secondAnswer', 'thirdAnswer'].includes(call.action)).map(call => call.action),
       ['secondAnswer', 'thirdAnswer', 'answer'])
   })
-  await test('MOCKED failure policies preserve observed restore/save/view/draw behavior', async () => {
-    const records = capture(), f = probe(), {p, V, disk, faults, saves, surface} = f
+  await test('MOCKED corrupt-state recovery commits before publishing a fresh state', async () => {
+    const records = capture(), {p, V, disk, saves, snapshots} = probe()
     disk.set('fixture/version', 'not-json'); await loaded(p)
-    assert.equal(p.error, 'ACTOR_NOT_READY')
-    assert(records.some(record => record.event === 'STATE_LOST'))
-    assert.equal(saves.length, 0)
-    disk.set('fixture/version', JSON.stringify(V.encodeRuntimeValue(new V.VeraStringValue(secret))))
+    assert.equal(p.error, '')
+    assert(records.some(record => record.event === 'STATE_LOAD' && record.attributes.outcome === 'LOST'))
+    assert.equal(saves.length, 1)
+    assert.equal(V.decodeRuntimeValue(JSON.parse(saves[0])).value, secret)
+    assert.equal(await snapshot(p), saves[0])
+    assert.equal(disk.get('fixture/version'), saves[0])
+    assert.deepEqual(snapshots, saves)
+    assert.equal(records.filter(record => record.event === 'STATE_RECOVERY' && record.attributes.outcome === 'COMMITTED').length, 1)
+    sequence(records, ['STATE_LOAD', 'STATE_COMMIT_BEGIN', 'STATE_COMMIT_OK', 'SNAPSHOT', 'FRAME', 'STATE_RECOVERY'])
+  })
+  await test('MOCKED save failure rolls back input without publishing or changing durable state', async () => {
+    const records = capture(), f = probe(), {p, disk, faults, saves, snapshots, replies} = f
     await loaded(p)
     assert.equal(p.error, '')
     const before = await snapshot(p), durable = disk.get('fixture/version')
-    saves.length = 0; records.length = 0; faults.save = true
+    saves.length = 0; snapshots.length = 0; records.length = 0; faults.save = true
     p.dispatch('tap', payload(secret + '!')); await settled(p)
     assert.equal(await snapshot(p), before)
     assert.equal(disk.get('fixture/version'), durable)
     assert.equal(p.error, 'STATE_WRITE_FAILED')
     assert.equal(saves.length, 0)
-    sequence(records, ['STATE_COMMIT_BEGIN', 'STATE_WRITE_FAILED'])
-    for (const event of ['INPUT_APPLIED', 'SNAPSHOT', 'FRAME', 'EFFECT_REQUEST']) assert(!events(records).includes(event), event)
-    faults.save = false; p.error = ''; faults.view = true
+    assert.deepEqual(snapshots, [])
+    assert.deepEqual(replies, [])
+    assert.equal(f.host().effectsAllowed, false)
+    assert.deepEqual(f.host().pendingEffects, [])
+    sequence(records, ['EXECUTE', 'STATE_COMMIT_BEGIN', 'STATE_COMMIT_FAIL', 'STATE_WRITE_FAILED', 'ERROR', 'TIMERS_STOPPED'])
+    for (const event of ['INPUT_APPLIED', 'STATE_COMMIT_OK', 'STATE_LOAD', 'SNAPSHOT', 'FRAME', 'EFFECT_REQUEST']) assert(!events(records).includes(event), event)
+  })
+  await test('MOCKED stale-revision reload fails closed when generation publication cannot be saved', async () => {
+    const records = capture(), f = probe(), {p, V, disk, faults, saves, snapshots, loads, calls, replies} = f
+    await loaded(p)
+    const handle = p.handle
+    disk.set('fixture/version', JSON.stringify(V.encodeRuntimeValue(new V.VeraStringValue(secret + '!'))))
+    const durable = disk.get('fixture/version')
+    loads.length = 0; await loaded(p)
+    assert.equal(p.error, '')
+    assert.strictEqual(p.handle, handle)
+    assert.deepEqual(loads, [], 'loading an unchanged program redraws without reloading state')
+    assert.notEqual(await snapshot(p), durable)
+    saves.length = 0; snapshots.length = 0; records.length = 0; calls.length = 0; faults.save = true
+    p.dispatch('tap', payload(secret)); await settled(p)
+    assert.equal(p.error, 'STALE_REVISION')
+    await assert.rejects(snapshot(p), {code: 'INVALID_HANDLE'})
+    assert.equal(f.actor().ready(), false)
+    assert.equal(disk.get('fixture/version'), durable)
+    assert.equal(saves.length, 0)
+    assert.deepEqual(snapshots, [])
+    assert.deepEqual(replies, [])
+    assert.equal(f.host().effectsAllowed, false)
+    assert.deepEqual(f.host().pendingEffects, [])
+    assert.deepEqual(loads, [{kind: 'load', appId: 'fixture/version'}])
+    assert.equal(records.find(record => record.event === 'STATE_COMMIT_FAIL').attributes.outcome, 'STALE_REVISION')
+    assert(records.some(record => record.event === 'STATE_LOAD' && record.attributes.outcome === 'READY'))
+    assert(records.some(record => record.event === 'STATE_LOCK_WAIT' && record.attributes.stage === 'publication' && record.attributes.outcome === 'FAILED'))
+    sequence(records, ['EXECUTE', 'STATE_COMMIT_BEGIN', 'STATE_COMMIT_FAIL', 'STATE_LOAD', 'STATE_LOCK_WAIT', 'ERROR', 'TIMERS_STOPPED'])
+    for (const event of ['INPUT_APPLIED', 'STATE_COMMIT_OK', 'STATE_WRITE_FAILED', 'SNAPSHOT', 'FRAME', 'EFFECT_REQUEST', 'STATE_RECOVERY']) assert(!events(records).includes(event), event)
+    const executed = calls.length
+    records.length = 0
+    p.dispatch('stale', payload(secret)); await settled(p)
+    assert.equal(calls.length, executed)
+    for (const event of ['EXECUTE', 'INPUT_APPLIED', 'SNAPSHOT', 'FRAME', 'EFFECT_REQUEST']) assert(!events(records).includes(event), event)
+  })
+  await test('MOCKED view and draw failures preserve commit policy and effect fencing', async () => {
+    const records = capture(), f = probe(), {p, faults, saves, surface} = f
+    await loaded(p)
+    assert.equal(p.error, '')
+    saves.length = 0; records.length = 0; faults.view = true
     p.dispatch('tap', payload(secret)); await settled(p)
     assert.equal(p.error, 'fixture view')
     assert(records.some(record => record.event === 'ERROR' && record.attributes.kind === 'VIEW'))
     assert.equal(saves.length, 1, 'observed policy: view failure does not prevent dispatch save')
-    faults.view = false; p.error = ''; faults.draw = true
+    assert.equal(await snapshot(p), saves[0])
+    sequence(records, ['EXECUTE', 'STATE_COMMIT_BEGIN', 'STATE_COMMIT_OK', 'SNAPSHOT', 'ERROR', 'INPUT_APPLIED'])
+    assert(!events(records).includes('FRAME'))
+    faults.view = false; p.error = ''; faults.draw = true; records.length = 0
     p.liveSurfaces = [surface]
     p.surfaces.set(surface, {ready: true, visible: true, width: 100, height: 100, ctx: {}})
     p.paintSurface(surface); await settled(p)
